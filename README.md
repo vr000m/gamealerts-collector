@@ -11,8 +11,24 @@ taxonomy, and provider adapters were football-hardcoded. This project is the
 generalization: adding a tournament should be a config file; adding a sport
 (F1, Champions League, cricket) should be one new package.
 
-**Status: pre-alpha, design phase.** See [docs/DESIGN.md](docs/DESIGN.md) for the
+**Status: pre-alpha.** The foundation is implemented: package scaffold, schema v1 +
+core DB layer, the sport-pack SDK, and the first pack (`football-wc2026`).
+Interfaces (engine daemon, client library, real CLI, replay) are next — see
+[docs/dev_plans/](docs/dev_plans/). See [docs/DESIGN.md](docs/DESIGN.md) for the
 architecture contract. Not yet on PyPI; not yet consumed by gamealerts.
+
+## Development
+
+```sh
+uv sync                 # install (incl. dev deps + in-repo test-fixture pack)
+uv run pytest -q        # full test suite
+uv run ruff format --check src tests && uv run ruff check src tests
+uv run gamecollect      # CLI stub (real commands land with the interfaces plan)
+```
+
+Two packages ship in one wheel: `gamecollect` (core + SDK) and
+`gamecollect_football` (the WC2026 pack, registered under the
+`gamecollect.packs` entry-point group).
 
 ## Shape
 

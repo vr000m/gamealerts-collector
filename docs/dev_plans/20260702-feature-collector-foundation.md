@@ -1,6 +1,6 @@
 # Task: Collector foundation — scaffold, schema v1, sport-pack SDK, football pack
 
-**Status**: Not Started
+**Status**: In Review
 **Component**: collector
 **Assigned to**: Claude
 **Priority**: High
@@ -217,7 +217,7 @@ Context lifecycle — what enters each step's working state and whether it clear
 - `rg 'from gamealerts|import gamealerts' src/` returns no matches.
 - Tests passing, code reviewed, `docs/DESIGN.md` amended if any contract detail was refined during implementation.
 
-<!-- reviewed: 2026-07-02 @ c8fa1763ef2419a71b59f0663a8e0428f188c945 -->
+<!-- reviewed: 2026-07-02 @ bd5fb6af0fd4a2d958a612b3f5028662fd5844d4 -->
 
 ## Progress
 
