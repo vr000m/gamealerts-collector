@@ -24,7 +24,14 @@ gamecollect = "gamecollect.cli:main"
 dev = [
     "pytest>=8.0",
     "ruff>=0.4",
+    # In-repo test-fixture pack (dev only): registers the 'test-fixture' entry
+    # point so registry tests exercise real importlib.metadata discovery. Never
+    # part of the shipped gamecollect wheel.
+    "gamecollect-test-fixture-pack",
 ]
+
+[tool.uv.sources]
+gamecollect-test-fixture-pack = { path = "tests/fixture_pack", editable = true }
 
 [tool.hatch.version]
 path = "src/gamecollect/__init__.py"

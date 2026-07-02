@@ -1,0 +1,20 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# Dev-only fixture pack: installed via the root project's dev dependency
+# group (see [tool.uv.sources] there) so tests/test_pack_registry.py can
+# exercise real importlib.metadata entry-point discovery before the football
+# pack exists. Never part of the shipped gamecollect wheel.
+[project]
+name = "gamecollect-test-fixture-pack"
+version = "0.0.0"
+description = "In-repo test-fixture sport pack for gamecollect registry tests (dev only)."
+requires-python = ">=3.11"
+dependencies = []
+
+[project.entry-points."gamecollect.packs"]
+test-fixture = "gamecollect_test_fixture:pack"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gamecollect_test_fixture"]
