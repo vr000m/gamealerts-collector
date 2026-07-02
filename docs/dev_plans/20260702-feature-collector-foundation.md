@@ -24,7 +24,7 @@ Reference code to port lives at `/Users/vr000m/Code/vr000m/gamealerts/backend/ga
 - Schema v1 per DESIGN.md §3–4: generic core tables + JSON payload columns + `source` partition key; `schema_meta` version table; core-library-owned pragmas (WAL, busy_timeout, foreign_keys — port the pattern from gamealerts `store/db.py:45-48`); daemons/consumers refuse a newer major schema version.
 - Partition-per-writer: every row a collector writes carries its `source` (tournament/provider instance); the write API scopes all writes to the connection's declared source; per-match `seq` monotonic within its partition.
 - Sport-pack SDK per DESIGN.md §5: entry-point group `gamecollect.packs`; a pack supplies provider factory, event taxonomy declaration, prompt fragments, preference schema, display metadata, compaction boundaries.
-- Football pack: port `MatchDataProvider` ABC + `Normalized*` dataclasses (provider.py:378-388 and the dataclasses/enums in the same file), `ESPNAdapter` (espn.py), team reconciliation (reconcile.py), and the JSON fixtures under `data/fixtures/`. Behavior parity with gamealerts is the port's acceptance bar.
+- Football pack: port `MatchDataProvider` ABC + `Normalized*` dataclasses (provider.py:378-387 and the dataclasses/enums in the same file), `ESPNAdapter` (espn.py), team reconciliation (reconcile.py), and the JSON fixtures under `data/fixtures/`. Behavior parity with gamealerts is the port's acceptance bar.
 - The `commentary` table does NOT exist in this schema (DESIGN.md §3) — prose belongs to consuming apps.
 - No imports from gamealerts anywhere; this project is standalone.
 
@@ -40,28 +40,32 @@ Reference code to port lives at `/Users/vr000m/Code/vr000m/gamealerts/backend/ga
 
 ### Phase 1: Project scaffold
 
-**Impl files:** `pyproject.toml, src/gamecollect/__init__.py, .github/workflows/ci.yml, ruff.toml, .gitignore`
+**Impl files:** `pyproject.toml, uv.lock, src/gamecollect/__init__.py, src/gamecollect/cli.py, .github/workflows/ci.yml, ruff.toml, .gitignore`
 **Test files:** `tests/test_scaffold.py`
 **Test command:** `uv run pytest tests/test_scaffold.py -q`
 **Validation cmd:** `uv run ruff format --check src tests && uv run ruff check src tests`
 
-- `pyproject.toml`: hatchling, `requires-python >= 3.11`, no runtime deps, dev group (pytest, ruff), console script `gamecollect = "gamecollect.cli:main"` (stub until the interfaces plan), entry-point group declaration for `gamecollect.packs`.
+- `pyproject.toml`: hatchling, `requires-python >= 3.11`, no runtime deps, dev group (pytest, ruff), console script `gamecollect = "gamecollect.cli:main"`, entry-point group declaration for `gamecollect.packs`.
+- `src/gamecollect/cli.py`: stub `main()` printing a not-yet-implemented notice — the console script must resolve the moment this plan merges (the real CLI lands in the interfaces plan).
 - `src/gamecollect/` package skeleton with `__init__.py` exposing `__version__`.
-- CI: GitHub Actions — `uv sync --frozen`, ruff format+check, pytest. Single job, ubuntu + macos matrix not needed yet.
+- Generate and commit `uv.lock` (CI runs `--frozen`; refreshed in Phase 4 when `pyproject.toml` gains the football package).
+- CI: GitHub Actions — `uv sync --frozen`, ruff format+check, pytest. Single job, ubuntu + macos matrix not needed yet. Second step/job: build the wheel, install it into a clean venv **without dev deps**, and run the load-pack → normalize-fixture → write-DB path end-to-end (exercises the fresh-venv acceptance criterion; the pack half activates once Phase 4 lands).
 - `tests/test_scaffold.py`: package imports, version present, entry-point group queryable via `importlib.metadata`.
 
 ### Phase 2: Schema v1 + core DB layer
 
-**Impl files:** `src/gamecollect/db/schema.sql, src/gamecollect/db/connection.py, src/gamecollect/db/migrations.py, src/gamecollect/db/writer.py, src/gamecollect/db/reader.py`
+**Impl files:** `src/gamecollect/db/schema.sql, src/gamecollect/db/connection.py, src/gamecollect/db/migrations.py, src/gamecollect/db/writer.py, src/gamecollect/db/reader.py, src/gamecollect/fold.py`
 **Test files:** `tests/test_schema.py, tests/test_writer_partition.py, tests/test_migrations.py`
 **Test command:** `uv run pytest tests/test_schema.py tests/test_writer_partition.py tests/test_migrations.py -q`
 
-- `schema.sql` v1 generic core: `schema_meta` (schema major/minor, applied_at); `matches` (PK `match_id`, `source` NOT NULL, kickoff_utc, home/away entity refs, status, minute/period, score_home/away, display_clock, `payload` JSON, updated_at); `events` (PK (match_id, seq), minute/period, `type` TEXT NOT NULL, importance, actor/target entity refs, detail, `payload` JSON); `entities` (PK (source, entity_id), kind TEXT — team|player|driver, display_name, name_folded, parent_entity, `payload` JSON); `standings` (PK (source, group_key, entity_id), points/rank + `payload` JSON); `provider_match_map` ported as-is.
+- `schema.sql` v1 generic core: `schema_meta` (schema major/minor, applied_at); `matches` (PK `match_id`, `source` NOT NULL, kickoff_utc, home/away entity refs, status, minute/period, score_home/away, display_clock, `payload` JSON, updated_at); `events` (PK (match_id, seq), minute/period, `type` TEXT NOT NULL, importance, actor/target entity refs, detail, `payload` JSON); `entities` (PK (source, entity_id), kind TEXT — team|player|driver, display_name, name_folded, parent_entity, `payload` JSON); `standings` (PK (source, group_key, entity_id), points/rank + `payload` JSON); `provider_match_map` gains a `source` column vs gamealerts — PK `(source, provider, provider_match_id)`, stamped by `PartitionWriter` like every other table (NOT ported as-is: two sources collecting the same provider-native id must not collide).
+- Entity refs are **soft references**: nullable TEXT columns, no FOREIGN KEY constraints on entity refs in schema v1. `PartitionWriter` upserts `entities` rows when the provider supplies entity data; a match/event may legally land before its entities rows exist. FK-hardening is deferred to a later minor. Football schedule metadata (round, group_name, city, stadium, HT scores) lives in `matches.payload` JSON — not core columns, not a side table; verify no ported reader query filters/sorts on a now-JSON field.
+- `fold.py`: core-owned name-folding function shared by writer and reader (write-fold == query-fold by construction); pack reconciliation (`canonical_*`) calls into it.
 - `connection.py`: `connect(path)` sets `journal_mode=WAL`, `busy_timeout=5000`, `foreign_keys=ON` (port `store/db.py:45-48` pattern); applies schema when missing; refuses to open when `schema_meta` major > library major.
 - `migrations.py`: ordered additive migrations keyed by (major, minor); the rosters-folded back-add in gamealerts `_apply_schema` is the pattern to generalize.
-- `writer.py`: `PartitionWriter(conn, source)` — all inserts/upserts stamp `source`; raises on any attempt to write a row whose `source` differs; allocates per-match `seq` monotonically within the partition.
-- `reader.py`: untyped low-level reads used by the client library later (`list_matches`, `get_state`, `get_events_since`, `get_standings`, entity lookups by folded name).
-- Tests: pragma values asserted on a fresh connection; two writers on one file (different sources) interleave safely under WAL; cross-partition write raises; newer-major refusal; migration idempotency.
+- `writer.py`: `PartitionWriter(conn, source, taxonomy=None)` — final constructor signature, pinned here so it does not churn in Phase 3. All inserts/upserts stamp `source`; raises on any attempt to write a row whose `source` differs. `seq` is **provider-derived** (`NormalizedEvent.seq`, from the ESPN keyEvents index) — the writer does NOT allocate it; it enforces monotonic-per-(source, match) as an invariant and is idempotent via `INSERT OR IGNORE` on (match_id, seq), preserving gamealerts' re-poll semantics. `taxonomy` is opaque set-of-strings data; validation is skipped when `None` so the core writer stays sport-agnostic (wired by Phase 3, exercised with a real pack in Phase 4).
+- `reader.py`: untyped low-level reads used by the client library later (`list_matches`, `get_state`, `get_events_since`, `get_standings`, entity lookups by folded name). Per DESIGN.md §3 the DB is read-only to everyone but collector daemons: `reader.py` opens read-only / issues no DML, and a test asserts this.
+- Tests: pragma values asserted on a fresh connection; two concurrent writer **processes** (different sources) on one file under sustained load — asserting defined retry/backoff behavior when `SQLITE_BUSY` bites (see the WAL assumption in Architecture Decisions; writes serialize file-wide, they do not interleave concurrently); cross-partition write raises; schema-version policy all three cases (equal-major/newer-minor opens OK, equal-major/older-minor triggers additive migration, newer-major refuses); migration idempotency; fold round-trip consistency (write-fold == query-fold); folded lookup returns diacritic-named entities (Türkiye, Côte d'Ivoire).
 
 ### Phase 3: Sport-pack SDK
 
@@ -70,28 +74,30 @@ Reference code to port lives at `/Users/vr000m/Code/vr000m/gamealerts/backend/ga
 **Test command:** `uv run pytest tests/test_pack_registry.py tests/test_provider_abc.py -q`
 
 - `provider.py`: port `MatchDataProvider` ABC (`fetch_live_matches`, `fetch_match_detail`) + `Normalized*` dataclasses from gamealerts `data/provider.py`, generalized: `event_type` becomes `str` (pack-validated), `MatchStatus` stays a core enum, football-specific `NormalizedStats`/`NormalizedLineup*` move to the football pack, `NormalizedMatch` gains `payload: dict` for sport extras. Port `ProviderError`/`ShapeDriftError`/`ProviderUnavailableError` unchanged.
-- `spec.py`: `SportPack` dataclass — `name`, `sport`, `provider_factory`, `taxonomy: dict[str, EventTypeDecl]` (display name, importance default), `prompt_fragments: dict[str, str]`, `preference_schema: dict` (JSON-schema-shaped), `display_metadata: dict`, `compaction_boundaries: list[str]`.
-- `registry.py`: discover packs via `importlib.metadata.entry_points(group="gamecollect.packs")`; validate a loaded pack (taxonomy non-empty, provider factory returns a `MatchDataProvider`).
-- Taxonomy validation hook: `PartitionWriter` rejects an event `type` not in the active pack's taxonomy (explicit, loud — shape drift shows up at write time, mirroring gamealerts' `ShapeDriftError` philosophy).
+- `spec.py`: `SportPack` dataclass — `name`, `sport`, `provider_factory`, `taxonomy: dict[str, EventTypeDecl]` (display name, importance default), `prompt_fragments: dict[str, str]`, `preference_schema: dict` (JSON-schema-shaped), `display_metadata: dict`, `compaction_boundaries: list[str]`, `side_table_ddl` (additive DDL applied by `connect()` after core schema — the "packs may own typed side tables" hook; Phase 4 only supplies the DDL).
+- `registry.py`: discover packs via `importlib.metadata.entry_points(group="gamecollect.packs")`; validate a loaded pack against **all six** DESIGN.md §5 contributions (provider factory returns a `MatchDataProvider`, taxonomy non-empty, `prompt_fragments`, `preference_schema`, `display_metadata`, `compaction_boundaries` present/well-formed); test that a pack missing any is rejected loudly.
+- Taxonomy validation wiring: Phase 3 passes the active pack's taxonomy into the `PartitionWriter(conn, source, taxonomy=None)` parameter defined in Phase 2; the writer rejects an event `type` not in the taxonomy (explicit, loud — shape drift shows up at write time, mirroring gamealerts' `ShapeDriftError` philosophy). The loud-rejection test with a real pack lands in Phase 4.
+- Minimal in-repo test-fixture pack registered via a real entry point (dev environment only) so `tests/test_pack_registry.py` exercises discovery through `importlib.metadata` before the football pack exists — no mocks.
 
 ### Phase 4: Football/WC2026 pack
 
-**Impl files:** `src/gamecollect_football/__init__.py, src/gamecollect_football/pack.py, src/gamecollect_football/espn.py, src/gamecollect_football/reconcile.py, src/gamecollect_football/taxonomy.py, src/gamecollect_football/fixtures/*.json`
+**Impl files:** `pyproject.toml, uv.lock, src/gamecollect_football/__init__.py, src/gamecollect_football/pack.py, src/gamecollect_football/espn.py, src/gamecollect_football/reconcile.py, src/gamecollect_football/taxonomy.py, src/gamecollect_football/fixtures/*.json`
 **Test files:** `tests/football/test_espn_adapter.py, tests/football/test_reconcile.py, tests/football/test_taxonomy_parity.py`
 **Test command:** `uv run pytest tests/football -q`
 **Validation cmd:** `uv run python -c "from gamecollect.packs.registry import load_pack; p = load_pack('football-wc2026'); print(p.name, len(p.taxonomy))"`
 
-- Ship in-repo as a second package (`gamecollect_football`) with its own entry point, proving the SDK from the outside; same wheel for now.
+- Ship in-repo as a second package (`gamecollect_football`) with its own entry point, proving the SDK from the outside; same wheel for now. This **modifies `pyproject.toml`**: register the `football-wc2026` entry point under `gamecollect.packs` and add the second package to the hatchling build target; refresh `uv.lock` and run `uv sync` before the validation cmd (registry discovery needs the entry point installed).
 - `taxonomy.py`: the `EventType` value set + `EventImportance` defaults from gamealerts `data/provider.py`, as data.
-- `espn.py`: port `ESPNAdapter` and its private helpers (`_normalize_key_event` incl. yellow-red split, `_normalize_roster`, `_normalize_team_stats`, `_classify_goal_slug`, `_MAX_RESPONSE_BYTES` guard); tournament (`fifa.world`) becomes a constructor parameter with WC2026 default — the Champions-League-is-config promise.
+- `espn.py`: port `ESPNAdapter` and its private helpers (`_normalize_key_event` incl. yellow-red split, `_normalize_roster`, `_normalize_team_stats`, `_classify_goal_slug`, `_MAX_RESPONSE_BYTES` guard); tournament (`fifa.world`) becomes a constructor parameter with WC2026 default. **Named assumption**: ESPN per-tournament endpoint shape/slug uniformity is unverified beyond `fifa.world` — a probe/record of one other tournament's scoreboard+summary is required before claiming any second tournament is config-only.
 - `reconcile.py`: port `TEAM_ALIASES`, `canonical_display_name`, `canonical_team_name`, `canonical_player_name`, `resolve_canonical_match_id`, `register_unreconciled_match` (DAO calls rewritten against `writer.py`/`reader.py`).
-- Copy `data/fixtures/qatar_canada_760440.summary.json` (+ worldcup schedule/squads fixtures) for adapter tests; port the corresponding gamealerts adapter tests where they exist.
-- Football side tables (stats, lineups) as pack-owned DDL registered through the SDK (additive `executescript` after core schema) — exercises the "packs may own typed side tables" contract.
+- Copy `data/fixtures/qatar_canada_760440.summary.json` (+ worldcup schedule/squads fixtures) for adapter tests. Check in a **frozen golden normalized-output JSON** captured once from gamealerts' adapter; parity tests assert against that file (gamealerts is never imported at test time). Porting `test_card_counts.py` and `test_espn_event_mapping.py` is **mandatory** (they exist in gamealerts), with explicit assertions for the 2-event second-yellow split and the 0-event unknown-slug skip. Coverage limit: the parity fixture is a FINISHED match — live IN_PLAY normalization is unverified by it; live-path parity is scoped to the interfaces/replay plan.
+- Football side tables (stats, lineups) as pack-owned DDL supplied via the `SportPack.side_table_ddl` hook (applied by `connect()` after core schema) — exercises the "packs may own typed side tables" contract. Test: snapshot core-table schema before/after pack side-table registration and assert equality (core tables never altered by a pack).
+- Loud-rejection test with the real pack: an event `type` outside the football taxonomy raises at write time.
 
 ## Technical Specifications
 
 ### Files to Modify
-- None — greenfield repo (only `README.md`, `docs/DESIGN.md` exist).
+- `pyproject.toml` (created in Phase 1, modified in Phase 4: football entry point + second hatchling build target) and `uv.lock` (generated Phase 1, refreshed Phase 4). Otherwise greenfield (only `README.md`, `docs/DESIGN.md` exist).
 
 ### New Files to Create
 - See per-phase **Impl files** above; layout is `src/gamecollect/` (core) + `src/gamecollect_football/` (first pack) + `tests/`.
@@ -103,6 +109,12 @@ Reference code to port lives at `/Users/vr000m/Code/vr000m/gamealerts/backend/ga
 - **`events.type` as pack-declared strings** validated at write time (not a core enum): the core stays sport-agnostic; drift is caught loudly at the writer, consistent with gamealerts' `ShapeDriftError` posture.
 - **Refuse-on-newer-major** schema policy: equal-major/any-minor is compatible (minor = additive only); newer major refuses at `connect()`.
 - **`entities` replaces rosters/teams**: kind-discriminated (team/player/driver), with `name_folded` preserving the fold-based lookup gamealerts depends on.
+- **Soft entity refs in v1**: entity ref columns in `matches`/`events`/`standings` are nullable TEXT with no FK constraints — the ported pipeline is name-keyed and a match/event may land before its entities rows. `PartitionWriter` upserts entities when the provider supplies them; FK-hardening deferred to a later minor.
+- **Provider-derived `seq`**: the normalizer supplies `seq`; the writer enforces monotonic-per-(source, match) and stays idempotent via `INSERT OR IGNORE` — re-poll parity with gamealerts, no writer-side counter.
+- **Core-owned fold**: the name-folding function lives in `gamecollect` (`fold.py`) and is shared by writer and reader; packs call into it, so write-fold == query-fold by construction.
+- **Named assumption — WAL concurrency**: SQLite WAL serializes writers file-wide; partition-per-source does NOT grant concurrent writes. Multi-daemon safety depends on `busy_timeout` absorbing `SQLITE_BUSY`, tested under sustained contention. Two writers on the same (file, source) is a documented-unsupported misconfiguration: last-write-wins on matches, seq races possible; a test asserts the outcome is bounded (no corruption, no crash). Structural locking is deferred to the interfaces-plan engine.
+- **Named assumption — ESPN tournament uniformity**: shape/slug taxonomy is verified only against `fifa.world`; a second tournament requires a recorded probe before it is treated as config-only.
+- **Schedule metadata in payload**: football round/group/city/stadium/HT scores live in `matches.payload` JSON, keeping core columns sport-agnostic.
 
 ### Dependencies
 - Runtime: none. Dev: `pytest>=8.0`, `ruff>=0.4` (matching gamealerts `backend/pyproject.toml` pins). Build: `hatchling`.
@@ -112,10 +124,10 @@ Reference code to port lives at `/Users/vr000m/Code/vr000m/gamealerts/backend/ga
 | Seam | Writer (task) | Caller (task) | Contract |
 |------|---------------|---------------|----------|
 | schema v1 DDL | Phase 2 `schema.sql` | Phase 3 taxonomy hook, Phase 4 side tables | Core tables immutable within major; packs add side tables only, never alter core |
-| `PartitionWriter` | Phase 2 | Phase 4 reconcile port; interfaces-plan engine | All writes stamped with constructor `source`; cross-source write raises; `seq` monotonic per (source, match) |
+| `PartitionWriter` | Phase 2 | Phase 4 reconcile port; interfaces-plan engine | Constructor `PartitionWriter(conn, source, taxonomy=None)`; all writes stamped with constructor `source`; cross-source write raises; `seq` provider-derived, monotonic per (source, match), idempotent via `INSERT OR IGNORE` |
 | provider ABC | Phase 3 `provider.py` | Phase 4 `ESPNAdapter`; interfaces-plan `ReplayProvider` | `fetch_live_matches() -> list[NormalizedMatch]`, `fetch_match_detail(id)`; errors via `ProviderError` hierarchy only |
 | pack entry point | Phase 3 registry | Phase 4 pack; interfaces-plan CLI `--pack` flag | group `gamecollect.packs`; value is a zero-arg factory returning `SportPack` |
-| taxonomy | Phase 4 `taxonomy.py` | Phase 2 writer validation | Event `type` strings written must be declared by the active pack |
+| taxonomy | Phase 4 `taxonomy.py` | Phase 2 writer param (wired in Phase 3, tested in Phase 4) | Event `type` strings written must be declared by the active pack; validation skipped when `taxonomy=None` |
 
 ## Architecture & Call Flow
 
@@ -172,10 +184,12 @@ Context lifecycle — what enters each step's working state and whether it clear
 ## Testing Notes
 
 ### Test Approach
-- [ ] Unit: schema/pragma/migration behavior on temp DB files (no shared state between tests)
-- [ ] Unit: partition writer discipline (two sources, one file; cross-source raise; seq monotonicity)
-- [ ] Unit: pack registry discovery via real entry points (installed package, not mocks)
-- [ ] Parity: ESPN adapter against the checked-in `qatar_canada_760440.summary.json` fixture — normalized output equals the gamealerts adapter's output shape for the same input
+- [ ] Unit: schema/pragma/migration behavior on temp DB files (no shared state between tests); version policy all three cases
+- [ ] Unit: partition writer discipline (two sources, one file; cross-source raise; provider-derived seq monotonicity + `INSERT OR IGNORE` idempotency)
+- [ ] Unit: fold round-trip (write-fold == query-fold) and folded lookup with diacritic names
+- [ ] Unit: pack registry discovery via real entry points (in-repo test-fixture pack in Phase 3; football pack in Phase 4 — not mocks); registry rejects a pack missing any of the six §5 fields
+- [ ] Parity: ESPN adapter against the checked-in `qatar_canada_760440.summary.json` fixture — normalized output equals the checked-in golden JSON captured once from gamealerts' adapter (gamealerts never imported at test time)
+- [ ] Wheel-only: CI builds the wheel, installs into a clean venv without dev deps, runs load-pack → normalize → write end-to-end
 - [ ] Standalone check: no `gamealerts` imports anywhere under `src/`
 
 ### Test Results
@@ -184,16 +198,18 @@ Context lifecycle — what enters each step's working state and whether it clear
 - [ ] CI green on GitHub Actions
 
 ### Edge Cases Tested
-- [ ] Two daemons, same file, same source (misconfiguration) — second writer's behavior is defined (documented, not silent corruption)
-- [ ] Event with undeclared `type` — loud rejection
-- [ ] DB at future major — `connect()` refuses with actionable message
-- [ ] Non-ASCII team/player names through fold pipeline (Türkiye, Côte d'Ivoire, diacritics)
+- [ ] Two daemons, same file, same source — documented-unsupported misconfiguration; test asserts the outcome is bounded (no corruption, no crash), not prevented
+- [ ] Two daemons, same file, different sources — writes serialize under WAL; test asserts defined retry/backoff under `SQLITE_BUSY` contention
+- [ ] Event with undeclared `type` — loud rejection (real-pack test in Phase 4)
+- [ ] DB at future major — `connect()` refuses with actionable message; equal-major newer/older minor both handled
+- [ ] Non-ASCII team/player names through fold pipeline (Türkiye, Côte d'Ivoire, diacritics) — wired to the Phase 2 folded-lookup test
+- [ ] Core-table schema unchanged after pack side-table registration
 
 ## Acceptance Criteria
 
 - `uv run pytest -q` green; CI green on the PR.
 - A fresh venv with only this wheel installed can: load the football pack via entry point, normalize the checked-in ESPN fixture, and write it into a new SQLite file with correct pragmas and schema v1.
-- ESPN adapter parity: same fixture in → equivalent normalized events out as gamealerts' adapter (documented field mapping for the generalized bits).
+- ESPN adapter parity: same fixture in → normalized events equal to the checked-in golden JSON captured from gamealerts' adapter (documented field mapping for the generalized bits; gamealerts never imported at test time).
 - `rg 'gamealerts' src/` returns only comments/docs references, no imports.
 - Tests passing, code reviewed, `docs/DESIGN.md` amended if any contract detail was refined during implementation.
 
