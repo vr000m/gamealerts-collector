@@ -221,14 +221,23 @@ Context lifecycle — what enters each step's working state and whether it clear
 
 ## Progress
 
-- [ ] Phase 1: Project scaffold
-- [ ] Phase 2: Schema v1 + core DB layer
-- [ ] Phase 3: Sport-pack SDK
-- [ ] Phase 4: Football/WC2026 pack
+- [x] Phase 1: Project scaffold
+- [x] Phase 2: Schema v1 + core DB layer
+- [x] Phase 3: Sport-pack SDK
+- [x] Phase 4: Football/WC2026 pack
 
 ## Findings
 
-- (append findings here as work proceeds)
+- Phase 2 reviewer (advisory, unresolved — fix before merge):
+  - **Important / Contract**: partition enforcement is structural for `matches` but convention-only for child tables — `writer.py` `append_events`/`upsert_standing`/`map_provider_match` never verify `match_id` ownership against `matches.source`; a writer scoped to source B can create a shadow event partition under source A's match, breaking the match_id-global reader contract (`get_events_since` takes no source).
+  - Minor / Bug: `upsert_match` owner check is SELECT-then-INSERT (TOCTOU); racing writers with different sources can silently overwrite row data while `source` keeps the original value. Suggest `ON CONFLICT ... DO UPDATE ... WHERE matches.source = excluded.source` + changes() check.
+  - Minor / Contract: `upsert_entity` accepts caller-supplied `name_folded`, bypassing the core fold (breaks write-fold == query-fold "by construction").
+  - Minor / Clarity: `open_reader` refuses only newer-major while `connect()` also refuses older-major — asymmetry undocumented.
+  - Minor / Bug: `_pick` whitelists all tables' key columns for every table, so cross-table keys (e.g. `seq` in a match row) are silently dropped despite the loud-rejection comment.
+- Phase 3 reviewer (advisory, minor): (1) `validate_pack` doesn't validate `EventTypeDecl` contents (empty display_name / None importance_default pass); (2) two registry rejection tests use `pytest.raises(Exception)` instead of pinning `PackValidationError`. Reviewer verified the dev-only `test-fixture` pack uses a relative `[tool.uv.sources]` editable path (no absolute paths in uv.lock, `uv lock --check` passes) and cannot leak into the runtime wheel (no Requires-Dist).
+- Phase 4 reviewer (advisory, minor): (1) `reconcile.py` `resolve_canonical_match_id` step (b) uses source-blind `reader.get_state`, so a bare provider-native id can bind cross-source in a shared multi-source DB (compounds the Phase 2 Important finding — fix together: source-scope step (b)); (2) `worldcup.json`/`worldcup.squads.json` fixtures ship in the wheel but are consumed by no test or code yet (dead package data until the interfaces-plan schedule loader).
+- Phase 4 parity verified by reviewer: taxonomy == gamealerts EventType value set exactly (9 types, identical importance defaults); `_normalize_key_event` 0–2 expansion ported byte-for-byte; golden byte-exact; unreconciled ids source-qualified; core tables untouched by pack DDL.
+- Phase 2 note: two migration tests skip honestly — no equal-major/older-minor DB is constructible until the first additive migration exists (library is at v1.0); they activate with the first minor bump.
 
 ## Issues & Solutions
 
@@ -236,4 +245,13 @@ Context lifecycle — what enters each step's working state and whether it clear
 
 ## Final Results
 
-(fill when complete)
+Completed 2026-07-02 by `/conduct --autonomous` (4 phases, 0 fix-loop iterations, all parallel spawns).
+
+- Phase commits: `bf05d16` (scaffold), `2bd0f90` (schema v1 + DB layer), `1f762ca` (sport-pack SDK), `c1a60a8` (football pack).
+- Tests: 159 passed, 2 skipped (honest skips: no equal-major/older-minor DB constructible until the first additive migration). Lint clean (`ruff format --check` + `ruff check`).
+- CI-parity gate (local, `--ci-cmd` override — no just/make/npm entrypoint): `uv sync --frozen` + ruff format/check + full pytest → exit 0.
+- Wheel smoke (CI's exact script, clean venv, no dev deps): loads `football-wc2026`, normalizes the fixture via injected `http_get`, writes 24 events to a temp DB with pack side tables. Console script resolves.
+- Standalone: `rg 'from gamealerts|import gamealerts' src/` empty; golden captured once via `tests/football/golden/capture_golden.py` (gamealerts never imported at test time).
+- Taxonomy parity: 9 event types, exact gamealerts `EventType` value set with identical importance defaults; yellow-red 0–2 expansion ported byte-for-byte; golden byte-exact.
+- Note: the plan header `**Status**: Not Started` sits above the review marker (immutable contract section) and was deliberately left unedited to preserve the marker hash.
+- Outstanding before merge (see Findings): Phase 2 Important cross-partition child-table gap + Phase 4 minor source-blind resolve step (fix together); minor items from Phases 2–4; CI green on GitHub Actions still pending push.
