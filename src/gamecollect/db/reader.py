@@ -5,9 +5,10 @@ Per DESIGN.md §3 the database is read-only to everyone but collector daemons:
 ``PRAGMA query_only=ON``), so no code path through this module can issue DML —
 attempting a write on a reader connection raises ``sqlite3.OperationalError``.
 
-Consumers refuse a newer major schema version, same as daemons: a newer major
-means the file was written by a newer library whose layout this code does not
-understand.
+Consumers refuse a major schema version differing from the library's, same
+policy as ``connect()``: a newer major means the file was written by a newer
+library whose layout this code does not understand; an older major has a
+different table layout too, and only a daemon's ``connect()`` may migrate it.
 
 Reader contract: ``match_id`` is globally unambiguous (writers source-qualify
 unreconciled ids), so match-scoped reads take only ``match_id`` — no ``source``
@@ -44,9 +45,9 @@ def open_reader(path: str | Path) -> sqlite3.Connection:
     """Open an existing gamecollect database read-only and return a connection.
 
     Raises :class:`~gamecollect.db.migrations.SchemaVersionError` when the
-    file's stamped major is newer than this library's, and
-    ``sqlite3.OperationalError`` when the file does not exist (read-only mode
-    never creates a database).
+    file's stamped major differs from this library's (see module docstring),
+    and ``sqlite3.OperationalError`` when the file does not exist (read-only
+    mode never creates a database).
     """
     db_path = Path(path)
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, check_same_thread=False)
@@ -57,10 +58,11 @@ def open_reader(path: str | Path) -> sqlite3.Connection:
 
     try:
         version = get_schema_version(conn)
-        if version is not None and version[0] > SCHEMA_MAJOR:
+        if version is not None and version[0] != SCHEMA_MAJOR:
+            direction = "upgrade the library" if version[0] > SCHEMA_MAJOR else "migrate the file"
             raise SchemaVersionError(
                 f"database schema is v{version[0]}.{version[1]} but this library "
-                f"supports major v{SCHEMA_MAJOR}: upgrade the library to read this file"
+                f"supports major v{SCHEMA_MAJOR}: {direction} to read this file"
             )
     except BaseException:
         conn.close()

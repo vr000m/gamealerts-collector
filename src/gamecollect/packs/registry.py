@@ -114,6 +114,17 @@ def validate_pack(pack: object, *, entry_point_name: str | None = None) -> Sport
                 f"pack {name!r}: taxonomy[{key!r}] must be an EventTypeDecl, "
                 f"got {type(decl).__name__}"
             )
+        if not decl.display_name or not isinstance(decl.display_name, str):
+            raise PackValidationError(
+                f"pack {name!r}: taxonomy[{key!r}].display_name must be a non-empty string"
+            )
+        if not isinstance(decl.importance_default, int) or isinstance(
+            decl.importance_default, bool
+        ):
+            raise PackValidationError(
+                f"pack {name!r}: taxonomy[{key!r}].importance_default must be an int, "
+                f"got {decl.importance_default!r}"
+            )
 
     # 3. Prompt fragments — non-empty str -> str mapping.
     if not isinstance(pack.prompt_fragments, dict) or not pack.prompt_fragments:

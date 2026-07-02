@@ -78,6 +78,14 @@ _EVENT_COLUMNS = (
 _ENTITY_COLUMNS = ("kind", "display_name", "name_folded", "parent_entity", "payload")
 _STANDING_COLUMNS = ("points", "rank", "payload")
 
+# Key columns per table: only the keys a given write method actually consumes
+# are exempt from the unknown-key rejection, so a cross-table key (e.g. ``seq``
+# in a match row) fails loudly instead of being dropped.
+_MATCH_KEYS = frozenset({"match_id", "source"})
+_EVENT_KEYS = frozenset({"source", "match_id", "seq", "type"})
+_ENTITY_KEYS = frozenset({"source", "entity_id"})
+_STANDING_KEYS = frozenset({"source", "group_key", "entity_id"})
+
 
 def _utcnow() -> str:
     return datetime.now(UTC).isoformat()
@@ -135,27 +143,30 @@ class PartitionWriter:
         """
         self._check_source(match)
         match_id = self._require(match, "match_id")
-        provided = self._pick(match, _MATCH_COLUMNS)
+        provided = self._pick(match, _MATCH_COLUMNS, _MATCH_KEYS)
         provided.setdefault("updated_at", _utcnow())
 
-        owner = self._conn.execute(
-            "SELECT source FROM matches WHERE match_id = ?", (match_id,)
-        ).fetchone()
-        if owner is not None and owner[0] != self._source:
-            raise CrossPartitionError(
-                f"match {match_id!r} belongs to source {owner[0]!r}; "
-                f"this writer is scoped to {self._source!r}"
-            )
+        self._assert_match_owned(match_id)
 
         columns = ["match_id", "source", *provided]
         placeholders = ", ".join("?" for _ in columns)
         updates = ", ".join(f"{col} = excluded.{col}" for col in provided)
         with self._transaction():
-            self._conn.execute(
+            # The WHERE guard on the conflict clause closes the TOCTOU window
+            # left by _assert_match_owned's SELECT: if another source's row
+            # landed between the check and this statement, the update is a
+            # no-op (rowcount 0) instead of silently overwriting foreign data.
+            cursor = self._conn.execute(
                 f"INSERT INTO matches ({', '.join(columns)}) VALUES ({placeholders}) "
-                f"ON CONFLICT (match_id) DO UPDATE SET {updates}",
+                f"ON CONFLICT (match_id) DO UPDATE SET {updates} "
+                f"WHERE matches.source = excluded.source",
                 (match_id, self._source, *provided.values()),
             )
+            if cursor.rowcount == 0:
+                raise CrossPartitionError(
+                    f"match {match_id!r} was created by another source concurrently; "
+                    f"this writer is scoped to {self._source!r}"
+                )
 
     # ------------------------------------------------------------------
     # Events
@@ -181,6 +192,7 @@ class PartitionWriter:
         full-list re-polls stay cheap and legal).
         """
         batch = list(events)
+        self._assert_match_owned(match_id)
         for event in batch:
             self._check_source(event)
             seq = self._require(event, "seq")
@@ -207,7 +219,7 @@ class PartitionWriter:
         inserted = 0
         with self._transaction():
             for event in batch:
-                extras = self._pick(event, _EVENT_COLUMNS)
+                extras = self._pick(event, _EVENT_COLUMNS, _EVENT_KEYS)
                 columns = ["source", "match_id", "seq", "type", *extras]
                 placeholders = ", ".join("?" for _ in columns)
                 cursor = self._conn.execute(
@@ -235,13 +247,22 @@ class PartitionWriter:
         """
         self._check_source(entity)
         entity_id = self._require(entity, "entity_id")
-        provided = self._pick(entity, _ENTITY_COLUMNS)
+        provided = self._pick(entity, _ENTITY_COLUMNS, _ENTITY_KEYS)
         kind = provided.get("kind")
         display_name = provided.get("display_name")
         if not kind or not display_name:
             raise ValueError("entity rows require non-empty 'kind' and 'display_name'")
-        if provided.get("name_folded") is None:
-            provided["name_folded"] = fold(display_name)
+        # name_folded is always the core fold of display_name — accepting a
+        # caller-supplied value would break write-fold == query-fold.
+        folded = fold(display_name)
+        supplied = provided.get("name_folded")
+        if supplied is not None and supplied != folded:
+            raise ValueError(
+                f"supplied name_folded {supplied!r} differs from the core fold "
+                f"{folded!r} of {display_name!r}; omit name_folded and let the "
+                f"writer stamp it"
+            )
+        provided["name_folded"] = folded
 
         columns = ["source", "entity_id", *provided]
         placeholders = ", ".join("?" for _ in columns)
@@ -267,7 +288,7 @@ class PartitionWriter:
         self._check_source(standing)
         group_key = self._require(standing, "group_key")
         entity_id = self._require(standing, "entity_id")
-        provided = self._pick(standing, _STANDING_COLUMNS)
+        provided = self._pick(standing, _STANDING_COLUMNS, _STANDING_KEYS)
 
         columns = ["source", "group_key", "entity_id", *provided]
         placeholders = ", ".join("?" for _ in columns)
@@ -287,6 +308,7 @@ class PartitionWriter:
 
     def map_provider_match(self, provider: str, provider_match_id: str, match_id: str) -> None:
         """Record the provider-native → canonical match-id mapping for this source."""
+        self._assert_match_owned(match_id)
         with self._transaction():
             self._conn.execute(
                 "INSERT INTO provider_match_map (source, provider, provider_match_id, match_id) "
@@ -299,6 +321,24 @@ class PartitionWriter:
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
+
+    def _assert_match_owned(self, match_id: str) -> None:
+        """Raise when ``match_id`` exists under a different source.
+
+        Child-table writes (events, provider map) reference matches by their
+        globally-unique ``match_id``; without this check a writer scoped to
+        source B could build a shadow partition under source A's match and
+        break the match_id-global reader contract. An absent match row is
+        allowed — an event may legally land before its match is seeded.
+        """
+        owner = self._conn.execute(
+            "SELECT source FROM matches WHERE match_id = ?", (match_id,)
+        ).fetchone()
+        if owner is not None and owner[0] != self._source:
+            raise CrossPartitionError(
+                f"match {match_id!r} belongs to source {owner[0]!r}; "
+                f"this writer is scoped to {self._source!r}"
+            )
 
     def _check_source(self, row: Mapping[str, Any]) -> None:
         declared = row.get("source")
@@ -314,9 +354,10 @@ class PartitionWriter:
             raise ValueError(f"row is missing required key {key!r}")
         return value
 
-    def _pick(self, row: Mapping[str, Any], allowed: tuple[str, ...]) -> dict[str, Any]:
+    def _pick(
+        self, row: Mapping[str, Any], allowed: tuple[str, ...], key_columns: frozenset[str]
+    ) -> dict[str, Any]:
         """Extract known columns, rejecting unknown keys loudly."""
-        key_columns = {"match_id", "source", "seq", "type", "entity_id", "group_key"}
         unknown = set(row) - set(allowed) - key_columns
         if unknown:
             raise ValueError(f"unknown column(s) {sorted(unknown)}; core columns are {allowed}")

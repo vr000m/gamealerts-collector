@@ -242,3 +242,17 @@ class TestResolveCanonicalMatchId:
         writer.upsert_match({"match_id": "wc2026_md03_m04", "status": "SCHEDULED"})
         writer.map_provider_match("footballdata", match.match_id, "wc2026_md03_m04")
         assert resolve_canonical_match_id(conn, writer, match, PROVIDER) != "wc2026_md03_m04"
+
+
+class TestResolveCrossSourceIsolation:
+    def test_direct_seed_owned_by_other_source_is_not_bound(self, db):
+        """Review fix: step (b) must be source-scoped. A bare provider-native
+        id seeded by a DIFFERENT source is not this source's canonical row —
+        binding to it would append events under another partition's match."""
+        conn, writer = db
+        match = _match(home=None, away=None, kickoff=None)  # force (b)/(d) path only
+
+        other = PartitionWriter(conn, SOURCE_B)
+        other.upsert_match({"match_id": match.match_id, "status": "SCHEDULED"})
+
+        assert resolve_canonical_match_id(conn, writer, match, PROVIDER) is None

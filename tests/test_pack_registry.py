@@ -134,9 +134,9 @@ def _non_provider_factory():
 )
 def test_validation_rejects_pack_missing_a_contribution(pack, field, bad_value):
     broken = dataclasses.replace(pack, **{field: bad_value})
-    # "Rejects loudly": any raise with a non-empty message counts; the plan
-    # does not pin the exception type.
-    with pytest.raises(Exception, match=r"(?s)."):
+    # "Rejects loudly" means the registry's own validation error, not an
+    # incidental TypeError/AttributeError inside validate_pack.
+    with pytest.raises(registry.PackValidationError):
         validate_fn()(broken)
 
 
@@ -153,8 +153,10 @@ def test_pack_taxonomy_gates_event_types_at_write_time(tmp_path, pack):
         writer_method(writer, "event")(event_row("m1", 1, type=declared))
         conn.commit()
 
-        # Loud rejection of an undeclared type; exception type unpinned.
-        with pytest.raises(Exception, match=r"(?s)."):
+        # Loud rejection of an undeclared type at the writer boundary.
+        from gamecollect.db.writer import TaxonomyError
+
+        with pytest.raises(TaxonomyError):
             writer_method(writer, "event")(event_row("m1", 2, type="not-a-declared-type"))
     finally:
         conn.close()
@@ -176,3 +178,27 @@ def test_writer_without_taxonomy_stays_sport_agnostic(tmp_path):
         conn.commit()
     finally:
         conn.close()
+
+
+@pytest.mark.parametrize(
+    "bad_decl_kwargs",
+    [
+        {"display_name": ""},
+        {"importance_default": None},
+        {"importance_default": "high"},
+    ],
+)
+def test_validation_rejects_malformed_event_type_decl(pack, bad_decl_kwargs):
+    """Review fix: EventTypeDecl contents are validated, not just the type."""
+    from gamecollect.packs.spec import EventTypeDecl
+
+    key = next(iter(pack.taxonomy))
+    good = pack.taxonomy[key]
+    kwargs = {
+        "display_name": good.display_name,
+        "importance_default": good.importance_default,
+    } | bad_decl_kwargs
+    broken_taxonomy = dict(pack.taxonomy) | {key: EventTypeDecl(**kwargs)}
+    broken = dataclasses.replace(pack, taxonomy=broken_taxonomy)
+    with pytest.raises(registry.PackValidationError):
+        validate_fn()(broken)

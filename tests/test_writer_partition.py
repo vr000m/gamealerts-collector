@@ -29,7 +29,7 @@ from _phase2_helpers import (
 )
 
 from gamecollect.db.connection import connect
-from gamecollect.db.writer import PartitionWriter
+from gamecollect.db.writer import CrossPartitionError, PartitionWriter
 
 SRC = "wc2026-espn"
 OTHER = "euro2028-espn"
@@ -280,3 +280,77 @@ def test_two_processes_same_source_is_bounded_no_corruption_no_crash(db_path):
     assert len(seqs) == len(set(seqs)), "duplicate (source, match_id, seq) rows"
     assert set(seqs) <= set(range(N_EVENTS)), "seq values outside the written range"
     assert len(seqs) <= N_EVENTS
+
+
+# --- child-table match ownership ----------------------------------------------------
+# Review fix: events and provider-map writes must verify match_id ownership
+# against matches.source, or a writer scoped to source B could build a shadow
+# event partition under source A's match and break the match_id-global reader
+# contract (get_events_since takes no source parameter).
+
+
+def test_append_events_under_foreign_match_raises(db_path):
+    conn_a, wa = _writer(db_path, SRC)
+    writer_method(wa, "match")(match_row("m1"))
+    conn_a.commit()
+    conn_a.close()
+
+    conn_b, wb = _writer(db_path, OTHER)
+    with pytest.raises(CrossPartitionError, match="belongs to source"):
+        writer_method(wb, "event")(event_row("m1", 1))
+    conn_b.close()
+    with sqlite3.connect(db_path) as c:
+        assert c.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0
+
+
+def test_map_provider_match_to_foreign_match_raises(db_path):
+    conn_a, wa = _writer(db_path, SRC)
+    writer_method(wa, "match")(match_row("m1"))
+    conn_a.commit()
+    conn_a.close()
+
+    conn_b, wb = _writer(db_path, OTHER)
+    with pytest.raises(CrossPartitionError, match="belongs to source"):
+        writer_method(wb, "provider_map")("espn", "760440", "m1")
+    conn_b.close()
+    with sqlite3.connect(db_path) as c:
+        assert c.execute("SELECT COUNT(*) FROM provider_match_map").fetchone()[0] == 0
+
+
+def test_append_events_before_match_seeded_is_allowed(db_path):
+    # Soft-ref semantics: an event may legally land before its match row.
+    conn, w = _writer(db_path)
+    inserted = writer_method(w, "event")(event_row("m-unseeded", 1))
+    conn.commit()
+    conn.close()
+    assert inserted == 1
+
+
+# --- fold stamping is not caller-overridable -----------------------------------------
+
+
+def test_upsert_entity_rejects_mismatched_name_folded(db_path):
+    from gamecollect.fold import fold
+
+    conn, w = _writer(db_path)
+    with pytest.raises(ValueError, match="name_folded"):
+        writer_method(w, "entity")(entity_row("t1", "Türkiye", name_folded="not-the-fold"))
+    # Supplying the CORRECT fold is tolerated; the writer stamps it anyway.
+    writer_method(w, "entity")(entity_row("t2", "Türkiye", name_folded=fold("Türkiye")))
+    conn.commit()
+    conn.close()
+    with sqlite3.connect(db_path) as c:
+        stored = c.execute("SELECT name_folded FROM entities WHERE entity_id='t2'").fetchone()[0]
+    assert stored == fold("Türkiye")
+
+
+# --- cross-table keys fail loudly ----------------------------------------------------
+
+
+def test_cross_table_key_is_rejected_not_dropped(db_path):
+    conn, w = _writer(db_path)
+    with pytest.raises(ValueError, match="unknown column"):
+        writer_method(w, "match")(match_row("m1", seq=3))
+    with pytest.raises(ValueError, match="unknown column"):
+        writer_method(w, "entity")(entity_row("t1", "Qatar", group_key="A"))
+    conn.close()

@@ -99,3 +99,21 @@ def test_migration_idempotent_from_older_minor(db_path):
     connect(db_path).close()  # must be a no-op
     assert core_schema_sql(db_path) == after_first == baseline
     assert current_schema_version(db_path) == (major, minor)
+
+
+def test_reader_refuses_major_mismatch_both_directions(db_path):
+    """open_reader applies the same major policy as connect(): != refuses.
+
+    Review fix: the reader previously accepted older-major files, which have a
+    different table layout and would silently return wrong-shaped rows.
+    """
+    from gamecollect.db import reader
+
+    major, _minor = _fresh_db(db_path)
+    force_schema_version(db_path, major + 1, 0)
+    with pytest.raises(Exception, match="(?i)(schema|major|version)"):
+        reader.open_reader(db_path)
+
+    force_schema_version(db_path, major - 1, 0)
+    with pytest.raises(Exception, match="(?i)(schema|major|version)"):
+        reader.open_reader(db_path)

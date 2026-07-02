@@ -163,8 +163,13 @@ def resolve_canonical_match_id(
     if cached is not None:
         return cached
 
-    # (b) direct-seed back-compat: the provider id is itself a seeded canonical row
-    if reader.get_state(conn, provider_id) is not None:
+    # (b) direct-seed back-compat: the provider id is itself a seeded canonical
+    # row — but only when the row belongs to THIS source. In a shared
+    # multi-source DB a bare provider-native id could match a row seeded by a
+    # different source; binding to it would append this source's events under
+    # another partition's match. Fall through to (c)/(d) instead.
+    seeded = reader.get_state(conn, provider_id)
+    if seeded is not None and seeded["source"] == writer.source:
         return provider_id
 
     # (c) reconcile by (kickoff instant, team-set). Runs BEFORE the qualified
