@@ -217,7 +217,7 @@ Context lifecycle — what enters each step's working state and whether it clear
 - `rg 'from gamealerts|import gamealerts' src/` returns no matches.
 - Tests passing, code reviewed, `docs/DESIGN.md` amended if any contract detail was refined during implementation.
 
-<!-- /review-plan writes the marker line above. Everything below is the workspace: edits here do NOT invalidate the marker. -->
+<!-- reviewed: 2026-07-02 @ c8fa1763ef2419a71b59f0663a8e0428f188c945 -->
 
 ## Progress
 

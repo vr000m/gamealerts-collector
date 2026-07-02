@@ -25,7 +25,7 @@ Fixture ground truth (verified 2026-07-02 against the live DBs — note this cor
 ## Requirements
 
 - Engine daemon: one process per tournament (source); load pack → poll provider → diff → write via `PartitionWriter`; ported/adapted from gamealerts `collector/session.py` poll-loop mechanics, minus everything prose/voice (`summarizer.py` is explicitly NOT ported).
-- Client library: `list_matches`, `get_state`, `get_events_since(match_id, since_seq)`, `get_standings`, `get_squad`, `get_player_stats` — sync, typed returns, read-only, safe to call while daemons write (WAL).
+- Client library: `list_matches`, `get_state`, `get_events_since(match_id, since_seq)`, `get_standings`, `get_squad`, `get_player_stats` — sync, typed returns, read-only, safe to call while daemons write (WAL). `match_id` is globally unique (the foundation plan source-qualifies unreconciled canonical ids), so the reader resolves `source` internally via the `matches` row — no `source` parameter leaks into the client API even though `events` is keyed `(source, match_id, seq)`.
 - CLI `gamecollect`: argparse; every read subcommand has `--json`; `gamecollect tools --json` emits the manifest (subcommand names, args, output JSON Schemas) generated from the same registry the library exposes — the CLI cannot drift from the library by construction.
 - `ReplayProvider(fixture, speed=1.0)`: implements the provider ABC; replays a recorded fixture with original or accelerated timing; `speed=inf` (or `step()` mode) for deterministic tests.
 - Fixture format: JSON files checked into the repo (portable, diffable, no binary DBs in git) + an importer script that exports them from a gamealerts-schema SQLite file.
