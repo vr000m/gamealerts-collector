@@ -1,0 +1,16 @@
+# Development Plans
+
+Index of dev plans for gamealerts-collector. The plan file is the source of truth; this table is derived.
+
+## Current Tasks
+
+| Plan | Comp | Status | Branch | Notes |
+|------|------|--------|--------|-------|
+| [20260702-feature-collector-foundation](20260702-feature-collector-foundation.md) | collector | Not Started | feature/collector-scaffold | Scaffold, schema v1, pack SDK, football/WC2026 pack. Start here. |
+| [20260702-feature-collector-interfaces](20260702-feature-collector-interfaces.md) | collector | Not Started | feature/collector-interfaces | Engine daemon, client library, CLI + manifest, ReplayProvider + fixtures. Depends on foundation. |
+
+## Completed Tasks
+
+| Plan | Comp | Completed | Outcome |
+|------|------|-----------|---------|
+| — | | | |
