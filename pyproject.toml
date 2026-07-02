@@ -1,0 +1,33 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "gamecollect"
+description = "Sport-agnostic live-match data collector: generic SQLite schema, sport-pack SDK, and collector engine."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+dynamic = ["version"]
+dependencies = []
+
+[project.scripts]
+gamecollect = "gamecollect.cli:main"
+
+# Sport packs register here (group: gamecollect.packs).
+# Each value is a zero-arg factory returning a SportPack.
+# Core declares the group; packs (in-repo test-fixture pack, football pack)
+# are registered in later phases.
+[project.entry-points."gamecollect.packs"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.4",
+]
+
+[tool.hatch.version]
+path = "src/gamecollect/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gamecollect"]
