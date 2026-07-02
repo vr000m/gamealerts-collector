@@ -22,6 +22,7 @@ typed views belong to the client library layered on top (interfaces plan).
 from __future__ import annotations
 
 import sqlite3
+import urllib.parse
 from pathlib import Path
 from typing import Any
 
@@ -50,7 +51,11 @@ def open_reader(path: str | Path) -> sqlite3.Connection:
     mode never creates a database).
     """
     db_path = Path(path)
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, check_same_thread=False)
+    # Percent-escape the path: a literal '%', '?', or '#' in an unescaped URI
+    # is decoded/misparsed by SQLite, making the reader open a DIFFERENT file
+    # than connect() (which passes the plain path) would for the same input.
+    escaped = urllib.parse.quote(str(db_path))
+    conn = sqlite3.connect(f"file:{escaped}?mode=ro", uri=True, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
     # Belt and braces on top of mode=ro: the connection itself refuses DML.
@@ -58,7 +63,12 @@ def open_reader(path: str | Path) -> sqlite3.Connection:
 
     try:
         version = get_schema_version(conn)
-        if version is not None and version[0] != SCHEMA_MAJOR:
+        if version is None:
+            raise SchemaVersionError(
+                f"{db_path} has no schema_meta version stamp — not a gamecollect "
+                "database (or created by something other than connect())"
+            )
+        if version[0] != SCHEMA_MAJOR:
             direction = "upgrade the library" if version[0] > SCHEMA_MAJOR else "migrate the file"
             raise SchemaVersionError(
                 f"database schema is v{version[0]}.{version[1]} but this library "

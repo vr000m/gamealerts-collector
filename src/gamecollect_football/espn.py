@@ -482,21 +482,24 @@ def _normalize_key_event(raw: dict) -> list[NormalizedEvent]:
     and later events shift instead of colliding under ``INSERT OR IGNORE``. The
     events returned here carry a placeholder ``seq`` of -1.
     """
-    type_type = raw.get("type", {}).get("type", "")
+    # ``or {}`` guards present-but-null values: ESPN emits "athlete": null (etc.)
+    # on malformed events, and a bare .get(..., {}) default does not fire for
+    # an explicit null — the chained .get would raise AttributeError.
+    type_type = (raw.get("type") or {}).get("type", "")
 
-    clock_display = raw.get("clock", {}).get("displayValue") or None
+    clock_display = (raw.get("clock") or {}).get("displayValue") or None
     minute = _parse_minute(clock_display)
 
-    team = raw.get("team", {}).get("displayName") if raw.get("team") else None
+    team = (raw.get("team") or {}).get("displayName")
 
     # participants: first is player, second (if present) is assist
-    participants = raw.get("participants", [])
+    participants = raw.get("participants") or []
     player = None
     assist = None
     if participants:
-        player = participants[0].get("athlete", {}).get("displayName")
+        player = (participants[0].get("athlete") or {}).get("displayName")
     if len(participants) >= 2:
-        assist = participants[1].get("athlete", {}).get("displayName")
+        assist = (participants[1].get("athlete") or {}).get("displayName")
 
     detail = raw.get("text") or raw.get("shortText")
 
@@ -657,7 +660,13 @@ class ESPNAdapter(MatchDataProvider):
         """
         data = self._http_get(self.SCOREBOARD_URL, params=params)
         assert_espn_scoreboard_shape(data)
-        return [self._normalize_scoreboard_event(ev) for ev in data.get("events", [])]
+        # The shape assertion samples events[0] only; normalization of LATER
+        # events can still hit missing keys. Map those to ShapeDriftError so
+        # errors cross the provider seam only via the ProviderError hierarchy.
+        try:
+            return [self._normalize_scoreboard_event(ev) for ev in data.get("events", [])]
+        except (KeyError, IndexError, TypeError, AttributeError) as exc:
+            raise ShapeDriftError(f"malformed scoreboard event: {exc!r}") from exc
 
     def fetch_match_detail(self, match_id: str) -> NormalizedMatch:
         """
@@ -667,7 +676,10 @@ class ESPNAdapter(MatchDataProvider):
         """
         data = self._http_get(self.SUMMARY_URL, params={"event": match_id})
         assert_espn_summary_shape(data)
-        return self._normalize_summary(match_id, data)
+        try:
+            return self._normalize_summary(match_id, data)
+        except (KeyError, IndexError, TypeError, AttributeError) as exc:
+            raise ShapeDriftError(f"malformed summary for match {match_id!r}: {exc!r}") from exc
 
     # ------------------------------------------------------------------
     # Private normalization

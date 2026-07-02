@@ -154,3 +154,40 @@ class TestResponseSizeGuard:
             espn_mod, "MAX_RESPONSE_BYTES", None
         )
         assert isinstance(cap, int) and cap > 0, "response-size guard missing from the port"
+
+
+def test_malformed_later_scoreboard_event_raises_shape_drift():
+    """The shape assertion samples events[0]; a malformed LATER event must
+    still surface as ShapeDriftError, not raw KeyError (provider seam)."""
+    import copy
+
+    import pytest
+
+    from gamecollect.provider import ShapeDriftError
+    from gamecollect_football.espn import ESPNAdapter
+
+    good_event = {
+        "id": "1",
+        "competitions": [{"status": {"type": {"description": "In Progress"}}, "competitors": []}],
+    }
+    data = {"events": [copy.deepcopy(good_event), {"id": "2"}]}
+    adapter = ESPNAdapter(http_get=lambda url, params=None: data)
+    with pytest.raises(ShapeDriftError):
+        adapter.fetch_live_matches()
+
+
+def test_null_athlete_in_key_event_does_not_crash():
+    """ESPN emits present-but-null nested values; normalization must not
+    raise raw AttributeError (it previously escaped the ProviderError seam)."""
+    from gamecollect_football.espn import _normalize_key_event
+
+    raw = {
+        "type": {"type": "goal"},
+        "clock": {"displayValue": "12'"},
+        "team": None,
+        "participants": [{"athlete": None}],
+        "text": "Goal!",
+    }
+    events = _normalize_key_event(raw)
+    assert len(events) == 1
+    assert events[0].player is None and events[0].team is None

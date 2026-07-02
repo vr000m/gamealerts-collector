@@ -117,3 +117,36 @@ def test_reader_refuses_major_mismatch_both_directions(db_path):
     force_schema_version(db_path, major - 1, 0)
     with pytest.raises(Exception, match="(?i)(schema|major|version)"):
         reader.open_reader(db_path)
+
+
+def test_fresh_db_schema_matches_migrated_schema(db_path, tmp_path):
+    """Fresh path (schema.sql + stamp) and migration path must converge.
+
+    Guards the convention that schema.sql always reflects the LATEST schema:
+    a MIGRATIONS entry whose DDL is not folded into schema.sql would make a
+    fresh DB diverge from a migrated one and this test fail.
+    """
+    _fresh_db(db_path)
+    fresh = core_schema_sql(db_path)
+
+    migrated_path = tmp_path / "migrated.db"
+    major, minor = _fresh_db(migrated_path)
+    if minor > 0:
+        # Rewind the stamp and re-run the migration path over the baseline.
+        force_schema_version(migrated_path, major, 0)
+        connect(migrated_path).close()
+    assert core_schema_sql(migrated_path) == fresh
+
+
+def test_reader_refuses_unstamped_file(tmp_path):
+    """A SQLite file without a schema_meta stamp is not a gamecollect DB."""
+    import sqlite3
+
+    from gamecollect.db import reader
+    from gamecollect.db.migrations import SchemaVersionError
+
+    foreign = tmp_path / "foreign.db"
+    with sqlite3.connect(foreign) as c:
+        c.execute("CREATE TABLE unrelated (x)")
+    with pytest.raises(SchemaVersionError, match="schema_meta"):
+        reader.open_reader(foreign)

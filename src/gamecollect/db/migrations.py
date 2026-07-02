@@ -29,8 +29,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 # Library schema version. Bump MINOR for additive changes (new column/table/
-# index) with a matching entry in MIGRATIONS; bump MAJOR only for breaking
-# changes (which existing files cannot migrate to in place).
+# index) with a matching entry in MIGRATIONS **and the same DDL folded into
+# schema.sql** — schema.sql always reflects the LATEST schema; migrations only
+# upgrade existing files. The fresh-DB path applies schema.sql and stamps the
+# target version WITHOUT running MIGRATIONS, so a migration whose DDL is
+# missing from schema.sql would leave fresh files permanently short of it
+# (tests/test_migrations.py asserts fresh-vs-migrated schema parity).
+# Bump MAJOR only for breaking changes (not in-place upgradable).
 SCHEMA_MAJOR = 1
 SCHEMA_MINOR = 0
 

@@ -354,3 +354,15 @@ def test_cross_table_key_is_rejected_not_dropped(db_path):
     with pytest.raises(ValueError, match="unknown column"):
         writer_method(w, "entity")(entity_row("t1", "Qatar", group_key="A"))
     conn.close()
+
+
+def test_upsert_entities_batch_is_atomic(db_path):
+    """The batch shares one transaction: a bad row rolls back the whole batch."""
+    conn, w = _writer(db_path)
+    good = entity_row("t1", "Qatar")
+    bad = {"entity_id": "t2", "kind": "team"}  # missing display_name
+    with pytest.raises(ValueError):
+        w.upsert_entities([good, bad])
+    conn.close()
+    with sqlite3.connect(db_path) as c:
+        assert c.execute("SELECT COUNT(*) FROM entities").fetchone()[0] == 0

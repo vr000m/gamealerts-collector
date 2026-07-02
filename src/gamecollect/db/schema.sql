@@ -96,7 +96,11 @@ CREATE TABLE IF NOT EXISTS entities (
     PRIMARY KEY (source, entity_id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_entities_folded ON entities (source, kind, name_folded);
+-- name_folded leads: it is the one always-present predicate in
+-- find_entities_by_name (source/kind are optional filters), so this ordering
+-- serves all four filter combinations; (source, kind, ...) would force a
+-- full scan for name-only lookups.
+CREATE INDEX IF NOT EXISTS idx_entities_folded ON entities (name_folded, source, kind);
 
 -- ---------------------------------------------------------------------------
 -- Standings  (group tables, championship standings, ...)

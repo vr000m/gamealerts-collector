@@ -261,3 +261,38 @@ def test_reader_issues_no_dml(db_path):
     with sqlite3.connect(db_path) as c:
         assert c.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 2
         assert c.execute("SELECT COUNT(*) FROM matches").fetchone()[0] == 1
+
+
+def test_reader_and_writer_agree_on_paths_with_uri_metachars(tmp_path):
+    """connect() takes a plain path; open_reader builds a URI. A literal
+    '%' or '#' in the path must not make them address different files."""
+    from gamecollect.db import reader
+    from gamecollect.db.connection import connect
+
+    for weird in ("a%20b", "a#b"):
+        d = tmp_path / weird
+        d.mkdir()
+        db_path = d / "t.db"
+        connect(db_path).close()
+        ro = reader.open_reader(db_path)
+        try:
+            assert ro.execute("SELECT major FROM schema_meta").fetchone() is not None
+        finally:
+            ro.close()
+
+
+def test_folded_lookup_uses_index_without_source_or_kind(tmp_path):
+    """idx_entities_folded must serve a name-only lookup (no full scan)."""
+    from gamecollect.db.connection import connect
+
+    conn = connect(tmp_path / "idx.db")
+    try:
+        plan = " ".join(
+            row[3]
+            for row in conn.execute(
+                "EXPLAIN QUERY PLAN SELECT * FROM entities WHERE name_folded = ?", ("x",)
+            )
+        )
+        assert "idx_entities_folded" in plan, f"name-only lookup not indexed: {plan}"
+    finally:
+        conn.close()

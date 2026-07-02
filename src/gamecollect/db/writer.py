@@ -138,8 +138,12 @@ class PartitionWriter:
         """Insert or update one ``matches`` row (keyed by ``match_id``).
 
         Only the keys present in ``match`` are updated on conflict, so a live
-        update carrying score/minute does not wipe schedule fields written
-        earlier. ``updated_at`` is stamped automatically when not supplied.
+        update carrying score/minute does not wipe OTHER COLUMNS written
+        earlier. ``payload`` is a single column and is replaced WHOLESALE when
+        supplied — the writer does not merge JSON keys, so a caller whose
+        write paths emit different payload key-sets for the same match must
+        read-merge-write (or not send ``payload``) to avoid erasing keys.
+        ``updated_at`` is stamped automatically when not supplied.
         """
         self._check_source(match)
         match_id = self._require(match, "match_id")
@@ -245,6 +249,10 @@ class PartitionWriter:
         ``name_folded`` is stamped with the core fold of ``display_name``
         unless explicitly supplied (write-fold == query-fold by construction).
         """
+        with self._transaction():
+            self._execute_entity_upsert(entity)
+
+    def _execute_entity_upsert(self, entity: Mapping[str, Any]) -> None:
         self._check_source(entity)
         entity_id = self._require(entity, "entity_id")
         provided = self._pick(entity, _ENTITY_COLUMNS, _ENTITY_KEYS)
@@ -267,17 +275,21 @@ class PartitionWriter:
         columns = ["source", "entity_id", *provided]
         placeholders = ", ".join("?" for _ in columns)
         updates = ", ".join(f"{col} = excluded.{col}" for col in provided)
-        with self._transaction():
-            self._conn.execute(
-                f"INSERT INTO entities ({', '.join(columns)}) VALUES ({placeholders}) "
-                f"ON CONFLICT (source, entity_id) DO UPDATE SET {updates}",
-                (self._source, entity_id, *provided.values()),
-            )
+        self._conn.execute(
+            f"INSERT INTO entities ({', '.join(columns)}) VALUES ({placeholders}) "
+            f"ON CONFLICT (source, entity_id) DO UPDATE SET {updates}",
+            (self._source, entity_id, *provided.values()),
+        )
 
     def upsert_entities(self, entities: Iterable[Mapping[str, Any]]) -> None:
-        """Upsert a batch of entity rows (see :meth:`upsert_entity`)."""
-        for entity in entities:
-            self.upsert_entity(entity)
+        """Upsert a batch of entity rows in ONE transaction (one WAL commit).
+
+        A roster refresh is dozens of rows per match; committing per row would
+        cost one fsync each. All-or-nothing: a bad row rolls back the batch.
+        """
+        with self._transaction():
+            for entity in entities:
+                self._execute_entity_upsert(entity)
 
     # ------------------------------------------------------------------
     # Standings
