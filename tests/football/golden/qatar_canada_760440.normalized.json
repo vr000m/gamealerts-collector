@@ -1,0 +1,255 @@
+{
+  "events": [
+    {
+      "assist": null,
+      "detail": "First Half begins.",
+      "event_type": "kickoff",
+      "importance": 3,
+      "minute": null,
+      "player": null,
+      "seq": 0,
+      "team": null
+    },
+    {
+      "assist": null,
+      "detail": "Derek Cornelius (Canada) is shown the yellow card for a bad foul.",
+      "event_type": "yellow",
+      "importance": 3,
+      "minute": 9,
+      "player": "Derek Cornelius",
+      "seq": 1,
+      "team": "Canada"
+    },
+    {
+      "assist": null,
+      "detail": "Goal! Canada 1, Qatar 0. Cyle Larin (Canada) left footed shot from very close range to the bottom right corner following a corner.",
+      "event_type": "goal",
+      "importance": 1,
+      "minute": 16,
+      "player": "Cyle Larin",
+      "seq": 2,
+      "team": "Canada"
+    },
+    {
+      "assist": null,
+      "detail": "Goal! Canada 2, Qatar 0. Jonathan David (Canada) right footed shot from the right side of the box to the bottom right corner.",
+      "event_type": "goal",
+      "importance": 1,
+      "minute": 29,
+      "player": "Jonathan David",
+      "seq": 3,
+      "team": "Canada"
+    },
+    {
+      "assist": null,
+      "detail": "Homam El Amin (Qatar) is shown the red card.",
+      "event_type": "red",
+      "importance": 2,
+      "minute": 33,
+      "player": "Homam Ahmed",
+      "seq": 4,
+      "team": "Qatar"
+    },
+    {
+      "assist": "Yusuf Abdurisag",
+      "detail": "Substitution, Qatar. Sultan Al Brake replaces Yusuf Abdurisag.",
+      "event_type": "sub",
+      "importance": 4,
+      "minute": 40,
+      "player": "Sultan Al-Brake",
+      "seq": 5,
+      "team": "Qatar"
+    },
+    {
+      "assist": null,
+      "detail": "Goal! Canada 3, Qatar 0. Jonathan David (Canada) right footed shot from very close range to the centre of the goal.",
+      "event_type": "goal",
+      "importance": 1,
+      "minute": 45,
+      "player": "Jonathan David",
+      "seq": 6,
+      "team": "Canada"
+    },
+    {
+      "assist": null,
+      "detail": null,
+      "event_type": "half_time",
+      "importance": 3,
+      "minute": 45,
+      "player": null,
+      "seq": 7,
+      "team": null
+    },
+    {
+      "assist": "Edmílson Junior",
+      "detail": "Substitution, Qatar. Ahmed Fathy replaces Edmílson Junior.",
+      "event_type": "sub",
+      "importance": 4,
+      "minute": 45,
+      "player": "Ahmed Fathy",
+      "seq": 8,
+      "team": "Qatar"
+    },
+    {
+      "assist": "Jassem Gaber",
+      "detail": "Substitution, Qatar. Mohammad Al Manai replaces Jassem Gaber.",
+      "event_type": "sub",
+      "importance": 4,
+      "minute": 45,
+      "player": "Mohamed Manai",
+      "seq": 9,
+      "team": "Qatar"
+    },
+    {
+      "assist": "Derek Cornelius",
+      "detail": "Substitution, Canada. Moïse Bombito replaces Derek Cornelius.",
+      "event_type": "sub",
+      "importance": 4,
+      "minute": 45,
+      "player": "Moïse Bombito",
+      "seq": 10,
+      "team": "Canada"
+    },
+    {
+      "assist": null,
+      "detail": "Assim Madibo (Qatar) is shown the red card.",
+      "event_type": "red",
+      "importance": 2,
+      "minute": 53,
+      "player": "Assim Madibo",
+      "seq": 11,
+      "team": "Qatar"
+    },
+    {
+      "assist": "Ismaël Koné",
+      "detail": "Substitution, Canada. Nathan Saliba replaces Ismaël Koné because of an injury.",
+      "event_type": "sub",
+      "importance": 4,
+      "minute": 57,
+      "player": "Nathan Saliba",
+      "seq": 12,
+      "team": "Canada"
+    },
+    {
+      "assist": "Akram Afif",
+      "detail": "Substitution, Qatar. Al Hashmi Al Hussain replaces Akram Afif.",
+      "event_type": "sub",
+      "importance": 4,
+      "minute": 59,
+      "player": "Al-Hashmi Al-Hussain",
+      "seq": 13,
+      "team": "Qatar"
+    },
+    {
+      "assist": null,
+      "detail": "Ahmed Fathy (Qatar) is shown the yellow card for a bad foul.",
+      "event_type": "yellow",
+      "importance": 3,
+      "minute": 62,
+      "player": "Ahmed Fathy",
+      "seq": 14,
+      "team": "Qatar"
+    },
+    {
+      "assist": null,
+      "detail": "Goal! Canada 4, Qatar 0. Nathan Saliba (Canada) from a free kick with a right footed shot to the bottom right corner.",
+      "event_type": "goal",
+      "importance": 1,
+      "minute": 64,
+      "player": "Nathan Saliba",
+      "seq": 15,
+      "team": "Canada"
+    },
+    {
+      "assist": "Luc de Fougerolles",
+      "detail": "Substitution, Canada. Jacob Shaffelburg replaces Luc De Fougerolles.",
+      "event_type": "sub",
+      "importance": 4,
+      "minute": 71,
+      "player": "Jacob Shaffelburg",
+      "seq": 16,
+      "team": "Canada"
+    },
+    {
+      "assist": "Ali Ahmed",
+      "detail": "Substitution, Canada. Tani Oluwaseyi replaces Ali Ahmed.",
+      "event_type": "sub",
+      "importance": 4,
+      "minute": 71,
+      "player": "Tani Oluwaseyi",
+      "seq": 17,
+      "team": "Canada"
+    },
+    {
+      "assist": null,
+      "detail": "Own Goal by Mohammad Al Manai, Qatar. Canada 5, Qatar 0.",
+      "event_type": "own_goal",
+      "importance": 1,
+      "minute": 75,
+      "player": "Mohamed Manai",
+      "seq": 18,
+      "team": "Canada"
+    },
+    {
+      "assist": null,
+      "detail": "Second yellow card",
+      "event_type": "yellow",
+      "importance": 3,
+      "minute": 78,
+      "player": "Derek Cornelius",
+      "seq": 19,
+      "team": "Canada"
+    },
+    {
+      "assist": null,
+      "detail": "Derek Cornelius (Canada) is shown the second yellow card and is sent off.",
+      "event_type": "red",
+      "importance": 2,
+      "minute": 78,
+      "player": "Derek Cornelius",
+      "seq": 20,
+      "team": "Canada"
+    },
+    {
+      "assist": "Tajon Buchanan",
+      "detail": "Substitution, Canada. Niko Sigur replaces Tajon Buchanan.",
+      "event_type": "sub",
+      "importance": 4,
+      "minute": 83,
+      "player": "Niko Sigur",
+      "seq": 21,
+      "team": "Canada"
+    },
+    {
+      "assist": "Ahmed Fathy",
+      "detail": "Substitution, Qatar. Lucas Mendes replaces Ahmed Fathy.",
+      "event_type": "sub",
+      "importance": 4,
+      "minute": 87,
+      "player": "Lucas Mendes",
+      "seq": 22,
+      "team": "Qatar"
+    },
+    {
+      "assist": "Nathan Saliba",
+      "detail": "Goal! Canada 6, Qatar 0. Jonathan David (Canada) left footed shot from the centre of the box to the top left corner. Assisted by Nathan Saliba.",
+      "event_type": "goal",
+      "importance": 1,
+      "minute": 90,
+      "player": "Jonathan David",
+      "seq": 23,
+      "team": "Canada"
+    }
+  ],
+  "match": {
+    "away_team": "Qatar",
+    "display_clock": null,
+    "home_team": "Canada",
+    "kickoff_utc": "2026-06-18T22:00Z",
+    "match_id": "760440",
+    "minute": null,
+    "score_away": 0,
+    "score_home": 6,
+    "status": "FINISHED"
+  }
+}

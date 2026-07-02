@@ -50,3 +50,74 @@ jobs:
         run: |
           /tmp/smoke-venv/bin/python -c "import gamecollect; print(gamecollect.__version__)"
           /tmp/smoke-venv/bin/gamecollect
+
+      # Phase 4 extension of the clean-venv smoke: the installed wheel (no dev
+      # deps) must load the football pack via its entry point, normalize the
+      # checked-in ESPN fixture offline, and write a temp DB (pack side tables
+      # applied) — the acceptance-criteria end-to-end path.
+      - name: Football pack smoke (load pack -> normalize fixture -> write DB)
+        run: |
+          /tmp/smoke-venv/bin/python - <<'EOF'
+          import json
+          import tempfile
+          from importlib import resources
+          from pathlib import Path
+
+          from gamecollect.db.connection import connect
+          from gamecollect.db.writer import PartitionWriter
+          from gamecollect.packs.registry import load_pack
+          from gamecollect_football.espn import ESPNAdapter
+
+          pack = load_pack("football-wc2026")
+          fixture = json.loads(
+              resources.files("gamecollect_football")
+              .joinpath("fixtures/qatar_canada_760440.summary.json")
+              .read_text(encoding="utf-8")
+          )
+          adapter = ESPNAdapter(http_get=lambda url, params=None: fixture)
+          match = adapter.fetch_match_detail("760440")
+          assert match.events, "no events normalized from fixture"
+          assert match.payload["stats"], "no stats normalized from fixture"
+
+          db_path = Path(tempfile.mkdtemp()) / "smoke.db"
+          conn = connect(db_path, side_table_ddl=pack.side_table_ddl)
+          writer = PartitionWriter(conn, "wc2026", taxonomy=pack.event_types)
+          writer.upsert_match(
+              {
+                  "match_id": match.match_id,
+                  "kickoff_utc": match.kickoff_utc,
+                  "status": match.status.value,
+                  "minute": match.minute,
+                  "score_home": match.score_home,
+                  "score_away": match.score_away,
+                  "display_clock": match.display_clock,
+                  "payload": match.payload,
+              }
+          )
+          inserted = writer.append_events(
+              match.match_id,
+              [
+                  {
+                      "seq": ev.seq,
+                      "type": ev.event_type,
+                      "minute": ev.minute,
+                      "importance": ev.importance,
+                      "detail": ev.detail,
+                      "payload": {"team": ev.team, "player": ev.player, "assist": ev.assist},
+                  }
+                  for ev in match.events
+              ],
+          )
+          assert inserted == len(match.events), (inserted, len(match.events))
+          count = conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+          assert count == inserted, (count, inserted)
+          side_tables = {
+              row[0]
+              for row in conn.execute(
+                  "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'football_%'"
+              )
+          }
+          assert side_tables == {"football_stats", "football_lineups"}, side_tables
+          conn.close()
+          print(f"football wheel smoke OK: {inserted} events written to {db_path}")
+          EOF

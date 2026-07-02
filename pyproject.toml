@@ -16,9 +16,12 @@ gamecollect = "gamecollect.cli:main"
 
 # Sport packs register here (group: gamecollect.packs).
 # Each value is a zero-arg factory returning a SportPack.
-# Core declares the group; packs (in-repo test-fixture pack, football pack)
-# are registered in later phases.
+# The football pack ships in this same wheel as a second package
+# (src/gamecollect_football) but consumes the SDK only through public API +
+# this entry point; the dev-only test-fixture pack registers its own entry
+# point from tests/fixture_pack.
 [project.entry-points."gamecollect.packs"]
+football-wc2026 = "gamecollect_football.pack:pack"
 
 [dependency-groups]
 dev = [
@@ -37,4 +40,4 @@ gamecollect-test-fixture-pack = { path = "tests/fixture_pack", editable = true }
 path = "src/gamecollect/__init__.py"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/gamecollect"]
+packages = ["src/gamecollect", "src/gamecollect_football"]
