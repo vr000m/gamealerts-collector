@@ -47,7 +47,7 @@ Fixture ground truth (verified 2026-07-02 against the live DBs — note this cor
 **Test files:** `tests/test_engine.py`
 **Test command:** `uv run pytest tests/test_engine.py -q`
 
-- `engine.py`: `CollectorEngine(pack, db_path, source, poll_interval)` — poll loop with jittered interval, provider-error backoff, graceful shutdown on SIGTERM; adapted from gamealerts `collector/session.py` mechanics (no prose, no IPC).
+- `engine.py`: `CollectorEngine(pack, db_path, source, poll_interval)` — poll loop with jittered interval, provider-error backoff, graceful shutdown on SIGTERM; opens the DB with `connect(db_path, side_table_ddl=pack.side_table_ddl)` before constructing `PartitionWriter(conn, source, taxonomy=pack.taxonomy)` so pack side tables and taxonomy validation are active; adapted from gamealerts `collector/session.py` mechanics (no prose, no IPC).
 - `diffing.py`: compute new events (by seq) and changed match state between polls so writes are minimal; port the diff discipline from gamealerts' session loop.
 - Tests: fake provider (scripted `NormalizedMatch` sequences) drives the engine against a temp DB; assert idempotent re-poll (no duplicate events), backoff on `ProviderUnavailableError`, clean shutdown.
 
@@ -109,6 +109,7 @@ Fixture ground truth (verified 2026-07-02 against the live DBs — note this cor
 |------|---------------|---------------|----------|
 | operation registry | Phase 2 | Phase 3 CLI + manifest | Registry entry = (name, params, output schema, impl); CLI/manifest generated, never hand-edited |
 | provider ABC | foundation plan | Phase 1 engine, Phase 4 replay | Engine consumes ABC only; replay indistinguishable from live |
+| connection setup | foundation plan `connect(path, *, side_table_ddl=())` | Phase 1 engine | Engine passes the loaded pack's `side_table_ddl`; core schema/migrations still run before pack side-table DDL |
 | fixture format | Phase 4 `fixture_io` | Phase 4 importer + replay; gamealerts eval harness (external) | Versioned JSON: header + ordered timed events + entities; facts only |
 | `--record` output | Phase 1 engine flag | Phase 4 `fixture_io` | Recording a live session yields a fixture `read_fixture` accepts |
 | JSON output schemas | Phase 3 golden files | external consumers (gamealerts workers, third parties) | Breaking change ⇒ `contract_version` bump + golden diff in review |
