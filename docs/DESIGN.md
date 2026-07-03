@@ -70,6 +70,15 @@ A pack is a Python package (entry-point registered) supplying:
 - display metadata (replaces the menubar's baked-in `teams.json`),
 - compaction boundaries (half-time, innings, stints — used by workers to
   compact context).
+- a `seed_match(conn, writer, match) -> str | None` hook: the collection engine
+  is sport-agnostic and never imports a pack, so it reaches a pack's
+  seed/reconcile logic only through this hook. It must ensure a `matches` row
+  exists (owned by `writer.source`) before the engine appends the match's
+  events and return the canonical `match_id` to write children against; `None`
+  means the match could not be seeded (e.g. missing identity fields) and the
+  engine skips its child writes for that poll. Football wires
+  `register_unreconciled_match` (source-qualified strip rows); packs emitting
+  already-canonical ids can rely on the core `default_seed_match`.
 
 First pack: football / FIFA World Cup 2026 (ported from gamealerts). A second
 tournament (e.g. Champions League) should be ~configuration on that pack.
@@ -98,6 +107,14 @@ the eval/hardening harness for any consumer: replay a recorded match, assert
 consumer behavior against ground truth (facts-only checks against the event
 log are the strongest hallucination guard). Recording is symmetric: any live
 session can be captured as a replayable fixture.
+
+Fixture format (`gamecollect.fixture_io`, one match per file, checked into git
+as JSON): a `format_version` field, a `match` header (id, status, minute,
+score, clock, team names, kickoff, payload), an `events` list in seq order
+carrying the full `NormalizedEvent` shape, and nullable `entities`/`standings`
+snapshots (a live `--record` session only sees `NormalizedMatch` state, so it
+records those empty; the importer fills them from the source DB). The engine's
+`--record` flag writes fixtures through the same module a replay reads.
 
 Seed fixtures to import from gamealerts' DBs: Morocco–Haiti 4–2 (21 events +
 21 commentary rows, real DB), Canada–Qatar 6–0 (fictional DB; Jonathan David
