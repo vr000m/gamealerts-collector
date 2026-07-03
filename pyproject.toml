@@ -1,0 +1,43 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "gamecollect"
+description = "Sport-agnostic live-match data collector: generic SQLite schema, sport-pack SDK, and collector engine."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+dynamic = ["version"]
+dependencies = []
+
+[project.scripts]
+gamecollect = "gamecollect.cli:main"
+
+# Sport packs register here (group: gamecollect.packs).
+# Each value is a zero-arg factory returning a SportPack.
+# The football pack ships in this same wheel as a second package
+# (src/gamecollect_football) but consumes the SDK only through public API +
+# this entry point; the dev-only test-fixture pack registers its own entry
+# point from tests/fixture_pack.
+[project.entry-points."gamecollect.packs"]
+football-wc2026 = "gamecollect_football.pack:pack"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.4",
+    # In-repo test-fixture pack (dev only): registers the 'test-fixture' entry
+    # point so registry tests exercise real importlib.metadata discovery. Never
+    # part of the shipped gamecollect wheel.
+    "gamecollect-test-fixture-pack",
+]
+
+[tool.uv.sources]
+gamecollect-test-fixture-pack = { path = "tests/fixture_pack", editable = true }
+
+[tool.hatch.version]
+path = "src/gamecollect/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gamecollect", "src/gamecollect_football"]
