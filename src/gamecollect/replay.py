@@ -36,6 +36,7 @@ from __future__ import annotations
 import math
 import time
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 
 from gamecollect.fixture_io import Fixture, read_fixture
@@ -145,14 +146,20 @@ class ReplayProvider(MatchDataProvider):
 
     @property
     def exhausted(self) -> bool:
-        """True once every recorded event has been revealed.
+        """True once every recorded event has been *revealed by a fetch call*.
 
-        Drives the engine-driven replay loop's stop condition. A zero-event
-        fixture is exhausted from the outset.
+        Drives the engine-driven replay loop's stop condition. Reflects
+        ``self._revealed`` — the count the last :meth:`fetch_live_matches`
+        returned — in BOTH modes, so it never runs ahead of the events a
+        consumer has actually received. A wall-clock reading (paced
+        ``_paced_count``) would report exhaustion the instant enough time
+        elapsed, letting the stop-then-check loop truncate the tail events that
+        no fetch has yet revealed; it would also lazily start the pacing clock as
+        a side effect of merely reading the property. Tying it to ``_revealed``
+        avoids both. A zero-event fixture is exhausted from the outset (no fetch
+        needed).
         """
-        if self._step_mode:
-            return self._revealed >= len(self._events)
-        return self._paced_count() >= len(self._events)
+        return self._revealed >= len(self._events)
 
     def _paced_count(self) -> int:
         """Number of leading events whose recorded time has elapsed (paced mode)."""
@@ -171,17 +178,8 @@ class ReplayProvider(MatchDataProvider):
 
     def _snapshot(self) -> NormalizedMatch:
         """Fixture header state (verbatim) plus the revealed event prefix."""
-        match = self._match
-        return NormalizedMatch(
-            match_id=match.match_id,
-            status=match.status,
-            minute=match.minute,
-            score_home=match.score_home,
-            score_away=match.score_away,
-            display_clock=match.display_clock,
+        return replace(
+            self._match,
             events=list(self._events[: self._revealed]),
-            home_team=match.home_team,
-            away_team=match.away_team,
-            kickoff_utc=match.kickoff_utc,
-            payload=dict(match.payload),
+            payload=dict(self._match.payload),
         )

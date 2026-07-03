@@ -685,12 +685,14 @@ def test_engine_constructor_positional_signature(tmp_path):
 
 def test_record_multi_match_json_path_writes_siblings(tmp_path):
     from gamecollect.engine import CollectorEngine
+    from gamecollect.fixture_io import fixture_stem
 
     db = tmp_path / "engine.db"
     # A ``.json`` record path with more than one match cannot be that single
     # file for all of them; the engine must write unambiguous sibling files
-    # ``<stem>-<match_id>.json`` rather than a directory literally named
-    # ``session.json``.
+    # ``<stem>-<fixture_stem(match_id)>.json`` rather than a directory literally
+    # named ``session.json``. The per-match stem is the collision-proof
+    # ``fixture_stem`` (sanitized id + short hash), not the raw id.
     record = tmp_path / "session.json"
     m1 = nm("m1", (ev(0, "goal"),))
     m2 = nm("m2", (ev(0, "goal"),))
@@ -700,10 +702,75 @@ def test_record_multi_match_json_path_writes_siblings(tmp_path):
 
     # No directory masquerading as the ``.json`` path.
     assert not record.is_dir()
-    sib1 = tmp_path / "session-m1.json"
-    sib2 = tmp_path / "session-m2.json"
+    sib1 = tmp_path / f"session-{fixture_stem('m1')}.json"
+    sib2 = tmp_path / f"session-{fixture_stem('m2')}.json"
     assert sib1.is_file(), f"expected sibling fixture {sib1.name}"
     assert sib2.is_file(), f"expected sibling fixture {sib2.name}"
     # Each sibling is a valid fixture for its own match.
     assert json.loads(sib1.read_text())["match"]["match_id"] == "m1"
     assert json.loads(sib2.read_text())["match"]["match_id"] == "m2"
+
+
+# --------------------------------------------------------------------------- #
+# display_clock survives the engine write path
+# --------------------------------------------------------------------------- #
+
+
+def test_engine_persists_display_clock_to_db(tmp_path):
+    """A provider-supplied ``display_clock`` must round-trip to the ``matches``
+    row. The writer accepts the column and the read contract exposes it, but the
+    seed/upsert dict on the engine path historically omitted it, so the value was
+    silently dropped. Drive one poll through the default seed hook and assert the
+    stored row carries the clock."""
+    from gamecollect.engine import CollectorEngine
+    from gamecollect.packs.spec import default_seed_match
+
+    db = tmp_path / "clock.db"
+    match = nm("m-clock", (ev(0, "goal"),), display_clock="45'+2")
+    provider = ScriptedProvider([[match]])
+    # default_seed_match seeds under the bare provider id "m-clock".
+    pack = make_pack(provider, seed_match=default_seed_match)
+    engine = CollectorEngine(pack, str(db), SOURCE, 0.01)
+    run_engine(engine, provider)
+
+    conn = read_db(db)
+    try:
+        row = reader.get_state(conn, "m-clock")
+    finally:
+        conn.close()
+    assert row is not None, "the match row was not seeded"
+    assert row["display_clock"] == "45'+2", "provider display_clock must reach the DB"
+
+
+# --------------------------------------------------------------------------- #
+# close(): flush-once, always close the connection, idempotent
+# --------------------------------------------------------------------------- #
+
+
+def test_close_flush_failure_closes_conn_and_is_idempotent(tmp_path):
+    """A failing ``--record`` flush must not leak the WAL connection nor re-raise
+    on a second ``close()``. The record path points through a regular file (so
+    ``write_fixture``'s ``mkdir`` raises): the first ``close()`` surfaces the
+    error once but still closes the connection; the second ``close()`` is a
+    no-op (the record was cleared before the flush was attempted)."""
+    from gamecollect.engine import CollectorEngine
+
+    db = tmp_path / "close.db"
+    # A regular file where write_fixture needs a parent directory forces mkdir
+    # (and thus the flush) to raise.
+    blocker = tmp_path / "blocker"
+    blocker.write_text("x")
+    record = blocker / "session.json"
+
+    match = nm("m1", (ev(0, "goal"),))
+    provider = ScriptedProvider([[match]])
+    engine = CollectorEngine(make_pack(provider), str(db), SOURCE, 0.01, record_path=str(record))
+    # One poll populates the record accumulator without run_engine's own close().
+    engine.poll_once()
+
+    with pytest.raises(OSError):
+        engine.close()
+    assert engine._conn is None, "connection must be closed even when the flush fails"
+
+    # A second close() must not re-run the failing flush.
+    engine.close()

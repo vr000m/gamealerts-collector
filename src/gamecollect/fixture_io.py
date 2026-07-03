@@ -17,6 +17,7 @@ misreading a future layout.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -24,7 +25,14 @@ from typing import Any
 
 from gamecollect.provider import MatchStatus, NormalizedEvent, NormalizedMatch
 
-__all__ = ["FORMAT_VERSION", "Fixture", "FixtureFormatError", "write_fixture", "read_fixture"]
+__all__ = [
+    "FORMAT_VERSION",
+    "Fixture",
+    "FixtureFormatError",
+    "write_fixture",
+    "read_fixture",
+    "fixture_stem",
+]
 
 # Bump when the on-disk layout changes incompatibly; read_fixture refuses any
 # other version rather than guessing at an unknown shape.
@@ -33,6 +41,22 @@ FORMAT_VERSION = 1
 
 class FixtureFormatError(ValueError):
     """A fixture file is malformed or carries an unsupported ``format_version``."""
+
+
+def fixture_stem(match_id: str) -> str:
+    """A collision-proof filename stem for a fixture named after ``match_id``.
+
+    Sanitizing a match_id for the filesystem is lossy: ``espn:760464`` and
+    ``espn_760464`` both fold to ``espn_760464``, so two distinct matches would
+    silently overwrite one shared file. To keep the stem both filesystem-safe
+    and injective, a short stable hash of the *original* id is appended — the
+    sanitized part stays human-readable, the hash makes the whole stem unique
+    per source id. The hash is derived from the raw id (not the sanitized form),
+    so ids that sanitize alike still get distinct stems.
+    """
+    sanitized = "".join(c if c.isalnum() or c in "-_." else "_" for c in match_id)
+    digest = hashlib.sha1(match_id.encode("utf-8")).hexdigest()[:8]
+    return f"{sanitized}-{digest}"
 
 
 @dataclass
@@ -131,6 +155,8 @@ def read_fixture(path: str | Path) -> Fixture:
         )
 
     header = _require(data, "match")
+    if not isinstance(header, dict):
+        raise FixtureFormatError(f"fixture {path!r} 'match' is not a JSON object")
     try:
         status = MatchStatus(header["status"])
     except (KeyError, ValueError) as exc:
@@ -138,23 +164,38 @@ def read_fixture(path: str | Path) -> Fixture:
             f"fixture {path!r} has a missing/unknown match status: {exc}"
         ) from exc
 
-    events = [
-        NormalizedEvent(
-            seq=event["seq"],
-            minute=event.get("minute"),
-            event_type=event["event_type"],
-            importance=event["importance"],
-            team=event.get("team"),
-            player=event.get("player"),
-            assist=event.get("assist"),
-            detail=event.get("detail"),
-        )
-        for event in data.get("events", [])
-    ]
+    raw_events = data.get("events", [])
+    if not isinstance(raw_events, list):
+        raise FixtureFormatError(f"fixture {path!r} 'events' is not a JSON array")
+    events = []
+    for index, event in enumerate(raw_events):
+        if not isinstance(event, dict):
+            raise FixtureFormatError(f"fixture {path!r} event {index} is not a JSON object")
+        try:
+            events.append(
+                NormalizedEvent(
+                    seq=event["seq"],
+                    minute=event.get("minute"),
+                    event_type=event["event_type"],
+                    importance=event["importance"],
+                    team=event.get("team"),
+                    player=event.get("player"),
+                    assist=event.get("assist"),
+                    detail=event.get("detail"),
+                )
+            )
+        except KeyError as exc:
+            raise FixtureFormatError(
+                f"fixture {path!r} event {index} is missing required key {exc}"
+            ) from exc
     events.sort(key=lambda e: e.seq)
 
+    try:
+        match_id = header["match_id"]
+    except KeyError as exc:
+        raise FixtureFormatError(f"fixture {path!r} 'match' is missing required key {exc}") from exc
     match = NormalizedMatch(
-        match_id=header["match_id"],
+        match_id=match_id,
         status=status,
         minute=header.get("minute"),
         score_home=header.get("score_home"),

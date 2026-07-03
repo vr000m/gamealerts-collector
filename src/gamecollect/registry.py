@@ -302,8 +302,3 @@ def build_registry(packs: Iterable[Any] = ()) -> Registry:
         for op in getattr(pack, "operations", ()):
             registry.register(op)
     return registry
-
-
-# A ready-made core-only registry for callers that need the sport-agnostic
-# surface without loading a pack.
-CORE_REGISTRY = build_registry()

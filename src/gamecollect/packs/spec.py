@@ -45,6 +45,7 @@ def default_seed_match(
             "minute": match.minute,
             "score_home": match.score_home,
             "score_away": match.score_away,
+            "display_clock": match.display_clock,
             "kickoff_utc": match.kickoff_utc,
         }
     )

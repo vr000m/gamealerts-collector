@@ -54,6 +54,7 @@ def load_registry(
     *,
     pack_loader: Callable[[str], Any] = load_pack,
     names: Sequence[str] | None = None,
+    loaded_packs: dict[str, Any] | None = None,
 ) -> Registry:
     """Build the merged registry: core ops plus every installed pack's ops.
 
@@ -61,17 +62,36 @@ def load_registry(
     (:func:`~gamecollect.packs.registry.pack_names`); each is loaded and its
     contributed operations merged onto the core set. A pack that fails to load
     or validate is logged and skipped — a broken pack must not take the whole
-    CLI (and its core reads) down with it. ``pack_loader``/``names`` are
-    injectable so tests can pin a deterministic registry.
+    CLI (and its core reads) down with it. Duplicate entry-point names (a wheel
+    installed alongside an editable checkout can register the same name twice)
+    are de-duplicated before loading, and the registry merge is done pack by pack
+    so a pack whose op name collides with core or an already-merged pack is
+    skipped with a loud warning rather than raising and killing even the core
+    reads. ``pack_loader``/``names`` are injectable so tests can pin a
+    deterministic registry; ``loaded_packs``, when supplied, is populated with
+    the successfully-merged ``{name: pack}`` so callers (``collect``) can reuse
+    the already-loaded pack instead of loading it a second time.
     """
-    pack_list = list(names) if names is not None else list(pack_names())
-    packs: list[Any] = []
+    seen: set[str] = set()
+    pack_list: list[str] = []
+    for name in list(names) if names is not None else list(pack_names()):
+        if name in seen:
+            # A duplicate entry-point name (e.g. wheel + editable install of the
+            # same pack) would otherwise be loaded and merged twice, and the
+            # second merge would collide on every op name. Load each name once.
+            log.warning("ignoring duplicate pack entry-point name %r", name)
+            continue
+        seen.add(name)
+        pack_list.append(name)
+
+    accepted: list[Any] = []
     for name in pack_list:
         try:
-            packs.append(pack_loader(name))
+            pack = pack_loader(name)
         except PackError as exc:
             # An expected, structured pack failure (bad spec, dup op, etc.).
             log.warning("skipping pack %r for CLI registry: %s", name, exc)
+            continue
         except Exception as exc:  # noqa: BLE001 - broad by design (see below)
             # An installed pack's entry-point load / factory can raise anything
             # (ImportError, a bug in the pack, a version skew). None of that may
@@ -83,7 +103,24 @@ def load_registry(
                 type(exc).__name__,
                 exc,
             )
-    return build_registry(packs)
+            continue
+        # Validate this pack's ops merge cleanly against core + already-accepted
+        # packs before accepting it. build_registry raises ValueError on a
+        # duplicate op name; a single bad pack must not abort the whole build, so
+        # trial-build with the candidate included and skip it on collision.
+        try:
+            build_registry([*accepted, pack])
+        except ValueError as exc:
+            log.warning(
+                "skipping pack %r for CLI registry (duplicate operation name: %s)",
+                name,
+                exc,
+            )
+            continue
+        accepted.append(pack)
+        if loaded_packs is not None:
+            loaded_packs[name] = pack
+    return build_registry(accepted)
 
 
 def cli_subcommand_names(registry: Registry) -> tuple[str, ...]:
@@ -230,17 +267,24 @@ def _run_collect(
     engine_factory: Callable[..., CollectorEngine] = CollectorEngine,
     runner: Callable[[CollectorEngine], None] | None = None,
     pack_loader: Callable[[str], Any] = load_pack,
+    loaded_packs: dict[str, Any] | None = None,
 ) -> int:
     """Run the collector engine for one source.
 
-    Loads the named pack and constructs a :class:`CollectorEngine`, then hands
-    it to ``runner`` (defaults to :func:`_default_runner`, which blocks in
-    ``engine.run()`` until SIGTERM). ``provider``/``engine_factory``/``runner``/
-    ``pack_loader`` are injection seams: the in-phase unit test drives a single
-    poll with a fake provider and a one-shot runner instead of the real ESPN
-    provider and blocking loop.
+    Reuses the pack already loaded during registry construction when available
+    (``loaded_packs``) so ``main`` does not load and validate every installed
+    pack once for the registry and then load the target pack a second time here;
+    falls back to ``pack_loader`` when the target was not among the merged packs
+    (e.g. a directly-injected registry, or a pack skipped from the registry).
+    Constructs a :class:`CollectorEngine`, then hands it to ``runner`` (defaults
+    to :func:`_default_runner`, which blocks in ``engine.run()`` until SIGTERM).
+    ``provider``/``engine_factory``/``runner``/``pack_loader`` are injection
+    seams: the in-phase unit test drives a single poll with a fake provider and a
+    one-shot runner instead of the real ESPN provider and blocking loop.
     """
-    pack = pack_loader(args.pack)
+    pack = (loaded_packs or {}).get(args.pack)
+    if pack is None:
+        pack = pack_loader(args.pack)
     engine = engine_factory(pack, args.db, args.source, provider=provider, record_path=args.record)
     try:
         (runner or _default_runner)(engine)
@@ -266,8 +310,9 @@ def main(
     in-phase tests pin a deterministic registry and drive ``collect`` against a
     fake provider; the console-script call ``main()`` uses live defaults.
     """
+    loaded_packs: dict[str, Any] = {}
     if registry is None:
-        registry = load_registry(pack_loader=pack_loader)
+        registry = load_registry(pack_loader=pack_loader, loaded_packs=loaded_packs)
     parser = build_parser(registry)
     args = parser.parse_args(argv)
 
@@ -281,6 +326,7 @@ def main(
             engine_factory=engine_factory,
             runner=runner,
             pack_loader=pack_loader,
+            loaded_packs=loaded_packs,
         )
     if command == "tools":
         return _run_tools(registry, args)

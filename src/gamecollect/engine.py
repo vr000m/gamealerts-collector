@@ -36,6 +36,7 @@ import random
 import signal
 import threading
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -48,7 +49,7 @@ from gamecollect.db.writer import (
     UnseededMatchError,
 )
 from gamecollect.diffing import MatchDiff, diff_matches
-from gamecollect.fixture_io import write_fixture
+from gamecollect.fixture_io import fixture_stem, write_fixture
 from gamecollect.packs.spec import SportPack
 from gamecollect.provider import (
     MatchDataProvider,
@@ -288,13 +289,24 @@ class CollectorEngine:
         self._stop_event.set()
 
     def close(self) -> None:
-        """Flush any recorded fixture and close the database connection (idempotent)."""
-        if self._record_path is not None:
-            self._flush_record()
-        conn = getattr(self, "_conn", None)
-        if conn is not None:
-            conn.close()
-            self._conn = None  # type: ignore[assignment]
+        """Flush any recorded fixture and close the database connection (idempotent).
+
+        The flush is attempted at most once (``_record`` is cleared before the
+        write so a second ``close()`` after a failed flush does not re-raise) and
+        the connection is closed unconditionally in a ``finally`` — a
+        ``write_fixture`` failure must not leak the WAL connection, and the CLI's
+        redundant second ``close()`` must be a no-op that re-raises nothing.
+        """
+        try:
+            if self._record_path is not None and self._record:
+                recorded = self._record
+                self._record = {}
+                self._flush_record(recorded)
+        finally:
+            conn = getattr(self, "_conn", None)
+            if conn is not None:
+                conn.close()
+                self._conn = None  # type: ignore[assignment]
 
     # ------------------------------------------------------------------
     # Backoff / jitter
@@ -321,14 +333,14 @@ class CollectorEngine:
             else:
                 recorded.update(match)
 
-    def _flush_record(self) -> None:
-        if not self._record:
+    def _flush_record(self, records: dict[str, _RecordedMatch]) -> None:
+        if not records:
             return
         target = self._record_path
         assert target is not None
         to_json_file = target.suffix == ".json"
-        single = len(self._record) == 1
-        for match_id, recorded in self._record.items():
+        single = len(records) == 1
+        for match_id, recorded in records.items():
             if to_json_file:
                 # A ``.json`` record path names a single fixture file. With more
                 # than one match it cannot be that file for all of them, and
@@ -338,10 +350,10 @@ class CollectorEngine:
                 path = (
                     target
                     if single
-                    else target.with_name(f"{target.stem}-{_safe_filename(match_id)}.json")
+                    else target.with_name(f"{target.stem}-{fixture_stem(match_id)}.json")
                 )
             else:
-                path = target / f"{_safe_filename(match_id)}.json"
+                path = target / f"{fixture_stem(match_id)}.json"
             write_fixture(path, recorded.as_match())
 
     # ------------------------------------------------------------------
@@ -379,21 +391,4 @@ class _RecordedMatch:
 
     def as_match(self) -> NormalizedMatch:
         ordered = [self._events[seq] for seq in sorted(self._events)]
-        return NormalizedMatch(
-            match_id=self._header.match_id,
-            status=self._header.status,
-            minute=self._header.minute,
-            score_home=self._header.score_home,
-            score_away=self._header.score_away,
-            display_clock=self._header.display_clock,
-            events=ordered,
-            home_team=self._header.home_team,
-            away_team=self._header.away_team,
-            kickoff_utc=self._header.kickoff_utc,
-            payload=self._header.payload,
-        )
-
-
-def _safe_filename(match_id: str) -> str:
-    """Make a match_id safe as a filename stem (source-qualified ids carry ':')."""
-    return "".join(c if c.isalnum() or c in "-_." else "_" for c in match_id)
+        return replace(self._header, events=ordered)

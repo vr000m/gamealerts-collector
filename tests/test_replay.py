@@ -462,3 +462,70 @@ def test_recorded_fixture_is_valid_json_and_versioned(tmp_path):
     data = json.loads(record_path.read_text())
     assert data.get("format_version"), "recorded fixture carries no format_version"
     assert data["match"]["match_id"] == "rt-json"
+
+
+# --------------------------------------------------------------------------- #
+# Paced mode: exhausted reflects fetched events, never the wall clock
+# --------------------------------------------------------------------------- #
+
+
+class _FakeClock:
+    """A controllable monotonic clock: returns ``t`` and counts every read."""
+
+    def __init__(self) -> None:
+        self.t = 0.0
+        self.calls = 0
+
+    def __call__(self) -> float:
+        self.calls += 1
+        return self.t
+
+
+def test_paced_reading_exhausted_before_poll_does_not_start_clock(tmp_path):
+    """In paced mode, merely reading ``exhausted`` before the first poll must not
+    lazily start the pacing clock (the origin instant is the FIRST fetch, not a
+    property read) and must report False for a non-empty fixture."""
+    from gamecollect.replay import ReplayProvider
+
+    fx = tmp_path / "paced.json"
+    write_fixture(str(fx), _synth_match("paced-1", n_goals=3))
+    clock = _FakeClock()
+    provider = ReplayProvider(read_fixture(str(fx)), speed=1.0, monotonic=clock)
+
+    assert provider.exhausted is False
+    assert clock.calls == 0, "reading exhausted must not consult the pacing clock"
+    assert getattr(provider, "_start", None) is None, (
+        "reading exhausted must not start (lazily set) the pacing origin"
+    )
+
+
+def test_paced_exhausted_tracks_reveals_not_wallclock(tmp_path):
+    """``exhausted`` must reflect the events a fetch actually revealed, not the
+    wall clock. If it read the clock it could report done the instant enough time
+    elapsed — letting the documented fetch-then-check-exhausted loop stop before
+    the tail events were ever revealed. Advance the clock past every event with no
+    intervening fetch and prove exhausted stays False (and reads no clock), then
+    that the consumer loop still receives every event."""
+    from gamecollect.replay import ReplayProvider
+
+    fx = tmp_path / "paced.json"
+    # Events at minutes 10/15/20 -> game-time offsets 600/900/1200s.
+    write_fixture(str(fx), _synth_match("paced-2", n_goals=3))
+    clock = _FakeClock()
+    provider = ReplayProvider(read_fixture(str(fx)), speed=1.0, monotonic=clock)
+
+    # First fetch fixes the pacing origin at t=0 and reveals nothing yet.
+    assert provider.fetch_live_matches()[0].events == []
+    # Jump wall time past every event WITHOUT another fetch.
+    clock.t = 5000.0
+    calls_before = clock.calls
+    assert provider.exhausted is False, "exhausted must reflect fetched events, not wall time"
+    assert clock.calls == calls_before, "exhausted must not consult the pacing clock"
+
+    # The exhausted-then-stop consumer pattern still receives all tail events.
+    revealed: list = []
+    for _ in range(5):
+        revealed = provider.fetch_live_matches()[0].events
+        if provider.exhausted:
+            break
+    assert len(revealed) == 3, "every tail event must be revealed before exhausted stops the loop"

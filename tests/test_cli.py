@@ -502,6 +502,89 @@ def test_broken_pack_is_skipped_and_core_reads_still_work(tmp_path, capsys, capl
     assert payload and payload[0]["match_id"] == MATCH_ID
 
 
+def test_pack_with_duplicate_op_name_is_skipped_core_survives(tmp_path, caplog):
+    """A pack whose contributed op name collides with core (or an earlier pack)
+    must be skipped with a loud warning — the unprotected ``build_registry`` used
+    to raise ``ValueError`` and kill even the sport-agnostic core reads. Core ops
+    survive and a core read still runs end to end."""
+    from gamecollect.registry import CORE_OPERATIONS
+
+    class _DupOpPack:
+        # Re-contributes the core "matches" op → a duplicate subcommand name.
+        operations = (CORE_OPERATIONS[0],)
+
+    with caplog.at_level(logging.WARNING):
+        registry = cli.load_registry(pack_loader=lambda name: _DupOpPack(), names=["dup-pack"])
+
+    assert set(registry.names) == {"matches", "state", "events", "standings"}
+    assert any("dup-pack" in rec.getMessage() for rec in caplog.records), (
+        "a pack skipped for a duplicate op name must be warned about"
+    )
+
+    db = tmp_path / "cli.db"
+    _seed_golden_db(db)
+    rc = cli.main(["matches", "--db", str(db), "--json"], registry=registry)
+    assert rc == 0
+
+
+def test_duplicate_pack_entry_point_name_loaded_once(caplog):
+    """A duplicate entry-point name (wheel + editable install register the same
+    name twice) is de-duplicated before loading, so the pack is loaded once and
+    its ops are not merged twice (which would itself collide)."""
+
+    class _NoOpPack:
+        operations = ()
+
+    loads: list[str] = []
+
+    def counting_loader(name: str) -> Any:
+        loads.append(name)
+        return _NoOpPack()
+
+    with caplog.at_level(logging.WARNING):
+        registry = cli.load_registry(pack_loader=counting_loader, names=[PACK_NAME, PACK_NAME])
+
+    assert loads == [PACK_NAME], f"a duplicate entry-point name must load once, got {loads}"
+    assert set(registry.names) == {"matches", "state", "events", "standings"}
+
+
+def test_collect_reuses_registry_loaded_pack_without_double_load(tmp_path, monkeypatch):
+    """``collect`` must reuse the pack already loaded while building the registry
+    rather than loading and validating it a second time. With ``registry`` left to
+    default (built inside ``main``), the injected loader is invoked exactly once —
+    during registry construction — and ``collect`` picks the same object up."""
+
+    class _NoOpPack:
+        operations = ()
+
+    monkeypatch.setattr(cli, "pack_names", lambda: [PACK_NAME])
+    sentinel_pack = _NoOpPack()
+    calls: list[str] = []
+
+    def counting_loader(name: str) -> Any:
+        calls.append(name)
+        return sentinel_pack
+
+    built: list[_FakeEngine] = []
+
+    def engine_factory(pack, db_path, source, *, provider, record_path):  # noqa: A002
+        engine = _FakeEngine(pack, db_path, source, provider=provider, record_path=record_path)
+        built.append(engine)
+        return engine
+
+    rc = cli.main(
+        ["collect", "--pack", PACK_NAME, "--db", str(tmp_path / "c.db"), "--source", "s"],
+        provider=_FakeProvider(),
+        engine_factory=engine_factory,
+        runner=lambda engine: engine.poll_once(),
+        pack_loader=counting_loader,
+    )
+
+    assert rc == 0
+    assert calls == [PACK_NAME], f"the pack must be loaded exactly once, got {calls}"
+    assert built and built[0].pack is sentinel_pack, "collect must reuse the registry-loaded pack"
+
+
 # --------------------------------------------------------------------------- #
 # collect — unit-tested via the main(...) injection seams (single fake poll)
 # --------------------------------------------------------------------------- #

@@ -259,3 +259,50 @@ def test_standings_snapshot_is_nullable(tmp_path):
     # A source without standings still produces a readable fixture.
     result = _read(fio, path)
     assert _match_id_of(result) == "m1"
+
+
+# --------------------------------------------------------------------------- #
+# Malformed fixtures raise FixtureFormatError (never a raw KeyError/TypeError)
+# --------------------------------------------------------------------------- #
+
+
+def _valid_fixture_dict() -> dict:
+    """A minimal well-formed fixture document to mutate into malformed shapes."""
+    return {
+        "format_version": 1,
+        "match": {"match_id": "m1", "status": "IN_PLAY"},
+        "events": [{"seq": 0, "event_type": "goal", "importance": 1}],
+        "entities": [],
+        "standings": [],
+    }
+
+
+@pytest.mark.parametrize(
+    "mutate, needle",
+    [
+        (lambda d: d["events"][0].pop("seq"), "seq"),
+        (lambda d: d["events"][0].pop("event_type"), "event_type"),
+        (lambda d: d["events"][0].pop("importance"), "importance"),
+        (lambda d: d["match"].pop("match_id"), "match_id"),
+        (lambda d: d.__setitem__("events", {"not": "a list"}), "events"),
+        (lambda d: d.__setitem__("events", ["not-a-dict"]), "event"),
+        (lambda d: d.__setitem__("match", "not-a-dict"), "match"),
+    ],
+)
+def test_malformed_fixture_raises_fixture_format_error(tmp_path, mutate, needle):
+    """A missing event key, missing ``match_id``, or non-dict ``events``/``match``
+    entry must raise the documented ``FixtureFormatError`` (with a useful
+    message) rather than leaking a raw ``KeyError``/``TypeError`` — the read
+    contract callers catch is ``FixtureFormatError`` alone."""
+    fio = _fixture_io()
+    assert hasattr(fio, "FixtureFormatError"), "fixture_io must expose FixtureFormatError"
+    data = _valid_fixture_dict()
+    mutate(data)
+    path = tmp_path / "bad.json"
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+    with pytest.raises(fio.FixtureFormatError) as excinfo:
+        _read(fio, path)
+    assert needle in str(excinfo.value), (
+        f"error message {str(excinfo.value)!r} should mention {needle!r}"
+    )

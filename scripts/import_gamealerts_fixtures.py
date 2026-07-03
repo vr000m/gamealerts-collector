@@ -62,7 +62,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from gamecollect.fixture_io import Fixture, FixtureFormatError, read_fixture, write_fixture
+from gamecollect.fixture_io import (
+    Fixture,
+    FixtureFormatError,
+    fixture_stem,
+    read_fixture,
+    write_fixture,
+)
 from gamecollect.fold import fold
 from gamecollect.provider import MatchStatus, NormalizedEvent, NormalizedMatch
 from gamecollect.replay import ReplayProvider
@@ -323,11 +329,6 @@ def import_match(
     return read_fixture(out_path)
 
 
-def _safe_name(match_id: str) -> str:
-    """Make a match_id safe as a fixture filename stem (ids may carry ':')."""
-    return "".join(c if c.isalnum() or c in "-_." else "_" for c in match_id)
-
-
 def import_all_matches(db_path: str | Path, out_dir: str | Path) -> list[Path]:
     """Import EVERY match in ``db_path`` (read-only) into ``out_dir``.
 
@@ -348,7 +349,7 @@ def import_all_matches(db_path: str | Path, out_dir: str | Path) -> list[Path]:
         raise ImportError_(f"no matches found in {db_path}")
     written: list[Path] = []
     for match_id in match_ids:
-        out_path = out_dir / f"{_safe_name(match_id)}.json"
+        out_path = out_dir / f"{fixture_stem(match_id)}.json"
         import_match(db_path, match_id, out_path)
         written.append(out_path)
         print(f"imported {match_id} -> {out_path}")

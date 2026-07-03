@@ -405,6 +405,7 @@ def register_unreconciled_match(
             "minute": match.minute,
             "score_home": match.score_home,
             "score_away": match.score_away,
+            "display_clock": match.display_clock,
         }
     )
     return qualified_id
