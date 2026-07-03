@@ -250,11 +250,11 @@ Context lifecycle — what enters each step's working state and whether it clear
 
 Completed 2026-07-02 by `/conduct --autonomous` (4 phases, 0 fix-loop iterations, all parallel spawns).
 
-- Phase commits: `bf05d16` (scaffold), `2bd0f90` (schema v1 + DB layer), `1f762ca` (sport-pack SDK), `c1a60a8` (football pack).
-- Tests: 159 passed, 2 skipped (honest skips: no equal-major/older-minor DB constructible until the first additive migration). Lint clean (`ruff format --check` + `ruff check`).
+- Phase commits: `bf05d16` (scaffold), `2bd0f90` (schema v1 + DB layer), `1f762ca` (sport-pack SDK), `c1a60a8` (football pack). Post-run review-fix commits: `d5371a0` (phase-review findings), `566716c` (/code-review findings), `49f4730` (Codex adversarial-review findings), `e54d957` (/code-review medium findings).
+- Tests: 186 passed, 2 skipped after all review-fix rounds (159 at conduct completion; honest skips: no equal-major/older-minor DB constructible until the first additive migration). Lint clean (`ruff format --check` + `ruff check`).
 - CI-parity gate (local, `--ci-cmd` override — no just/make/npm entrypoint): `uv sync --frozen` + ruff format/check + full pytest → exit 0.
 - Wheel smoke (CI's exact script, clean venv, no dev deps): loads `football-wc2026`, normalizes the fixture via injected `http_get`, writes 24 events to a temp DB with pack side tables. Console script resolves.
 - Standalone: `rg 'from gamealerts|import gamealerts' src/` empty; golden captured once via `tests/football/golden/capture_golden.py` (gamealerts never imported at test time).
 - Taxonomy parity: 9 event types, exact gamealerts `EventType` value set with identical importance defaults; yellow-red 0–2 expansion ported byte-for-byte; golden byte-exact.
 - Note: the plan header `**Status**: Not Started` sits above the review marker (immutable contract section) and was deliberately left unedited to preserve the marker hash.
-- Outstanding before merge (see Findings): Phase 2 Important cross-partition child-table gap + Phase 4 minor source-blind resolve step (fix together); minor items from Phases 2–4; CI green on GitHub Actions still pending push.
+- Outstanding before merge: none — all reviewer findings fixed (see Findings), CI green on PR #1 (`test` + `wheel-smoke` passing).
