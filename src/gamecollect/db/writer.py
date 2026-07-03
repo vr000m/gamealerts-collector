@@ -220,6 +220,8 @@ class PartitionWriter:
         rather than silently mis-aligning the stored stream.
         """
         batch = list(events)
+        if not batch:
+            return 0
         for event in batch:
             self._check_source(event)
             declared_match = event.get("match_id")
@@ -243,9 +245,6 @@ class PartitionWriter:
                 f"event batch for match {match_id!r} is not strictly increasing by seq: {seqs}"
             )
         self._assert_match_owned(match_id, require_seeded=True)
-
-        if not batch:
-            return 0
 
         row = self._conn.execute(
             "SELECT MAX(seq) FROM events WHERE source = ? AND match_id = ?",

@@ -58,11 +58,11 @@ def open_reader(path: str | Path) -> sqlite3.Connection:
     escaped = urllib.parse.quote(str(db_path))
     conn = sqlite3.connect(f"file:{escaped}?mode=ro", uri=True, check_same_thread=False)
     conn.row_factory = sqlite3.Row
-    conn.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
-    # Belt and braces on top of mode=ro: the connection itself refuses DML.
-    conn.execute("PRAGMA query_only=ON")
 
     try:
+        conn.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
+        # Belt and braces on top of mode=ro: the connection itself refuses DML.
+        conn.execute("PRAGMA query_only=ON")
         version = get_schema_version(conn)
         if version is None:
             raise SchemaVersionError(

@@ -49,14 +49,13 @@ def connect(path: str | Path, *, side_table_ddl: Iterable[str] = ()) -> sqlite3.
     conn = sqlite3.connect(str(db_path), check_same_thread=False)
     conn.row_factory = sqlite3.Row
 
-    # WAL mode — must be set before any DML.
-    conn.execute("PRAGMA journal_mode=WAL")
-    # Busy timeout — wait up to N ms before raising SQLITE_BUSY.
-    conn.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
-    # Foreign key enforcement.
-    conn.execute("PRAGMA foreign_keys=ON")
-
     try:
+        # WAL mode — must be set before any DML.
+        conn.execute("PRAGMA journal_mode=WAL")
+        # Busy timeout — wait up to N ms before raising SQLITE_BUSY.
+        conn.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
+        # Foreign key enforcement.
+        conn.execute("PRAGMA foreign_keys=ON")
         ensure_schema(conn)
         for ddl in side_table_ddl:
             conn.executescript(ddl)

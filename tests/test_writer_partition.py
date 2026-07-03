@@ -436,3 +436,11 @@ def test_upsert_entities_batch_is_atomic(db_path):
     conn.close()
     with sqlite3.connect(db_path) as c:
         assert c.execute("SELECT COUNT(*) FROM entities").fetchone()[0] == 0
+
+
+def test_append_events_empty_batch_is_a_noop_even_unseeded(db_path):
+    # Deep-review fix: an empty batch writes nothing, so it must not require
+    # a seeded match — return 0 instead of raising UnseededMatchError.
+    conn, w = _writer(db_path)
+    assert w.append_events("m-unseeded", []) == 0
+    conn.close()

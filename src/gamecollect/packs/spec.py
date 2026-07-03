@@ -42,6 +42,11 @@ class SportPack:
     ``connect(path, side_table_ddl=pack.side_table_ddl)`` after core
     schema/migrations — packs may own typed side tables but never alter core
     tables.
+
+    ``provider_factory`` must be cheap and side-effect-free at construction
+    time (no network I/O, no blocking work): the registry's ``validate_pack``
+    instantiates a throwaway provider on every pack load purely to type-check
+    it. Defer expensive setup to the provider's fetch methods.
     """
 
     name: str

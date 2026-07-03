@@ -18,6 +18,7 @@ from gamecollect.db.writer import (
     PartitionWriter,
     SequenceError,
     TaxonomyError,
+    UnseededMatchError,
 )
 
 __all__ = [
@@ -28,6 +29,7 @@ __all__ = [
     "CrossPartitionError",
     "SequenceError",
     "TaxonomyError",
+    "UnseededMatchError",
     "SCHEMA_MAJOR",
     "SCHEMA_MINOR",
 ]
