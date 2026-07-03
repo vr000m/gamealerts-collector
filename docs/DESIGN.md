@@ -85,13 +85,23 @@ tournament (e.g. Champions League) should be ~configuration on that pack.
 
 ## 6. Interfaces
 
-- **Client library** (canonical): `list_matches`, `get_state`,
-  `get_events_since`, `get_standings`, `get_squad`, `get_player_stats`,
-  historical lookups. Sync, typed returns.
+- **Client library** (canonical): the four **core** ops `list_matches`,
+  `get_state`, `get_events_since`, `get_standings` (plus historical lookups,
+  later) live in `gamecollect.client`. Sync, typed returns. Packs contribute
+  further read ops over their side tables — football adds `get_squad` and
+  `get_player_stats`, implemented in `gamecollect_football` — so core never
+  imports a pack module.
+- **Operation registry** (`gamecollect.registry`): the single source of truth.
+  Every operation — core or pack-contributed — is declared once (name, params,
+  summary, output JSON Schema); the CLI's argparse subcommands and the tools
+  manifest are both generated from the merged registry, so the CLI surface,
+  the library, and the manifest cannot drift (a registry-derivation equality
+  test pins this).
 - **CLI** `gamecollect`: thin `main()` over the library, `--json` output whose
-  schemas ARE the public contract. `gamecollect tools --json` emits a manifest
-  (commands + output JSON schemas) for runtime discovery; consuming agents
-  generate function-calling tool definitions from it.
+  schemas ARE the public contract (versioned via the manifest's
+  `contract_version`, golden-file tested). `gamecollect tools --json` emits a
+  manifest (commands + output JSON schemas) for runtime discovery; consuming
+  agents generate function-calling tool definitions from it.
 - **MCP wrapper**: optional, later, generated from the manifest. Never the
   contract.
 

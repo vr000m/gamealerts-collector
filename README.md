@@ -11,11 +11,12 @@ taxonomy, and provider adapters were football-hardcoded. This project is the
 generalization: adding a tournament should be a config file; adding a sport
 (F1, Champions League, cricket) should be one new package.
 
-**Status: pre-alpha.** The foundation is implemented: package scaffold, schema v1 +
-core DB layer, the sport-pack SDK, and the first pack (`football-wc2026`).
-Interfaces (engine daemon, client library, real CLI, replay) are next — see
-[docs/dev_plans/](docs/dev_plans/). See [docs/DESIGN.md](docs/DESIGN.md) for the
-architecture contract. Not yet on PyPI; not yet consumed by gamealerts.
+**Status: pre-alpha.** The foundation (package scaffold, schema v1 + core DB
+layer, sport-pack SDK, the `football-wc2026` pack) and the interfaces (engine
+daemon, client library, registry-generated CLI, ReplayProvider + seed fixtures)
+are implemented — see [docs/dev_plans/](docs/dev_plans/). See
+[docs/DESIGN.md](docs/DESIGN.md) for the architecture contract. Not yet on
+PyPI; not yet consumed by gamealerts.
 
 ## Development
 
@@ -79,8 +80,18 @@ gamecollect collect --pack football-wc2026 --db games.db --source wc2026-live \
     --record sessions/            # optional: write a replay fixture
 ```
 
-> The `ReplayProvider` end-to-end flow and the checked-in seed fixtures land in
-> the next interfaces phase (replay); see [docs/dev_plans/](docs/dev_plans/).
+**Replay.** Recorded sessions (and the seed fixtures checked in under
+[fixtures/football/](fixtures/football/)) replay through `ReplayProvider`,
+which implements the same provider ABC the engine polls — paced in real time,
+scaled, or instantly (`speed=inf`) for deterministic tests:
+
+```python
+from gamecollect.replay import ReplayProvider
+provider = ReplayProvider("fixtures/football/canada-qatar-fictional.json", speed=float("inf"))
+```
+
+`scripts/import_gamealerts_fixtures.py` converts legacy gamealerts DBs into
+fixtures (`--check` validates a fixture directory).
 
 ## Shape
 
