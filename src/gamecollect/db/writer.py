@@ -36,11 +36,23 @@ __all__ = [
     "CrossPartitionError",
     "TaxonomyError",
     "SequenceError",
+    "UnseededMatchError",
 ]
 
 
 class CrossPartitionError(ValueError):
     """A write targeted a row owned by (or stamped for) a different source."""
+
+
+class UnseededMatchError(ValueError):
+    """A child-table write referenced a match_id with no seeded ``matches`` row.
+
+    Events and provider mappings are keyed per-source but read globally by
+    ``match_id`` (``get_events_since`` has no source filter). Allowing a child
+    write before the match row exists would let source B park rows under a
+    bare id that source A later claims via ``upsert_match`` — B's rows would
+    then surface in A's global event stream. ``upsert_match`` must run first.
+    """
 
 
 class TaxonomyError(ValueError):
@@ -188,17 +200,27 @@ class PartitionWriter:
     def append_events(self, match_id: str, events: Iterable[Mapping[str, Any]]) -> int:
         """Append provider-normalized events for one match; return rows inserted.
 
-        Each event mapping must carry an integer ``seq`` (provider-derived)
-        and a ``type`` string. Idempotent via ``INSERT OR IGNORE`` on
+        The match must already be seeded via :meth:`upsert_match` and owned
+        by this source (:class:`UnseededMatchError` /
+        :class:`CrossPartitionError` otherwise). Each event mapping must
+        carry an integer ``seq`` (provider-derived) and a ``type`` string; a
+        row carrying an explicit ``match_id`` that differs from the batch's
+        ``match_id`` raises ``ValueError`` instead of being silently
+        re-homed. Idempotent via ``INSERT OR IGNORE`` on
         ``(source, match_id, seq)``; a NEW row landing at-or-below the
         partition's existing max seq is out-of-order shape drift and raises
         :class:`SequenceError` (re-sent already-stored seqs are ignored, so
         full-list re-polls stay cheap and legal).
         """
         batch = list(events)
-        self._assert_match_owned(match_id)
         for event in batch:
             self._check_source(event)
+            declared_match = event.get("match_id")
+            if declared_match is not None and declared_match != match_id:
+                raise ValueError(
+                    f"event row declares match_id {declared_match!r} but this batch "
+                    f"targets match {match_id!r}; mixed-match batches are not allowed"
+                )
             seq = self._require(event, "seq")
             if not isinstance(seq, int) or isinstance(seq, bool):
                 raise SequenceError(f"event seq must be an int, got {seq!r}")
@@ -213,6 +235,7 @@ class PartitionWriter:
             raise SequenceError(
                 f"event batch for match {match_id!r} is not strictly increasing by seq: {seqs}"
             )
+        self._assert_match_owned(match_id, require_seeded=True)
 
         row = self._conn.execute(
             "SELECT MAX(seq) FROM events WHERE source = ? AND match_id = ?",
@@ -319,8 +342,14 @@ class PartitionWriter:
     # ------------------------------------------------------------------
 
     def map_provider_match(self, provider: str, provider_match_id: str, match_id: str) -> None:
-        """Record the provider-native → canonical match-id mapping for this source."""
-        self._assert_match_owned(match_id)
+        """Record the provider-native → canonical match-id mapping for this source.
+
+        The canonical ``match_id`` must already be seeded and owned by this
+        source (:class:`UnseededMatchError` / :class:`CrossPartitionError`
+        otherwise) — a mapping to a match that does not exist yet could bind
+        to a row another source later claims.
+        """
+        self._assert_match_owned(match_id, require_seeded=True)
         with self._transaction():
             self._conn.execute(
                 "INSERT INTO provider_match_map (source, provider, provider_match_id, match_id) "
@@ -334,19 +363,30 @@ class PartitionWriter:
     # Internals
     # ------------------------------------------------------------------
 
-    def _assert_match_owned(self, match_id: str) -> None:
+    def _assert_match_owned(self, match_id: str, *, require_seeded: bool = False) -> None:
         """Raise when ``match_id`` exists under a different source.
 
         Child-table writes (events, provider map) reference matches by their
         globally-unique ``match_id``; without this check a writer scoped to
         source B could build a shadow partition under source A's match and
-        break the match_id-global reader contract. An absent match row is
-        allowed — an event may legally land before its match is seeded.
+        break the match_id-global reader contract. Child writes pass
+        ``require_seeded=True``: an absent match row raises
+        :class:`UnseededMatchError`, closing the window where B parks child
+        rows under a bare id that A seeds later (``upsert_match`` itself
+        passes ``False`` — creating the row is its job).
         """
         owner = self._conn.execute(
             "SELECT source FROM matches WHERE match_id = ?", (match_id,)
         ).fetchone()
-        if owner is not None and owner[0] != self._source:
+        if owner is None:
+            if require_seeded:
+                raise UnseededMatchError(
+                    f"match {match_id!r} has no matches row; seed it with "
+                    f"upsert_match (source {self._source!r}) before writing "
+                    f"events or provider mappings"
+                )
+            return
+        if owner[0] != self._source:
             raise CrossPartitionError(
                 f"match {match_id!r} belongs to source {owner[0]!r}; "
                 f"this writer is scoped to {self._source!r}"

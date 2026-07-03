@@ -49,6 +49,7 @@ Fixture ground truth (verified 2026-07-02 against the live DBs — note this cor
 
 - `engine.py`: `CollectorEngine(pack, db_path, source, poll_interval)` — poll loop with jittered interval, provider-error backoff, graceful shutdown on SIGTERM; opens the DB with `connect(db_path, side_table_ddl=pack.side_table_ddl)` before constructing `PartitionWriter(conn, source, taxonomy=pack.taxonomy)` so pack side tables and taxonomy validation are active; adapted from gamealerts `collector/session.py` mechanics (no prose, no IPC).
 - `diffing.py`: compute new events (by seq) and changed match state between polls so writes are minimal; port the diff discipline from gamealerts' session loop.
+- Write-order constraint (from the foundation writer's adversarial-review fix): `append_events`/`map_provider_match` raise `UnseededMatchError` unless the match row already exists under this source — the engine must `upsert_match` (or `register_unreconciled_match`, which seeds a qualified strip row unless identity fields are missing) before appending that poll's events.
 - Tests: fake provider (scripted `NormalizedMatch` sequences) drives the engine against a temp DB; assert idempotent re-poll (no duplicate events), backoff on `ProviderUnavailableError`, clean shutdown.
 
 ### Phase 2: Client library

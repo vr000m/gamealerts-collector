@@ -29,7 +29,7 @@ from _phase2_helpers import (
 )
 
 from gamecollect.db.connection import connect
-from gamecollect.db.writer import CrossPartitionError, PartitionWriter
+from gamecollect.db.writer import CrossPartitionError, PartitionWriter, UnseededMatchError
 
 SRC = "wc2026-espn"
 OTHER = "euro2028-espn"
@@ -91,10 +91,12 @@ def test_cross_source_write_raises(db_path):
 
 def test_same_provider_match_id_does_not_collide_across_sources(db_path):
     conn_a, wa = _writer(db_path, SRC)
+    writer_method(wa, "match")(match_row("m-a"))
     writer_method(wa, "provider_map")("espn", "760440", "m-a")
     conn_a.commit()
     conn_a.close()
     conn_b, wb = _writer(db_path, OTHER)
+    writer_method(wb, "match")(match_row("m-b"))
     writer_method(wb, "provider_map")("espn", "760440", "m-b")
     conn_b.commit()
     conn_b.close()
@@ -317,13 +319,62 @@ def test_map_provider_match_to_foreign_match_raises(db_path):
         assert c.execute("SELECT COUNT(*) FROM provider_match_map").fetchone()[0] == 0
 
 
-def test_append_events_before_match_seeded_is_allowed(db_path):
-    # Soft-ref semantics: an event may legally land before its match row.
+def test_append_events_before_match_seeded_raises(db_path):
+    # Adversarial-review fix: unseeded child writes are rejected. Events are
+    # keyed per-source but read globally by match_id (get_events_since has no
+    # source filter), so a pre-seed write could park rows under a bare id a
+    # different source later claims.
     conn, w = _writer(db_path)
-    inserted = writer_method(w, "event")(event_row("m-unseeded", 1))
+    with pytest.raises(UnseededMatchError, match="upsert_match"):
+        writer_method(w, "event")(event_row("m-unseeded", 1))
+    conn.close()
+    with sqlite3.connect(db_path) as c:
+        assert c.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0
+
+
+def test_map_provider_match_before_match_seeded_raises(db_path):
+    conn, w = _writer(db_path)
+    with pytest.raises(UnseededMatchError, match="upsert_match"):
+        writer_method(w, "provider_map")("espn", "760440", "m-unseeded")
+    conn.close()
+    with sqlite3.connect(db_path) as c:
+        assert c.execute("SELECT COUNT(*) FROM provider_match_map").fetchone()[0] == 0
+
+
+def test_unseeded_cross_source_events_cannot_leak_into_owner_stream(db_path):
+    """Regression for the review's poisoning scenario: source B tries to
+    append events for bare 'm1' BEFORE source A seeds it. The write must be
+    rejected outright, so once A owns m1 the global event stream contains
+    only A's rows."""
+    from gamecollect.db import reader
+
+    conn_b, wb = _writer(db_path, OTHER)
+    with pytest.raises(UnseededMatchError):
+        writer_method(wb, "event")(event_row("m1", 1))
+    conn_b.close()
+
+    conn_a, wa = _writer(db_path, SRC)
+    writer_method(wa, "match")(match_row("m1"))
+    writer_method(wa, "event")(event_row("m1", 1))
+    conn_a.commit()
+
+    events = reader.get_events_since(conn_a, "m1")
+    sources = {e["source"] for e in events}
+    assert sources == {SRC}, f"foreign rows leaked into m1's global stream: {sources}"
+    conn_a.close()
+
+
+def test_append_events_rejects_per_row_match_id_mismatch(db_path):
+    # Adversarial-review fix: a mixed batch must fail loudly, not be silently
+    # persisted under the outer match_id.
+    conn, w = _writer(db_path)
+    writer_method(w, "match")(match_row("m1"))
+    with pytest.raises(ValueError, match="mixed-match"):
+        w.append_events("m1", [event_row("m1", 1), event_row("m2", 2)])
     conn.commit()
     conn.close()
-    assert inserted == 1
+    with sqlite3.connect(db_path) as c:
+        assert c.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0
 
 
 # --- fold stamping is not caller-overridable -----------------------------------------
