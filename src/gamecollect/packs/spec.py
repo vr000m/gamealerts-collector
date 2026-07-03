@@ -17,6 +17,7 @@ from gamecollect.provider import MatchDataProvider, NormalizedMatch
 
 if TYPE_CHECKING:
     from gamecollect.db.writer import PartitionWriter
+    from gamecollect.registry import Operation
 
 __all__ = ["EventTypeDecl", "SportPack", "default_seed_match"]
 
@@ -92,6 +93,17 @@ class SportPack:
     display_metadata: dict
     compaction_boundaries: list[str]
     side_table_ddl: tuple[str, ...] = field(default=())
+    operations: tuple[Operation, ...] = field(default=())
+    """Pack-contributed read operations merged into the operation registry.
+
+    A pack may register additional read ops over its own side tables (football
+    contributes ``squad``/``player-stats`` over ``football_lineups``/
+    ``football_stats``). :func:`gamecollect.registry.build_registry` merges
+    these onto the four core ops; the CLI and ``tools --json`` manifest are
+    generated from the merged set. Each entry is a
+    :class:`gamecollect.registry.Operation` whose ``impl`` lives in the pack —
+    core never imports pack modules (dependency direction is pack → core).
+    """
     seed_match: SeedMatch = field(default=default_seed_match)
     """Seed-before-child-write hook the engine calls per changed match.
 
