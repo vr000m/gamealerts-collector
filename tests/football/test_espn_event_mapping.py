@@ -287,3 +287,44 @@ class TestClassifyGoalSlugPrecedence:
     def test_non_goal_family_returns_none(self):
         for slug in ("red-card", "yellow-card", "substitution", "penalty", "halftime"):
             assert self._classify(slug) is None
+
+
+# ===========================================================================
+# Code-review fixes: malformed participants entries and interval status.
+# ===========================================================================
+
+
+class TestMalformedParticipantsEntries:
+    def test_null_participant_entry_does_not_abort_the_event(self):
+        """ESPN emits explicit nulls on malformed events; a null participants
+        ENTRY must degrade to player=None, not AttributeError the whole
+        summary parse (review fix — the rosters loop already had this guard)."""
+        from gamecollect_football.espn import _normalize_key_event
+
+        raw = _key_event("yellow-card")
+        raw["participants"] = [None]
+        out = _normalize_key_event(raw)
+        assert len(out) == 1
+        assert out[0].player is None
+
+    def test_null_assist_entry_degrades_to_none(self):
+        from gamecollect_football.espn import _normalize_key_event
+
+        raw = _key_event("goal")
+        raw["participants"] = [{"athlete": {"displayName": "Jonathan David"}}, None]
+        out = _normalize_key_event(raw)
+        assert len(out) == 1
+        assert out[0].player == "Jonathan David"
+        assert out[0].assist is None
+
+
+class TestIntervalStatus:
+    def test_both_halftime_spellings_normalize_to_paused(self):
+        """Review fix: the ported 'Half Time' literal was never live-verified
+        and ESPN's event slug is the one-word 'halftime' — both spellings must
+        keep the match on the live slate through the interval."""
+        from gamecollect.provider import MatchStatus
+        from gamecollect_football.espn import normalize_status
+
+        assert normalize_status("Half Time") is MatchStatus.PAUSED
+        assert normalize_status("Halftime") is MatchStatus.PAUSED

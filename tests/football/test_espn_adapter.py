@@ -90,6 +90,13 @@ class TestGeneralizedShape:
         # generalized NormalizedMatch exposes the dict.
         assert isinstance(replayed_match.payload, dict)
 
+    def test_ht_scores_are_parsed_from_linescores(self, replayed_match):
+        """Code-review fix: the docstring-promised HT scores were initialized
+        to None and never assigned. The fixture's first-period linescores are
+        3-0, so the payload must carry them."""
+        assert replayed_match.payload["score_ht_home"] == 3
+        assert replayed_match.payload["score_ht_away"] == 0
+
     def test_match_is_core_normalized_match(self, replayed_match):
         """The pack normalizes into the CORE dataclasses (SDK consumed from the
         outside), not a private clone."""

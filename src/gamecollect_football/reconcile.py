@@ -170,6 +170,12 @@ def resolve_canonical_match_id(
     # another partition's match. Fall through to (c)/(d) instead.
     seeded = reader.get_state(conn, provider_id)
     if seeded is not None and seeded["source"] == writer.source:
+        # Cache the bind (docstring contract: (b)/(c) cache, (d) does not) so
+        # subsequent polls resolve via (a) without re-running get_state. Safe:
+        # the row exists and is source-checked, satisfying map_provider_match's
+        # seeded-ownership precondition, and a provider_id → provider_id bind
+        # is stable (unlike (d)'s transient qualified row).
+        writer.map_provider_match(provider, provider_id, provider_id)
         return provider_id
 
     # (c) reconcile by (kickoff instant, team-set). Runs BEFORE the qualified
@@ -334,7 +340,9 @@ def _reconcile_by_kickoff(match: NormalizedMatch, candidates: list[dict]) -> str
     return best["match_id"]
 
 
-def register_unreconciled_match(writer: PartitionWriter, match: NormalizedMatch) -> str:
+def register_unreconciled_match(
+    conn: sqlite3.Connection, writer: PartitionWriter, match: NormalizedMatch
+) -> str | None:
     """
     Seed/update a minimal ``matches`` row for a live scoreboard match that has no
     seeded canonical counterpart, so an all-live consumer can render it.
@@ -345,12 +353,16 @@ def register_unreconciled_match(writer: PartitionWriter, match: NormalizedMatch)
     (canonical DISPLAY-folded, carried in ``payload`` JSON per the
     schedule-metadata-in-payload pin), ``kickoff_utc``, and the live strip
     fields (status/minute/score). ``updated_at`` is stamped by the writer.
-    Idempotent on the qualified id.
+    Idempotent on the qualified id. The writer replaces ``payload`` wholesale,
+    so the existing row's payload is read (via ``conn``) and merged first — a
+    re-registration must not erase keys another write path added.
 
     If the identity fields (``home_team``/``away_team``/``kickoff_utc``) are
     missing, the row cannot be meaningfully seeded — log a warning and return
-    the qualified id WITHOUT writing (ported behavior: gamealerts' NOT NULL
-    team columns are payload keys here, but the skip contract is preserved).
+    ``None`` WITHOUT writing. A ``str`` return therefore always names a seeded
+    row that satisfies the writer's child-write precondition (``append_events``
+    et al. raise :class:`~gamecollect.db.writer.UnseededMatchError` on unseeded
+    ids); callers must skip event/mapping writes on ``None``.
     """
     qualified_id = f"{writer.source}:{match.match_id}"
 
@@ -361,20 +373,34 @@ def register_unreconciled_match(writer: PartitionWriter, match: NormalizedMatch)
             match.match_id,
             writer.source,
         )
-        return qualified_id
+        return None
+
+    # Read-merge-write: upsert_match replaces payload wholesale, and this
+    # function re-runs on every poll while the match stays unreconciled — a
+    # bare {home_team, away_team} write would erase richer keys (stats,
+    # lineups, schedule metadata) another path put on the row.
+    existing = reader.get_state(conn, qualified_id)
+    payload: dict[str, Any] = {}
+    if existing is not None and existing.get("payload"):
+        try:
+            decoded = json.loads(existing["payload"])
+        except (TypeError, ValueError):
+            decoded = None
+        if isinstance(decoded, dict):
+            payload = decoded
+
+    # Fold provider names to the canonical DISPLAY name at the write seam
+    # (the single authority): the unreconciled row carries `Turkey`, not
+    # raw `Türkiye`, so display consumers compare canonical-to-canonical
+    # with no opposite-direction name map.
+    payload["home_team"] = canonical_display_name(match.home_team)
+    payload["away_team"] = canonical_display_name(match.away_team)
 
     writer.upsert_match(
         {
             "match_id": qualified_id,
             "kickoff_utc": match.kickoff_utc,
-            # Fold provider names to the canonical DISPLAY name at the write seam
-            # (the single authority): the unreconciled row carries `Turkey`, not
-            # raw `Türkiye`, so display consumers compare canonical-to-canonical
-            # with no opposite-direction name map.
-            "payload": {
-                "home_team": canonical_display_name(match.home_team),
-                "away_team": canonical_display_name(match.away_team),
-            },
+            "payload": payload,
             "status": match.status.value,
             "minute": match.minute,
             "score_home": match.score_home,

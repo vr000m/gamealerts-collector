@@ -134,7 +134,13 @@ _FOOTBALL_DATA_STATUS: dict[str, MatchStatus] = {
 
 _ESPN_DESCRIPTION_STATUS: dict[str, MatchStatus] = {
     "Full Time": MatchStatus.FINISHED,
+    # "Half Time" is the literal ported out of gamealerts, but unlike "First
+    # Half"/"Second Half" it was never verified against a live interval
+    # payload, and ESPN's STATUS_HALFTIME event slug is the one-word
+    # "halftime" — cover both spellings so the interval never normalizes to
+    # UNKNOWN and drops the match from the live slate.
     "Half Time": MatchStatus.PAUSED,
+    "Halftime": MatchStatus.PAUSED,
     "In Progress": MatchStatus.IN_PLAY,
     # ESPN serves live group matches as "First Half"/"Second Half"
     # (STATUS_FIRST_HALF/STATUS_SECOND_HALF), not "In Progress" (verified via
@@ -492,13 +498,15 @@ def _normalize_key_event(raw: dict) -> list[NormalizedEvent]:
 
     team = (raw.get("team") or {}).get("displayName")
 
-    # participants: first is player, second (if present) is assist
+    # participants: first is player, second (if present) is assist. Entries
+    # can be explicit nulls (like "athlete" above) — a malformed entry must
+    # not abort the whole summary parse, mirroring the rosters loop's guard.
     participants = raw.get("participants") or []
     player = None
     assist = None
-    if participants:
+    if participants and isinstance(participants[0], dict):
         player = (participants[0].get("athlete") or {}).get("displayName")
-    if len(participants) >= 2:
+    if len(participants) >= 2 and isinstance(participants[1], dict):
         assist = (participants[1].get("athlete") or {}).get("displayName")
 
     detail = raw.get("text") or raw.get("shortText")
@@ -785,12 +793,23 @@ class ESPNAdapter(MatchDataProvider):
                 except (ValueError, TypeError):
                     score_val = None
                 team_name = (competitor.get("team") or {}).get("displayName")
+                # linescores carries per-period scores; the first entry is the
+                # first-half score (present once the half ends).
+                linescores = competitor.get("linescores") or []
+                ht_val: int | None = None
+                if linescores and isinstance(linescores[0], dict):
+                    try:
+                        ht_val = int(linescores[0].get("displayValue", ""))
+                    except (ValueError, TypeError):
+                        ht_val = None
                 if competitor.get("homeAway") == "home":
                     score_home = score_val
                     home_team = team_name
+                    score_ht_home = ht_val
                 elif competitor.get("homeAway") == "away":
                     score_away = score_val
                     away_team = team_name
+                    score_ht_away = ht_val
             break  # Only need first competition
 
         # keyEvents → NormalizedEvent list. A keyEvent may expand to two events

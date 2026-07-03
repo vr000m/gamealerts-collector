@@ -26,6 +26,9 @@ import urllib.parse
 from pathlib import Path
 from typing import Any
 
+# The multi-daemon locking contract depends on reader and writer agreeing on
+# the busy timeout, so the constant is defined once, in connection.py.
+from gamecollect.db.connection import _BUSY_TIMEOUT_MS
 from gamecollect.db.migrations import SCHEMA_MAJOR, SchemaVersionError, get_schema_version
 from gamecollect.fold import fold
 
@@ -38,8 +41,6 @@ __all__ = [
     "get_entity",
     "find_entities_by_name",
 ]
-
-_BUSY_TIMEOUT_MS = 5000
 
 
 def open_reader(path: str | Path) -> sqlite3.Connection:

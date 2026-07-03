@@ -111,17 +111,36 @@ def test_same_provider_match_id_does_not_collide_across_sources(db_path):
 # --- seq semantics ------------------------------------------------------------------
 
 
-def test_event_idempotent_replay_first_write_wins(db_path):
+def test_event_idempotent_replay_same_content_is_ignored(db_path):
     conn, w = _writer(db_path)
     writer_method(w, "match")(match_row("m1"))
     writer_method(w, "event")(event_row("m1", 1, type="goal"))
-    # Re-poll delivers the same (source, match_id, seq) again: INSERT OR
-    # IGNORE — no error, no duplicate, first write retained.
-    writer_method(w, "event")(event_row("m1", 1, type="yellow_card"))
+    # Re-poll delivers the same (source, match_id, seq) with the SAME type:
+    # ignored — no error, no duplicate, first write retained.
+    inserted = writer_method(w, "event")(event_row("m1", 1, type="goal"))
     conn.commit()
     conn.close()
+    assert inserted == 0
     rows = all_rows(db_path, "events")
     assert len(rows) == 1
+    with sqlite3.connect(db_path) as c:
+        assert c.execute("SELECT type FROM events WHERE seq=1").fetchone()[0] == "goal"
+
+
+def test_resent_seq_with_different_type_raises_instead_of_silent_drop(db_path):
+    """Code-review fix: seqs are positional in the normalizer, so a provider
+    removing a mid-list event (VAR overturn) shifts later events onto stored
+    seqs with different content. That must fail loudly — the old INSERT OR
+    IGNORE silently kept the stale row and dropped the shifted-in event."""
+    from gamecollect.db.writer import SequenceError
+
+    conn, w = _writer(db_path)
+    writer_method(w, "match")(match_row("m1"))
+    writer_method(w, "event")(event_row("m1", 1, type="goal"))
+    with pytest.raises(SequenceError, match="shifted"):
+        writer_method(w, "event")(event_row("m1", 1, type="yellow_card"))
+    conn.commit()
+    conn.close()
     with sqlite3.connect(db_path) as c:
         assert c.execute("SELECT type FROM events WHERE seq=1").fetchone()[0] == "goal"
 

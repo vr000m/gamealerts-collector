@@ -7,12 +7,16 @@ that carries an explicit ``source`` differing from the writer's raises
 :class:`PartitionWriter` cannot be talked into writing another partition's
 rows.
 
-``seq`` is provider-derived (the normalizer supplies it, e.g. from the ESPN
-keyEvents index after any 0–2-event expansion) — the writer does NOT allocate
-it. It enforces monotonic-per-``(source, match_id)`` as an invariant and is
-idempotent via ``INSERT OR IGNORE`` on ``(source, match_id, seq)``, preserving
-gamealerts' re-poll semantics: re-polling the full event list re-sends already
-stored seqs, which are ignored.
+``seq`` is provider-derived (the normalizer assigns it positionally over the
+filtered/expanded event list) — the writer does NOT allocate it. It enforces
+monotonic-per-``(source, match_id)`` as an invariant and is idempotent via
+``INSERT OR IGNORE`` on ``(source, match_id, seq)``, preserving gamealerts'
+re-poll semantics: re-polling the full event list re-sends already stored
+seqs, which are ignored WHEN their ``type`` matches the stored row. A re-sent
+seq carrying a DIFFERENT ``type`` means the provider's event list shifted
+under the positional seqs (e.g. a VAR-overturned goal removed mid-match) and
+raises :class:`SequenceError` — loud drift detection instead of silently
+keeping stale rows and dropping the shifted-in events.
 
 Event ``type`` is pack-declared string data: when a ``taxonomy`` is supplied,
 an undeclared type raises :class:`TaxonomyError` at write time (loud, explicit
@@ -209,8 +213,11 @@ class PartitionWriter:
         re-homed. Idempotent via ``INSERT OR IGNORE`` on
         ``(source, match_id, seq)``; a NEW row landing at-or-below the
         partition's existing max seq is out-of-order shape drift and raises
-        :class:`SequenceError` (re-sent already-stored seqs are ignored, so
-        full-list re-polls stay cheap and legal).
+        :class:`SequenceError`. Re-sent already-stored seqs are ignored ONLY
+        when their ``type`` matches the stored row (full-list re-polls stay
+        cheap and legal); a type mismatch means the provider event list
+        shifted under the positional seqs and raises :class:`SequenceError`
+        rather than silently mis-aligning the stored stream.
         """
         batch = list(events)
         for event in batch:
@@ -237,29 +244,54 @@ class PartitionWriter:
             )
         self._assert_match_owned(match_id, require_seeded=True)
 
+        if not batch:
+            return 0
+
         row = self._conn.execute(
             "SELECT MAX(seq) FROM events WHERE source = ? AND match_id = ?",
             (self._source, match_id),
         ).fetchone()
         max_seq = row[0] if row and row[0] is not None else None
 
+        # Stored types for the re-sent seqs: a re-sent seq whose type differs
+        # from the stored row means the provider's positional event list
+        # shifted (removal/reorder) — silent INSERT OR IGNORE would keep the
+        # stale row and drop the shifted-in event, so fail loudly instead.
+        seq_marks = ", ".join("?" for _ in seqs)
+        stored_types = dict(
+            self._conn.execute(
+                f"SELECT seq, type FROM events "
+                f"WHERE source = ? AND match_id = ? AND seq IN ({seq_marks})",
+                (self._source, match_id, *seqs),
+            )
+        )
+
         inserted = 0
         with self._transaction():
             for event in batch:
+                seq = event["seq"]
+                if seq in stored_types:
+                    if stored_types[seq] != event["type"]:
+                        raise SequenceError(
+                            f"re-sent seq {seq} for match {match_id!r} carries type "
+                            f"{event['type']!r} but the stored row is "
+                            f"{stored_types[seq]!r}; the provider event list shifted "
+                            f"under its positional seqs (source {self._source!r})"
+                        )
+                    continue
+                if max_seq is not None and seq <= max_seq:
+                    raise SequenceError(
+                        f"new event seq {seq} for match {match_id!r} is not "
+                        f"monotonic (existing max seq {max_seq} in source {self._source!r})"
+                    )
                 extras = self._pick(event, _EVENT_COLUMNS, _EVENT_KEYS)
                 columns = ["source", "match_id", "seq", "type", *extras]
                 placeholders = ", ".join("?" for _ in columns)
                 cursor = self._conn.execute(
                     f"INSERT OR IGNORE INTO events ({', '.join(columns)}) VALUES ({placeholders})",
-                    (self._source, match_id, event["seq"], event["type"], *extras.values()),
+                    (self._source, match_id, seq, event["type"], *extras.values()),
                 )
-                if cursor.rowcount == 1:
-                    if max_seq is not None and event["seq"] <= max_seq:
-                        raise SequenceError(
-                            f"new event seq {event['seq']} for match {match_id!r} is not "
-                            f"monotonic (existing max seq {max_seq} in source {self._source!r})"
-                        )
-                    inserted += 1
+                inserted += cursor.rowcount
         return inserted
 
     # ------------------------------------------------------------------
