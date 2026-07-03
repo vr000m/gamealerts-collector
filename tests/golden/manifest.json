@@ -1,0 +1,488 @@
+{
+  "contract_version": 1,
+  "operations": [
+    {
+      "name": "matches",
+      "params": [
+        {
+          "name": "source",
+          "type": "string",
+          "required": false
+        },
+        {
+          "name": "status",
+          "type": "string",
+          "required": false
+        }
+      ],
+      "output_schema": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "match_id": {
+              "type": "string"
+            },
+            "source": {
+              "type": "string"
+            },
+            "kickoff_utc": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "home_entity": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "away_entity": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "status": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "minute": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "period": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "score_home": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "score_away": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "display_clock": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "payload": {
+              "type": [
+                "object",
+                "array",
+                "null"
+              ]
+            },
+            "updated_at": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "state",
+      "params": [
+        {
+          "name": "match_id",
+          "type": "string",
+          "required": true
+        }
+      ],
+      "output_schema": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "match_id": {
+                "type": "string"
+              },
+              "source": {
+                "type": "string"
+              },
+              "kickoff_utc": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "home_entity": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "away_entity": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "status": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "minute": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "period": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "score_home": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "score_away": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "display_clock": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "payload": {
+                "type": [
+                  "object",
+                  "array",
+                  "null"
+                ]
+              },
+              "updated_at": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            }
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    {
+      "name": "events",
+      "params": [
+        {
+          "name": "match_id",
+          "type": "string",
+          "required": true
+        },
+        {
+          "name": "since_seq",
+          "type": "integer",
+          "required": false
+        }
+      ],
+      "output_schema": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "source": {
+              "type": "string"
+            },
+            "match_id": {
+              "type": "string"
+            },
+            "seq": {
+              "type": "integer"
+            },
+            "minute": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "period": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "type": {
+              "type": "string"
+            },
+            "importance": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "actor_entity": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "target_entity": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "detail": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "payload": {
+              "type": [
+                "object",
+                "array",
+                "null"
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "standings",
+      "params": [
+        {
+          "name": "source",
+          "type": "string",
+          "required": true
+        },
+        {
+          "name": "group_key",
+          "type": "string",
+          "required": false
+        }
+      ],
+      "output_schema": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "source": {
+              "type": "string"
+            },
+            "group_key": {
+              "type": "string"
+            },
+            "entity_id": {
+              "type": "string"
+            },
+            "points": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "rank": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "payload": {
+              "type": [
+                "object",
+                "array",
+                "null"
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "squad",
+      "params": [
+        {
+          "name": "match_id",
+          "type": "string",
+          "required": true
+        },
+        {
+          "name": "team",
+          "type": "string",
+          "required": false
+        }
+      ],
+      "output_schema": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "source": {
+              "type": "string"
+            },
+            "match_id": {
+              "type": "string"
+            },
+            "team": {
+              "type": "string"
+            },
+            "athlete_id": {
+              "type": "string"
+            },
+            "display_name": {
+              "type": "string"
+            },
+            "name_folded": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "jersey": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "position": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "starter": {
+              "type": "integer"
+            },
+            "subbed_in": {
+              "type": "integer"
+            },
+            "subbed_out": {
+              "type": "integer"
+            },
+            "formation_place": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "home_away": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "formation": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "player-stats",
+      "params": [
+        {
+          "name": "match_id",
+          "type": "string",
+          "required": true
+        },
+        {
+          "name": "team",
+          "type": "string",
+          "required": false
+        }
+      ],
+      "output_schema": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "source": {
+              "type": "string"
+            },
+            "match_id": {
+              "type": "string"
+            },
+            "team": {
+              "type": "string"
+            },
+            "possession": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "shots": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "shots_on_target": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "corners": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "fouls": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "yellow_cards": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "red_cards": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "offsides": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        }
+      }
+    }
+  ]
+}

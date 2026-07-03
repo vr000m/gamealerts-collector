@@ -1,0 +1,50 @@
+[
+  {
+    "source": "wc2026-test",
+    "match_id": "wc2026-test:golden",
+    "team": "Canada",
+    "athlete_id": "a1",
+    "display_name": "Jonathan David",
+    "name_folded": "jonathan david",
+    "jersey": "20",
+    "position": "F",
+    "starter": 1,
+    "subbed_in": 0,
+    "subbed_out": 0,
+    "formation_place": 1,
+    "home_away": null,
+    "formation": null
+  },
+  {
+    "source": "wc2026-test",
+    "match_id": "wc2026-test:golden",
+    "team": "Canada",
+    "athlete_id": "a2",
+    "display_name": "Alphonso Davies",
+    "name_folded": "alphonso davies",
+    "jersey": "19",
+    "position": "D",
+    "starter": 1,
+    "subbed_in": 0,
+    "subbed_out": 0,
+    "formation_place": 2,
+    "home_away": null,
+    "formation": null
+  },
+  {
+    "source": "wc2026-test",
+    "match_id": "wc2026-test:golden",
+    "team": "Qatar",
+    "athlete_id": "a3",
+    "display_name": "Akram Afif",
+    "name_folded": "akram afif",
+    "jersey": "11",
+    "position": "F",
+    "starter": 1,
+    "subbed_in": 0,
+    "subbed_out": 0,
+    "formation_place": 1,
+    "home_away": null,
+    "formation": null
+  }
+]

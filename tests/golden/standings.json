@@ -1,0 +1,18 @@
+[
+  {
+    "source": "wc2026-test",
+    "group_key": "A",
+    "entity_id": "t-can",
+    "points": 9,
+    "rank": 1,
+    "payload": null
+  },
+  {
+    "source": "wc2026-test",
+    "group_key": "A",
+    "entity_id": "t-qat",
+    "points": 0,
+    "rank": 4,
+    "payload": null
+  }
+]

@@ -1,0 +1,43 @@
+[
+  {
+    "source": "wc2026-test",
+    "match_id": "wc2026-test:golden",
+    "seq": 0,
+    "minute": 10,
+    "period": 1,
+    "type": "goal",
+    "importance": 3,
+    "actor_entity": "t-can",
+    "target_entity": null,
+    "detail": "Jonathan David",
+    "payload": {
+      "assist": "Alphonso Davies"
+    }
+  },
+  {
+    "source": "wc2026-test",
+    "match_id": "wc2026-test:golden",
+    "seq": 1,
+    "minute": 25,
+    "period": 1,
+    "type": "goal",
+    "importance": 3,
+    "actor_entity": "t-can",
+    "target_entity": null,
+    "detail": "Jonathan David",
+    "payload": null
+  },
+  {
+    "source": "wc2026-test",
+    "match_id": "wc2026-test:golden",
+    "seq": 2,
+    "minute": 40,
+    "period": 1,
+    "type": "yellow_card",
+    "importance": 1,
+    "actor_entity": "t-qat",
+    "target_entity": null,
+    "detail": "Tactical foul",
+    "payload": null
+  }
+]
