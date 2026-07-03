@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from gamecollect.packs.spec import SportPack
 from gamecollect_football.espn import ESPNAdapter
+from gamecollect_football.reconcile import register_unreconciled_match
 from gamecollect_football.taxonomy import TAXONOMY
 
 __all__ = ["FOOTBALL_SIDE_TABLE_DDL", "pack"]
@@ -108,4 +109,10 @@ def pack() -> SportPack:
         # phase-marker event types.
         compaction_boundaries=["kickoff", "half_time", "full_time"],
         side_table_ddl=FOOTBALL_SIDE_TABLE_DDL,
+        # Reconcile-aware seed hook: register_unreconciled_match seeds a
+        # source-qualified strip row (returning its id) or returns None when the
+        # scoreboard match lacks identity fields — the engine then skips child
+        # writes for it. Its (conn, writer, match) -> str | None signature is the
+        # SportPack.seed_match contract exactly, so it wires in directly.
+        seed_match=register_unreconciled_match,
     )

@@ -8,12 +8,46 @@ below and are validated by :mod:`gamecollect.packs.registry` at load time.
 
 from __future__ import annotations
 
+import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
-from gamecollect.provider import MatchDataProvider
+from gamecollect.provider import MatchDataProvider, NormalizedMatch
 
-__all__ = ["EventTypeDecl", "SportPack"]
+if TYPE_CHECKING:
+    from gamecollect.db.writer import PartitionWriter
+
+__all__ = ["EventTypeDecl", "SportPack", "default_seed_match"]
+
+# The seeding hook the engine calls before any child (event/mapping) write.
+SeedMatch = Callable[[sqlite3.Connection, "PartitionWriter", NormalizedMatch], "str | None"]
+
+
+def default_seed_match(
+    conn: sqlite3.Connection, writer: PartitionWriter, match: NormalizedMatch
+) -> str | None:
+    """Sport-agnostic default :attr:`SportPack.seed_match`.
+
+    Seeds/updates a ``matches`` row under the provider-native ``match.match_id``
+    (no reconciliation, no source-qualification — that is pack territory) and
+    returns that id so the engine can proceed with child writes. A pack that
+    reconciles against a canonical schedule (football) overrides this with its
+    own hook; this default keeps the contract usable for packs that emit
+    already-canonical ids. ``conn`` is unused here but is part of the hook
+    signature so reconciling packs can read existing rows.
+    """
+    writer.upsert_match(
+        {
+            "match_id": match.match_id,
+            "status": match.status.value if match.status is not None else None,
+            "minute": match.minute,
+            "score_home": match.score_home,
+            "score_away": match.score_away,
+            "kickoff_utc": match.kickoff_utc,
+        }
+    )
+    return match.match_id
 
 
 @dataclass(frozen=True)
@@ -58,6 +92,19 @@ class SportPack:
     display_metadata: dict
     compaction_boundaries: list[str]
     side_table_ddl: tuple[str, ...] = field(default=())
+    seed_match: SeedMatch = field(default=default_seed_match)
+    """Seed-before-child-write hook the engine calls per changed match.
+
+    ``seed_match(conn, writer, match) -> str | None`` must ensure a ``matches``
+    row exists (and is owned by ``writer.source``) for ``match`` before the
+    engine appends its events, then return the **canonical** ``match_id`` the
+    engine writes children against. A ``str`` return always names a seeded row
+    satisfying the writer's child-write precondition
+    (:class:`~gamecollect.db.writer.UnseededMatchError`); ``None`` means the
+    match could not be seeded (e.g. missing identity fields) and the engine
+    skips child writes for it this poll. Defaults to :func:`default_seed_match`;
+    the football pack overrides it with its reconcile-aware seeder.
+    """
 
     @property
     def event_types(self) -> frozenset[str]:
