@@ -1,0 +1,226 @@
+{
+  "entities": [],
+  "events": [
+    {
+      "assist": null,
+      "detail": "First Half begins.",
+      "event_type": "kickoff",
+      "importance": 3,
+      "minute": null,
+      "player": null,
+      "seq": 0,
+      "team": null
+    },
+    {
+      "assist": null,
+      "detail": "Goal! New Zealand 0, Belgium 1. Leandro Trossard (Belgium) right footed shot from very close range following a corner.",
+      "event_type": "goal",
+      "importance": 1,
+      "minute": 28,
+      "player": "Leandro Trossard",
+      "seq": 1,
+      "team": "Belgium"
+    },
+    {
+      "assist": null,
+      "detail": "First Half ends, New Zealand 0, Belgium 1.",
+      "event_type": "half_time",
+      "importance": 3,
+      "minute": 45,
+      "player": null,
+      "seq": 2,
+      "team": null
+    },
+    {
+      "assist": "Ryan Thomas",
+      "detail": "Substitution, New Zealand. Ben Old replaces Ryan Thomas.",
+      "event_type": "sub",
+      "importance": 4,
+      "minute": 45,
+      "player": "Ben Old",
+      "seq": 3,
+      "team": "New Zealand"
+    },
+    {
+      "assist": "Sarpreet Singh",
+      "detail": "Jesse Randall (New Zealand) Substitution at 45'",
+      "event_type": "sub",
+      "importance": 4,
+      "minute": 45,
+      "player": "Jesse Randall",
+      "seq": 4,
+      "team": "New Zealand"
+    },
+    {
+      "assist": null,
+      "detail": "Marko Stamenic (New Zealand) is shown the yellow card for a bad foul.",
+      "event_type": "yellow",
+      "importance": 3,
+      "minute": 46,
+      "player": "Marko Stamenic",
+      "seq": 5,
+      "team": "New Zealand"
+    },
+    {
+      "assist": "Hans Vanaken",
+      "detail": "Goal! New Zealand 0, Belgium 2. Leandro Trossard (Belgium) right footed shot from the centre of the box.",
+      "event_type": "goal",
+      "importance": 1,
+      "minute": 50,
+      "player": "Leandro Trossard",
+      "seq": 6,
+      "team": "Belgium"
+    },
+    {
+      "assist": null,
+      "detail": "Elijah Just (New Zealand) is shown the yellow card for a bad foul.",
+      "event_type": "yellow",
+      "importance": 3,
+      "minute": 56,
+      "player": "Elijah Just",
+      "seq": 7,
+      "team": "New Zealand"
+    },
+    {
+      "assist": "Jérémy Doku",
+      "detail": "Substitution, Belgium. Matias Fernandez-Pardo replaces Jérémy Doku.",
+      "event_type": "sub",
+      "importance": 4,
+      "minute": 56,
+      "player": "Matias Fernandez-Pardo",
+      "seq": 8,
+      "team": "Belgium"
+    },
+    {
+      "assist": "Tim Payne",
+      "detail": "Substitution, New Zealand. Michael Boxall replaces Tim Payne.",
+      "event_type": "sub",
+      "importance": 4,
+      "minute": 64,
+      "player": "Michael Boxall",
+      "seq": 9,
+      "team": "New Zealand"
+    },
+    {
+      "assist": "Joe Bell",
+      "detail": "Substitution, New Zealand. Callum McCowatt replaces Joe Bell.",
+      "event_type": "sub",
+      "importance": 4,
+      "minute": 64,
+      "player": "Callum McCowatt",
+      "seq": 10,
+      "team": "New Zealand"
+    },
+    {
+      "assist": null,
+      "detail": "Goal! New Zealand 0, Belgium 3. Kevin De Bruyne (Belgium) left footed shot from outside the box.",
+      "event_type": "goal",
+      "importance": 1,
+      "minute": 66,
+      "player": "Kevin De Bruyne",
+      "seq": 11,
+      "team": "Belgium"
+    },
+    {
+      "assist": "Leandro Trossard",
+      "detail": "Substitution, Belgium. Alexis Saelemaekers replaces Leandro Trossard.",
+      "event_type": "sub",
+      "importance": 4,
+      "minute": 72,
+      "player": "Alexis Saelemaekers",
+      "seq": 12,
+      "team": "Belgium"
+    },
+    {
+      "assist": "Kevin De Bruyne",
+      "detail": "Substitution, Belgium. Amadou Onana replaces Kevin De Bruyne.",
+      "event_type": "sub",
+      "importance": 4,
+      "minute": 72,
+      "player": "Amadou Onana",
+      "seq": 13,
+      "team": "Belgium"
+    },
+    {
+      "assist": "Liberato Cacace",
+      "detail": "Francis de Vries (New Zealand) Substitution at 79'",
+      "event_type": "sub",
+      "importance": 4,
+      "minute": 79,
+      "player": "Francis de Vries",
+      "seq": 14,
+      "team": "New Zealand"
+    },
+    {
+      "assist": null,
+      "detail": "Goal! New Zealand 1, Belgium 3. Elijah Just (New Zealand) left footed shot from the centre of the box to the high centre of the goal following a corner.",
+      "event_type": "goal",
+      "importance": 1,
+      "minute": 84,
+      "player": "Elijah Just",
+      "seq": 15,
+      "team": "New Zealand"
+    },
+    {
+      "assist": "Charles De Ketelaere",
+      "detail": "Romelu Lukaku (Belgium) Substitution at 85'",
+      "event_type": "sub",
+      "importance": 4,
+      "minute": 85,
+      "player": "Romelu Lukaku",
+      "seq": 16,
+      "team": "Belgium"
+    },
+    {
+      "assist": "Youri Tielemans",
+      "detail": "Nicolas Raskin (Belgium) Substitution at 85'",
+      "event_type": "sub",
+      "importance": 4,
+      "minute": 85,
+      "player": "Nicolas Raskin",
+      "seq": 17,
+      "team": "Belgium"
+    },
+    {
+      "assist": "Nicolas Raskin",
+      "detail": "Goal! New Zealand 1, Belgium 4. Romelu Lukaku (Belgium) header from very close range to the centre of the goal. Assisted by Nicolas Raskin with a cross.",
+      "event_type": "goal",
+      "importance": 1,
+      "minute": 86,
+      "player": "Romelu Lukaku",
+      "seq": 18,
+      "team": "Belgium"
+    },
+    {
+      "assist": "Romelu Lukaku",
+      "detail": "Goal! New Zealand 1, Belgium 5. Alexis Saelemaekers (Belgium) right footed shot from the centre of the box.",
+      "event_type": "goal",
+      "importance": 1,
+      "minute": 90,
+      "player": "Alexis Saelemaekers",
+      "seq": 19,
+      "team": "Belgium"
+    }
+  ],
+  "format_version": 1,
+  "match": {
+    "away_team": "Belgium",
+    "display_clock": null,
+    "home_team": "New Zealand",
+    "kickoff_utc": "2026-06-27T03:00Z",
+    "match_id": "espn:760477",
+    "minute": 90,
+    "payload": {
+      "city": null,
+      "group_name": null,
+      "round_name": null,
+      "score_ht_away": null,
+      "score_ht_home": null,
+      "stadium": null
+    },
+    "score_away": 5,
+    "score_home": 1,
+    "status": "FINISHED"
+  },
+  "standings": []
+}

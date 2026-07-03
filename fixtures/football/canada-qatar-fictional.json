@@ -1,0 +1,86 @@
+{
+  "entities": [],
+  "events": [
+    {
+      "assist": null,
+      "detail": null,
+      "event_type": "goal",
+      "importance": 1,
+      "minute": 16,
+      "player": "Cyle Larin",
+      "seq": 0,
+      "team": "Canada"
+    },
+    {
+      "assist": null,
+      "detail": null,
+      "event_type": "goal",
+      "importance": 1,
+      "minute": 29,
+      "player": "Jonathan David",
+      "seq": 1,
+      "team": "Canada"
+    },
+    {
+      "assist": null,
+      "detail": null,
+      "event_type": "goal",
+      "importance": 1,
+      "minute": 45,
+      "player": "Jonathan David",
+      "seq": 2,
+      "team": "Canada"
+    },
+    {
+      "assist": null,
+      "detail": null,
+      "event_type": "goal",
+      "importance": 1,
+      "minute": 64,
+      "player": "Nathan Saliba",
+      "seq": 3,
+      "team": "Canada"
+    },
+    {
+      "assist": null,
+      "detail": null,
+      "event_type": "goal",
+      "importance": 1,
+      "minute": 75,
+      "player": "Mohamed Manai",
+      "seq": 4,
+      "team": "Canada"
+    },
+    {
+      "assist": null,
+      "detail": null,
+      "event_type": "goal",
+      "importance": 1,
+      "minute": 90,
+      "player": "Jonathan David",
+      "seq": 5,
+      "team": "Canada"
+    }
+  ],
+  "format_version": 1,
+  "match": {
+    "away_team": "Qatar",
+    "display_clock": null,
+    "home_team": "Canada",
+    "kickoff_utc": "2026-06-18T22:00:00+00:00",
+    "match_id": "2026-06-18_canada_vs_qatar_9",
+    "minute": null,
+    "payload": {
+      "city": "Vancouver",
+      "group_name": "Group B",
+      "round_name": "Matchday 8",
+      "score_ht_away": 0,
+      "score_ht_home": 3,
+      "stadium": "BC Place"
+    },
+    "score_away": 0,
+    "score_home": 6,
+    "status": "FINISHED"
+  },
+  "standings": []
+}

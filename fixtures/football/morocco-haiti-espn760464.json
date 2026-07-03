@@ -1,0 +1,236 @@
+{
+  "entities": [],
+  "events": [
+    {
+      "assist": null,
+      "detail": null,
+      "event_type": "kickoff",
+      "importance": 3,
+      "minute": null,
+      "player": null,
+      "seq": 0,
+      "team": null
+    },
+    {
+      "assist": null,
+      "detail": "Goal! Morocco 0, Haiti 1. Lenny Joseph (Haiti) right footed shot from very close range.",
+      "event_type": "goal",
+      "importance": 1,
+      "minute": 10,
+      "player": "Lenny Joseph",
+      "seq": 1,
+      "team": "Haiti"
+    },
+    {
+      "assist": null,
+      "detail": "Goal! Morocco 1, Haiti 1. Achraf Hakimi (Morocco) left footed shot from very close range to the centre of the goal.",
+      "event_type": "goal",
+      "importance": 1,
+      "minute": 39,
+      "player": "Achraf Hakimi",
+      "seq": 2,
+      "team": "Morocco"
+    },
+    {
+      "assist": "Jean-Kévin Duverne",
+      "detail": "Goal! Morocco 1, Haiti 2. Wilson Isidor (Haiti) right footed shot from outside the box to the top left corner. Assisted by Jean-Kévin Duverne.",
+      "event_type": "goal",
+      "importance": 1,
+      "minute": 43,
+      "player": "Wilson Isidor",
+      "seq": 3,
+      "team": "Haiti"
+    },
+    {
+      "assist": "Achraf Hakimi",
+      "detail": "Goal! Morocco 2, Haiti 2. Ismael Saibari (Morocco) right footed shot from the centre of the box to the bottom left corner. Assisted by Achraf Hakimi.",
+      "event_type": "goal",
+      "importance": 1,
+      "minute": 45,
+      "player": "Ismael Saibari",
+      "seq": 4,
+      "team": "Morocco"
+    },
+    {
+      "assist": null,
+      "detail": null,
+      "event_type": "half_time",
+      "importance": 3,
+      "minute": 45,
+      "player": null,
+      "seq": 5,
+      "team": null
+    },
+    {
+      "assist": "Ruben Providence",
+      "detail": "Duckens Nazon (Haiti) Substitution at 67'",
+      "event_type": "sub",
+      "importance": 4,
+      "minute": 67,
+      "player": "Duckens Nazon",
+      "seq": 6,
+      "team": "Haiti"
+    },
+    {
+      "assist": "Wilson Isidor",
+      "detail": "Louicius Deedson (Haiti) Substitution at 67'",
+      "event_type": "sub",
+      "importance": 4,
+      "minute": 67,
+      "player": "Louicius Deedson",
+      "seq": 7,
+      "team": "Haiti"
+    },
+    {
+      "assist": "Ismael Saibari",
+      "detail": "Soufiane Rahimi (Morocco) Substitution at 70'",
+      "event_type": "sub",
+      "importance": 4,
+      "minute": 70,
+      "player": "Soufiane Rahimi",
+      "seq": 8,
+      "team": "Morocco"
+    },
+    {
+      "assist": "Brahim Díaz",
+      "detail": "Substitution, Morocco. Azzedine Ounahi replaces Brahim Díaz.",
+      "event_type": "sub",
+      "importance": 4,
+      "minute": 70,
+      "player": "Azzedine Ounahi",
+      "seq": 9,
+      "team": "Morocco"
+    },
+    {
+      "assist": "Ayoub El Kaabi",
+      "detail": "Gessime Yassine (Morocco) Substitution at 70'",
+      "event_type": "sub",
+      "importance": 4,
+      "minute": 70,
+      "player": "Gessime Yassine",
+      "seq": 10,
+      "team": "Morocco"
+    },
+    {
+      "assist": "Chadi Riad",
+      "detail": "Goal! Morocco 3, Haiti 2. Soufiane Rahimi (Morocco) right footed shot from the centre of the box to the top right corner. Assisted by Chadi Riad following a corner.",
+      "event_type": "goal",
+      "importance": 1,
+      "minute": 78,
+      "player": "Soufiane Rahimi",
+      "seq": 11,
+      "team": "Morocco"
+    },
+    {
+      "assist": "Jean-Kévin Duverne",
+      "detail": "Carlens Arcus (Haiti) Substitution at 80'",
+      "event_type": "sub",
+      "importance": 4,
+      "minute": 80,
+      "player": "Carlens Arcus",
+      "seq": 12,
+      "team": "Haiti"
+    },
+    {
+      "assist": "Danley Jean Jacques",
+      "detail": "Dominique Simon (Haiti) Substitution at 80'",
+      "event_type": "sub",
+      "importance": 4,
+      "minute": 80,
+      "player": "Dominique Simon",
+      "seq": 13,
+      "team": "Haiti"
+    },
+    {
+      "assist": "Danley Jean Jacques",
+      "detail": "Substitution, Haiti. Dominique Simon replaces Danley Jean Jacques.",
+      "event_type": "sub",
+      "importance": 4,
+      "minute": 80,
+      "player": "Dominique Simon",
+      "seq": 14,
+      "team": "Haiti"
+    },
+    {
+      "assist": "Anass Salah-Eddine",
+      "detail": "Noussair Mazraoui (Morocco) Substitution at 83'",
+      "event_type": "sub",
+      "importance": 4,
+      "minute": 83,
+      "player": "Noussair Mazraoui",
+      "seq": 15,
+      "team": "Morocco"
+    },
+    {
+      "assist": "Neil El Aynaoui",
+      "detail": "Samir El Mourabet (Morocco) Substitution at 83'",
+      "event_type": "sub",
+      "importance": 4,
+      "minute": 83,
+      "player": "Samir El Mourabet",
+      "seq": 16,
+      "team": "Morocco"
+    },
+    {
+      "assist": "Lenny Joseph",
+      "detail": "Substitution, Haiti. Frantzdy Pierrot replaces Lenny Joseph.",
+      "event_type": "sub",
+      "importance": 4,
+      "minute": 83,
+      "player": "Frantzdy Pierrot",
+      "seq": 17,
+      "team": "Haiti"
+    },
+    {
+      "assist": "Lenny Joseph",
+      "detail": "Substitution, Haiti. Frantzdy Pierrot replaces Lenny Joseph.",
+      "event_type": "sub",
+      "importance": 4,
+      "minute": 83,
+      "player": "Frantzdy Pierrot",
+      "seq": 18,
+      "team": "Haiti"
+    },
+    {
+      "assist": "Soufiane Rahimi",
+      "detail": "Goal! Morocco 4, Haiti 2. Gessime Yassine (Morocco) left footed shot from the centre of the box to the centre of the goal. Assisted by Soufiane Rahimi.",
+      "event_type": "goal",
+      "importance": 1,
+      "minute": 89,
+      "player": "Gessime Yassine",
+      "seq": 19,
+      "team": "Morocco"
+    },
+    {
+      "assist": null,
+      "detail": "Josué Casimir (Haiti) is shown the yellow card for a bad foul.",
+      "event_type": "yellow",
+      "importance": 3,
+      "minute": 90,
+      "player": "Josué Casimir",
+      "seq": 20,
+      "team": "Haiti"
+    }
+  ],
+  "format_version": 1,
+  "match": {
+    "away_team": "Haiti",
+    "display_clock": null,
+    "home_team": "Morocco",
+    "kickoff_utc": "2026-06-24T22:00Z",
+    "match_id": "espn:760464",
+    "minute": 90,
+    "payload": {
+      "city": null,
+      "group_name": null,
+      "round_name": null,
+      "score_ht_away": null,
+      "score_ht_home": null,
+      "stadium": null
+    },
+    "score_away": 2,
+    "score_home": 4,
+    "status": "FINISHED"
+  },
+  "standings": []
+}
