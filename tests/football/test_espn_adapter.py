@@ -198,3 +198,29 @@ def test_null_athlete_in_key_event_does_not_crash():
     events = _normalize_key_event(raw)
     assert len(events) == 1
     assert events[0].player is None and events[0].team is None
+
+
+class TestProviderSeamNonDictResponses:
+    """Codex adversarial fix: valid JSON with the wrong top-level type (e.g. a
+    bare list) must surface as ShapeDriftError, not a raw TypeError escaping
+    the ProviderError seam the poll loop degrades on."""
+
+    def test_scoreboard_non_dict_response_raises_shape_drift(self):
+        import pytest
+
+        from gamecollect.provider import ShapeDriftError
+        from gamecollect_football.espn import ESPNAdapter
+
+        adapter = ESPNAdapter(http_get=lambda url, params=None: [])
+        with pytest.raises(ShapeDriftError):
+            adapter.fetch_live_matches()
+
+    def test_summary_non_dict_response_raises_shape_drift(self):
+        import pytest
+
+        from gamecollect.provider import ShapeDriftError
+        from gamecollect_football.espn import ESPNAdapter
+
+        adapter = ESPNAdapter(http_get=lambda url, params=None: [])
+        with pytest.raises(ShapeDriftError):
+            adapter.fetch_match_detail("760440")

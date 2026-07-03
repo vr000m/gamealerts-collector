@@ -12,11 +12,12 @@ filtered/expanded event list) — the writer does NOT allocate it. It enforces
 monotonic-per-``(source, match_id)`` as an invariant and is idempotent via
 ``INSERT OR IGNORE`` on ``(source, match_id, seq)``, preserving gamealerts'
 re-poll semantics: re-polling the full event list re-sends already stored
-seqs, which are ignored WHEN their ``type`` matches the stored row. A re-sent
-seq carrying a DIFFERENT ``type`` means the provider's event list shifted
-under the positional seqs (e.g. a VAR-overturned goal removed mid-match) and
-raises :class:`SequenceError` — loud drift detection instead of silently
-keeping stale rows and dropping the shifted-in events.
+seqs, which are ignored WHEN their full row content matches the stored row.
+A re-sent seq whose fingerprint (``type`` plus every event column) differs
+means the provider's event list shifted under the positional seqs (e.g. an
+event inserted or removed mid-match) and raises :class:`SequenceError` —
+loud drift detection instead of silently keeping stale rows and dropping the
+shifted-in events.
 
 Event ``type`` is pack-declared string data: when a ``taxonomy`` is supplied,
 an undeclared type raises :class:`TaxonomyError` at write time (loud, explicit
@@ -214,10 +215,11 @@ class PartitionWriter:
         ``(source, match_id, seq)``; a NEW row landing at-or-below the
         partition's existing max seq is out-of-order shape drift and raises
         :class:`SequenceError`. Re-sent already-stored seqs are ignored ONLY
-        when their ``type`` matches the stored row (full-list re-polls stay
-        cheap and legal); a type mismatch means the provider event list
-        shifted under the positional seqs and raises :class:`SequenceError`
-        rather than silently mis-aligning the stored stream.
+        when their full fingerprint (``type`` plus every event column)
+        matches the stored row (full-list re-polls stay cheap and legal); any
+        content mismatch means the provider event list shifted under the
+        positional seqs and raises :class:`SequenceError` rather than
+        silently mis-aligning the stored stream.
         """
         batch = list(events)
         if not batch:
@@ -252,29 +254,38 @@ class PartitionWriter:
         ).fetchone()
         max_seq = row[0] if row and row[0] is not None else None
 
-        # Stored types for the re-sent seqs: a re-sent seq whose type differs
-        # from the stored row means the provider's positional event list
-        # shifted (removal/reorder) — silent INSERT OR IGNORE would keep the
-        # stale row and drop the shifted-in event, so fail loudly instead.
+        # Stored fingerprints for the re-sent seqs: a re-sent seq whose FULL
+        # row content differs from the stored row means the provider's
+        # positional event list shifted (insertion/removal/reorder) — silent
+        # INSERT OR IGNORE would keep the stale row and drop the shifted-in
+        # event. Type alone is too weak a fingerprint (a shifted goal replayed
+        # over another goal matches on type), so every event column is compared.
+        fingerprint = ("type", *_EVENT_COLUMNS)
         seq_marks = ", ".join("?" for _ in seqs)
-        stored_types = dict(
-            self._conn.execute(
-                f"SELECT seq, type FROM events "
+        stored_rows = {
+            r[0]: dict(zip(fingerprint, r[1:], strict=True))
+            for r in self._conn.execute(
+                f"SELECT seq, {', '.join(fingerprint)} FROM events "
                 f"WHERE source = ? AND match_id = ? AND seq IN ({seq_marks})",
                 (self._source, match_id, *seqs),
             )
-        )
+        }
 
         inserted = 0
         with self._transaction():
             for event in batch:
                 seq = event["seq"]
-                if seq in stored_types:
-                    if stored_types[seq] != event["type"]:
+                extras = self._pick(event, _EVENT_COLUMNS, _EVENT_KEYS)
+                stored = stored_rows.get(seq)
+                if stored is not None:
+                    incoming = {"type": event["type"]} | {
+                        col: extras.get(col) for col in _EVENT_COLUMNS
+                    }
+                    changed = sorted(col for col in fingerprint if stored[col] != incoming[col])
+                    if changed:
                         raise SequenceError(
-                            f"re-sent seq {seq} for match {match_id!r} carries type "
-                            f"{event['type']!r} but the stored row is "
-                            f"{stored_types[seq]!r}; the provider event list shifted "
+                            f"re-sent seq {seq} for match {match_id!r} differs from the "
+                            f"stored row on {changed}; the provider event list shifted "
                             f"under its positional seqs (source {self._source!r})"
                         )
                     continue
@@ -283,7 +294,6 @@ class PartitionWriter:
                         f"new event seq {seq} for match {match_id!r} is not "
                         f"monotonic (existing max seq {max_seq} in source {self._source!r})"
                     )
-                extras = self._pick(event, _EVENT_COLUMNS, _EVENT_KEYS)
                 columns = ["source", "match_id", "seq", "type", *extras]
                 placeholders = ", ".join("?" for _ in columns)
                 cursor = self._conn.execute(

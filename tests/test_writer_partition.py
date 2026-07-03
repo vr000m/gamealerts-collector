@@ -444,3 +444,39 @@ def test_append_events_empty_batch_is_a_noop_even_unseeded(db_path):
     conn, w = _writer(db_path)
     assert w.append_events("m-unseeded", []) == 0
     conn.close()
+
+
+def test_resent_seq_same_type_different_content_raises(db_path):
+    """Codex adversarial fix: type alone is too weak a fingerprint — a shifted
+    goal replayed over another goal matches on type. Any event-column content
+    mismatch on a re-sent seq must raise, not be silently ignored."""
+    from gamecollect.db.writer import SequenceError
+
+    conn, w = _writer(db_path)
+    writer_method(w, "match")(match_row("m1"))
+    writer_method(w, "event")(event_row("m1", 0, type="goal", minute=16, detail="Header"))
+    # ESPN inserts an earlier goal; the stored goal shifts to seq 1 and a
+    # DIFFERENT goal is re-sent at seq 0: same type, different content.
+    with pytest.raises(SequenceError, match="shifted"):
+        w.append_events(
+            "m1",
+            [
+                event_row("m1", 0, type="goal", minute=12, detail="Penalty"),
+                event_row("m1", 1, type="goal", minute=16, detail="Header"),
+            ],
+        )
+    conn.commit()
+    conn.close()
+    with sqlite3.connect(db_path) as c:
+        rows = c.execute("SELECT seq, minute FROM events ORDER BY seq").fetchall()
+    assert rows == [(0, 16)], f"drift batch must not partially persist: {rows}"
+
+
+def test_resent_seq_identical_full_content_is_ignored(db_path):
+    conn, w = _writer(db_path)
+    writer_method(w, "match")(match_row("m1"))
+    row = event_row("m1", 0, type="goal", minute=16, detail="Header", payload={"team": "Canada"})
+    assert w.append_events("m1", [row]) == 1
+    # Byte-identical re-poll (payload dict re-encodes deterministically): ignored.
+    assert w.append_events("m1", [row]) == 0
+    conn.close()

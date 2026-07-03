@@ -184,6 +184,10 @@ def assert_espn_scoreboard_shape(data: dict) -> None:
 
     Raises ShapeDriftError if required fields are missing.
     """
+    if not isinstance(data, dict):
+        raise ShapeDriftError(
+            f"ESPN scoreboard response must be a JSON object, got {type(data).__name__}"
+        )
     try:
         events = data["events"]
     except KeyError as exc:
@@ -231,6 +235,10 @@ def assert_espn_summary_shape(data: dict) -> None:
 
     Raises ShapeDriftError if required fields are missing.
     """
+    if not isinstance(data, dict):
+        raise ShapeDriftError(
+            f"ESPN summary response must be a JSON object, got {type(data).__name__}"
+        )
     # boxscore.teams with statistics list
     try:
         teams = data["boxscore"]["teams"]
@@ -667,11 +675,13 @@ class ESPNAdapter(MatchDataProvider):
         with no live filter; the caller decides what to do with the statuses.
         """
         data = self._http_get(self.SCOREBOARD_URL, params=params)
-        assert_espn_scoreboard_shape(data)
-        # The shape assertion samples events[0] only; normalization of LATER
-        # events can still hit missing keys. Map those to ShapeDriftError so
-        # errors cross the provider seam only via the ProviderError hierarchy.
+        # The shape assertion samples events[0] only, and its own key probes
+        # can hit TypeError/IndexError on structurally wrong (but valid) JSON;
+        # normalization of LATER events can still hit missing keys. Map all of
+        # those to ShapeDriftError so errors cross the provider seam only via
+        # the ProviderError hierarchy.
         try:
+            assert_espn_scoreboard_shape(data)
             return [self._normalize_scoreboard_event(ev) for ev in data.get("events", [])]
         except (KeyError, IndexError, TypeError, AttributeError) as exc:
             raise ShapeDriftError(f"malformed scoreboard event: {exc!r}") from exc
@@ -683,8 +693,8 @@ class ESPNAdapter(MatchDataProvider):
         Raises ProviderUnavailableError or ShapeDriftError on failure.
         """
         data = self._http_get(self.SUMMARY_URL, params={"event": match_id})
-        assert_espn_summary_shape(data)
         try:
+            assert_espn_summary_shape(data)
             return self._normalize_summary(match_id, data)
         except (KeyError, IndexError, TypeError, AttributeError) as exc:
             raise ShapeDriftError(f"malformed summary for match {match_id!r}: {exc!r}") from exc
