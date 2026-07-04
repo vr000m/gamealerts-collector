@@ -9,13 +9,18 @@ altered by a pack.
 
 from __future__ import annotations
 
+import sqlite3
+
+from gamecollect.db.writer import PartitionWriter
+from gamecollect.fold import fold
 from gamecollect.packs.spec import SportPack
+from gamecollect.provider import NormalizedMatch
 from gamecollect_football.espn import ESPNAdapter
 from gamecollect_football.operations import FOOTBALL_OPERATIONS
 from gamecollect_football.reconcile import register_unreconciled_match
 from gamecollect_football.taxonomy import TAXONOMY
 
-__all__ = ["FOOTBALL_SIDE_TABLE_DDL", "pack"]
+__all__ = ["FOOTBALL_SIDE_TABLE_DDL", "pack", "persist_football_side_tables"]
 
 # Pack-owned side tables (typed homes for the football-specific shapes the
 # adapter carries in NormalizedMatch.payload: boxscore stats and lineups).
@@ -62,6 +67,121 @@ FOOTBALL_SIDE_TABLE_DDL: tuple[str, ...] = (
         ON football_lineups (source, name_folded);
     """,
 )
+
+
+def _to_int(value: object) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return int(value)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def persist_football_side_tables(
+    conn: sqlite3.Connection,
+    writer: PartitionWriter,
+    match: NormalizedMatch,
+    seeded_match_id: str,
+) -> None:
+    """Persist football detail payload extras into football-owned side tables."""
+    payload = match.payload or {}
+    stats = payload.get("stats")
+    lineups = payload.get("lineups")
+
+    with conn:
+        if isinstance(stats, list):
+            conn.execute(
+                "DELETE FROM football_stats WHERE source = ? AND match_id = ?",
+                (writer.source, seeded_match_id),
+            )
+            for row in stats:
+                if not isinstance(row, dict) or not row.get("team"):
+                    continue
+                conn.execute(
+                    "INSERT INTO football_stats "
+                    "(source, match_id, team, possession, shots, shots_on_target, "
+                    "corners, fouls, yellow_cards, red_cards, offsides) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(source, match_id, team) DO UPDATE SET "
+                    "possession = excluded.possession, "
+                    "shots = excluded.shots, "
+                    "shots_on_target = excluded.shots_on_target, "
+                    "corners = excluded.corners, "
+                    "fouls = excluded.fouls, "
+                    "yellow_cards = excluded.yellow_cards, "
+                    "red_cards = excluded.red_cards, "
+                    "offsides = excluded.offsides",
+                    (
+                        writer.source,
+                        seeded_match_id,
+                        row["team"],
+                        row.get("possession"),
+                        _to_int(row.get("shots")),
+                        _to_int(row.get("shots_on_target")),
+                        _to_int(row.get("corners")),
+                        _to_int(row.get("fouls")),
+                        _to_int(row.get("yellow_cards")),
+                        _to_int(row.get("red_cards")),
+                        _to_int(row.get("offsides")),
+                    ),
+                )
+
+        if isinstance(lineups, list):
+            conn.execute(
+                "DELETE FROM football_lineups WHERE source = ? AND match_id = ?",
+                (writer.source, seeded_match_id),
+            )
+            for lineup in lineups:
+                if not isinstance(lineup, dict) or not lineup.get("team"):
+                    continue
+                team = lineup["team"]
+                players = lineup.get("players") or []
+                if not isinstance(players, list):
+                    continue
+                for player in players:
+                    if not isinstance(player, dict):
+                        continue
+                    athlete_id = player.get("athlete_id")
+                    display_name = player.get("display_name")
+                    if athlete_id is None or not display_name:
+                        continue
+                    conn.execute(
+                        "INSERT INTO football_lineups "
+                        "(source, match_id, team, athlete_id, display_name, name_folded, "
+                        "jersey, position, starter, subbed_in, subbed_out, "
+                        "formation_place, home_away, formation) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                        "ON CONFLICT(source, match_id, team, athlete_id) DO UPDATE SET "
+                        "display_name = excluded.display_name, "
+                        "name_folded = excluded.name_folded, "
+                        "jersey = excluded.jersey, "
+                        "position = excluded.position, "
+                        "starter = excluded.starter, "
+                        "subbed_in = excluded.subbed_in, "
+                        "subbed_out = excluded.subbed_out, "
+                        "formation_place = excluded.formation_place, "
+                        "home_away = excluded.home_away, "
+                        "formation = excluded.formation",
+                        (
+                            writer.source,
+                            seeded_match_id,
+                            team,
+                            str(athlete_id),
+                            display_name,
+                            fold(display_name),
+                            player.get("jersey"),
+                            player.get("position"),
+                            int(bool(player.get("starter"))),
+                            int(bool(player.get("subbed_in"))),
+                            int(bool(player.get("subbed_out"))),
+                            _to_int(player.get("formation_place")),
+                            lineup.get("home_away"),
+                            lineup.get("formation"),
+                        ),
+                    )
 
 
 def pack() -> SportPack:
@@ -120,4 +240,5 @@ def pack() -> SportPack:
         # writes for it. Its (conn, writer, match) -> str | None signature is the
         # SportPack.seed_match contract exactly, so it wires in directly.
         seed_match=register_unreconciled_match,
+        persist_side_tables=persist_football_side_tables,
     )

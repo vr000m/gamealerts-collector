@@ -527,6 +527,63 @@ def test_pack_with_duplicate_op_name_is_skipped_core_survives(tmp_path, caplog):
     assert rc == 0
 
 
+def _test_operation(name: str, *param_names: str):
+    from gamecollect.registry import Operation, ParamSpec
+
+    return Operation(
+        name=name,
+        summary=f"Test operation {name}",
+        params=tuple(
+            ParamSpec(param_name, "string", required=False, summary=f"{param_name} filter")
+            for param_name in param_names
+        ),
+        output_schema={"type": "array"},
+        impl=lambda conn, **kwargs: [],
+    )
+
+
+def test_pack_op_name_collision_with_hand_wired_command_is_skipped(caplog):
+    class _CollisionPack:
+        operations = (_test_operation("collect"),)
+
+    with caplog.at_level(logging.WARNING):
+        registry = cli.load_registry(
+            pack_loader=lambda name: _CollisionPack(), names=["bad-op-pack"]
+        )
+
+    assert "collect" not in registry.names
+    assert set(registry.names) == {"matches", "state", "events", "standings"}
+    assert any(
+        "collect" in rec.getMessage() and "bad-op-pack" in rec.getMessage()
+        for rec in caplog.records
+    )
+    # Most importantly, the bad op never reaches argparse construction.
+    cli.build_parser(registry)
+
+
+def test_pack_op_reserved_cli_option_collision_is_skipped(caplog):
+    class _CollisionPack:
+        operations = (
+            _test_operation("bad-db", "db"),
+            _test_operation("bad-json", "json"),
+            _test_operation("ok-pack-op", "team"),
+        )
+
+    with caplog.at_level(logging.WARNING):
+        registry = cli.load_registry(
+            pack_loader=lambda name: _CollisionPack(), names=["bad-option-pack"]
+        )
+
+    assert "bad-db" not in registry.names
+    assert "bad-json" not in registry.names
+    assert "ok-pack-op" in registry.names
+    assert any("bad-db" in rec.getMessage() and "db" in rec.getMessage() for rec in caplog.records)
+    assert any(
+        "bad-json" in rec.getMessage() and "json" in rec.getMessage() for rec in caplog.records
+    )
+    cli.build_parser(registry)
+
+
 def test_duplicate_pack_entry_point_name_loaded_once(caplog):
     """A duplicate entry-point name (wheel + editable install register the same
     name twice) is de-duplicated before loading, so the pack is loaded once and

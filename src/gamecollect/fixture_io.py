@@ -168,13 +168,25 @@ def read_fixture(path: str | Path) -> Fixture:
     if not isinstance(raw_events, list):
         raise FixtureFormatError(f"fixture {path!r} 'events' is not a JSON array")
     events = []
+    seen_seqs: dict[int, int] = {}
     for index, event in enumerate(raw_events):
         if not isinstance(event, dict):
             raise FixtureFormatError(f"fixture {path!r} event {index} is not a JSON object")
         try:
+            seq = event["seq"]
+            if not isinstance(seq, int) or isinstance(seq, bool):
+                raise FixtureFormatError(
+                    f"fixture {path!r} event {index} has non-integer seq {seq!r}"
+                )
+            if seq in seen_seqs:
+                raise FixtureFormatError(
+                    f"fixture {path!r} event {index} duplicates seq {seq!r} "
+                    f"from event {seen_seqs[seq]}"
+                )
+            seen_seqs[seq] = index
             events.append(
                 NormalizedEvent(
-                    seq=event["seq"],
+                    seq=seq,
                     minute=event.get("minute"),
                     event_type=event["event_type"],
                     importance=event["importance"],

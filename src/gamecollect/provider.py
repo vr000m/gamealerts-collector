@@ -132,12 +132,27 @@ class ProviderUnavailableError(ProviderError):
 
 
 class MatchDataProvider(ABC):
-    """Abstract provider for live match data."""
+    """Abstract provider for live match data.
+
+    ``fetch_live_matches`` returns the current provider slate: enough match state
+    for the engine to decide which matches are in progress and seed/update core
+    match rows (identity, status, clock, score, and any scoreboard-level
+    payload). Providers may return partial event lists here; ESPN scoreboard
+    snapshots, for example, intentionally carry ``events=[]``.
+
+    ``fetch_match_detail(match_id)`` returns the full current snapshot for one
+    match id, including all provider-normalized events currently known and any
+    sport-specific payload extras that belong to detail/summary endpoints. The
+    engine calls it for in-progress matches before diffing/writing, so live,
+    replay, and fake providers must make this method a pure read of the same
+    logical provider state unless their documented provider API requires
+    otherwise. In particular, replay detail reads must not advance replay time.
+    """
 
     @abstractmethod
     def fetch_live_matches(self) -> list[NormalizedMatch]:
-        """Return all currently live/in-play matches."""
+        """Return the current live slate; event lists may be partial or empty."""
 
     @abstractmethod
     def fetch_match_detail(self, match_id: str) -> NormalizedMatch:
-        """Return full detail (events + payload extras) for a single match."""
+        """Return full current detail (events + payload extras) for one match."""

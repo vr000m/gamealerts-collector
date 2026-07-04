@@ -306,3 +306,38 @@ def test_malformed_fixture_raises_fixture_format_error(tmp_path, mutate, needle)
     assert needle in str(excinfo.value), (
         f"error message {str(excinfo.value)!r} should mention {needle!r}"
     )
+
+
+@pytest.mark.parametrize(
+    "events, needle",
+    [
+        (
+            [
+                {"seq": 0, "event_type": "goal", "importance": 1},
+                {"seq": 0, "event_type": "yellow", "importance": 3},
+            ],
+            "duplicates seq",
+        ),
+        (
+            [{"seq": "0", "event_type": "goal", "importance": 1}],
+            "non-integer seq",
+        ),
+        (
+            [{"seq": True, "event_type": "goal", "importance": 1}],
+            "non-integer seq",
+        ),
+    ],
+)
+def test_fixture_rejects_duplicate_or_non_integer_event_seq(tmp_path, events, needle):
+    fio = _fixture_io()
+    path = tmp_path / "bad-seq.json"
+    data = _valid_fixture_dict()
+    data["events"] = events
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+    with pytest.raises(fio.FixtureFormatError) as excinfo:
+        _read(fio, path)
+
+    message = str(excinfo.value)
+    assert str(path) in message
+    assert needle in message

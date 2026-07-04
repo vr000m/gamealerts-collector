@@ -182,6 +182,26 @@ class ScriptedProvider(MatchDataProvider):
         return self._by_id.get(match_id) or nm(match_id, ())
 
 
+class DetailProvider(MatchDataProvider):
+    """Scoreboard snapshot plus separate per-match detail snapshots."""
+
+    def __init__(
+        self,
+        live_matches: list[NormalizedMatch],
+        details: dict[str, NormalizedMatch],
+    ) -> None:
+        self._live_matches = live_matches
+        self._details = details
+        self.detail_calls: list[str] = []
+
+    def fetch_live_matches(self) -> list[NormalizedMatch]:
+        return list(self._live_matches)
+
+    def fetch_match_detail(self, match_id: str) -> NormalizedMatch:
+        self.detail_calls.append(match_id)
+        return self._details[match_id]
+
+
 def _seed_match(conn: sqlite3.Connection, writer, match: NormalizedMatch) -> str | None:
     """Fake ``SportPack.seed_match`` hook.
 
@@ -370,6 +390,102 @@ def test_single_poll_seeds_then_appends_events(tmp_path):
     state = reader.get_state(read_db(db), qid)
     assert state is not None
     assert state["source"] == SOURCE
+
+
+def test_in_progress_scoreboard_snapshot_fetches_detail_events_before_write(tmp_path):
+    db = tmp_path / "engine.db"
+    scoreboard = nm("m1", (), status=MatchStatus.IN_PLAY, score_home=1, score_away=0)
+    detail = nm(
+        "m1",
+        (
+            ev(0, "goal", minute=12, player="Jonathan David", detail="David scores"),
+            ev(1, "yellow", minute=30, player="Booked Player", detail="Booking"),
+        ),
+        status=MatchStatus.IN_PLAY,
+        score_home=1,
+        score_away=0,
+    )
+    provider = DetailProvider([scoreboard], {"m1": detail})
+    from gamecollect.engine import CollectorEngine
+
+    engine = CollectorEngine(make_pack(provider), str(db), SOURCE, 0.01, provider=provider)
+    try:
+        engine.poll_once()
+    finally:
+        engine.close()
+
+    assert provider.detail_calls == ["m1"]
+    assert event_types(db, qualified("m1")) == ["goal", "yellow"]
+
+
+def test_collect_with_football_pack_persists_squad_and_player_stats_side_tables(tmp_path):
+    from gamecollect.db.reader import open_reader
+    from gamecollect.engine import CollectorEngine
+    from gamecollect_football.operations import get_player_stats, get_squad
+    from gamecollect_football.pack import pack as football_pack
+
+    db = tmp_path / "football.db"
+    scoreboard = nm("760999", (), status=MatchStatus.IN_PLAY, score_home=1, score_away=0)
+    detail = nm(
+        "760999",
+        (ev(0, "goal", minute=12, team="Canada", player="Jonathan David"),),
+        status=MatchStatus.IN_PLAY,
+        score_home=1,
+        score_away=0,
+    )
+    detail.payload = {
+        "stats": [
+            {
+                "team": "Canada",
+                "possession": 62.5,
+                "shots": 8,
+                "shots_on_target": 4,
+                "corners": 3,
+                "fouls": 5,
+                "yellow_cards": 1,
+                "red_cards": 0,
+                "offsides": 2,
+            }
+        ],
+        "lineups": [
+            {
+                "team": "Canada",
+                "home_away": "home",
+                "formation": "4-3-3",
+                "players": [
+                    {
+                        "athlete_id": "ath-20",
+                        "display_name": "Jonathan David",
+                        "jersey": "20",
+                        "position": "F",
+                        "starter": True,
+                        "subbed_in": False,
+                        "subbed_out": False,
+                        "formation_place": 9,
+                    }
+                ],
+            }
+        ],
+    }
+    provider = DetailProvider([scoreboard], {"760999": detail})
+
+    engine = CollectorEngine(football_pack(), str(db), SOURCE, 0.01, provider=provider)
+    try:
+        engine.poll_once()
+    finally:
+        engine.close()
+
+    seeded_id = qualified("760999")
+    conn = open_reader(db)
+    try:
+        squad = get_squad(conn, seeded_id)
+        stats = get_player_stats(conn, seeded_id)
+    finally:
+        conn.close()
+
+    assert [member.display_name for member in squad] == ["Jonathan David"]
+    assert squad[0].name_folded == "jonathan david"
+    assert [(row.team, row.shots, row.shots_on_target) for row in stats] == [("Canada", 8, 4)]
 
 
 def test_engine_creates_pack_side_tables_via_connect(tmp_path):

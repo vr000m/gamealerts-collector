@@ -32,6 +32,7 @@ Mid-parallel the script/helper may be absent; tests skip (not fail) then.
 from __future__ import annotations
 
 import importlib.util
+import json
 import sqlite3
 import subprocess
 import sys
@@ -266,6 +267,44 @@ def test_check_reports_a_malformed_fixture(tmp_path):
         "--check passed a malformed fixture; it must fail loudly.\n"
         f"stdout={result.stdout}\nstderr={result.stderr}"
     )
+
+
+@pytest.mark.parametrize(
+    "events, needle",
+    [
+        (
+            [
+                {"seq": 0, "event_type": "goal", "importance": 1},
+                {"seq": 0, "event_type": "yellow", "importance": 3},
+            ],
+            "duplicates seq",
+        ),
+        (
+            [{"seq": "0", "event_type": "goal", "importance": 1}],
+            "non-integer seq",
+        ),
+    ],
+)
+def test_check_rejects_fixture_with_bad_event_seq(tmp_path, events, needle):
+    _require_importer_script()
+    bad_dir = tmp_path / "bad-seq"
+    bad_dir.mkdir()
+    data = {
+        "format_version": 1,
+        "match": {"match_id": "bad-seq", "status": "IN_PLAY"},
+        "events": events,
+        "entities": [],
+        "standings": [],
+    }
+    (bad_dir / "bad-seq.json").write_text(json.dumps(data), encoding="utf-8")
+
+    result = _run_cli(["--check", str(bad_dir)])
+
+    assert result.returncode != 0, (
+        "--check passed a fixture with an invalid event seq.\n"
+        f"stdout={result.stdout}\nstderr={result.stderr}"
+    )
+    assert needle in result.stderr
 
 
 # --------------------------------------------------------------------------- #

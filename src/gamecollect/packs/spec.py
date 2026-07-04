@@ -19,10 +19,19 @@ if TYPE_CHECKING:
     from gamecollect.db.writer import PartitionWriter
     from gamecollect.registry import Operation
 
-__all__ = ["EventTypeDecl", "SportPack", "default_seed_match"]
+__all__ = [
+    "EventTypeDecl",
+    "SportPack",
+    "default_persist_side_tables",
+    "default_seed_match",
+]
 
 # The seeding hook the engine calls before any child (event/mapping) write.
 SeedMatch = Callable[[sqlite3.Connection, "PartitionWriter", NormalizedMatch], "str | None"]
+PersistSideTables = Callable[
+    [sqlite3.Connection, "PartitionWriter", NormalizedMatch, str],
+    None,
+]
 
 
 def default_seed_match(
@@ -50,6 +59,20 @@ def default_seed_match(
         }
     )
     return match.match_id
+
+
+def default_persist_side_tables(
+    conn: sqlite3.Connection,
+    writer: PartitionWriter,
+    match: NormalizedMatch,
+    seeded_match_id: str,
+) -> None:
+    """Sport-agnostic default :attr:`SportPack.persist_side_tables`.
+
+    Core has no pack-owned side tables, so the default is a no-op. The parameters
+    mirror the engine's write context so packs can persist typed side-table rows
+    from ``match.payload`` without the core importing pack modules.
+    """
 
 
 @dataclass(frozen=True)
@@ -117,6 +140,18 @@ class SportPack:
     match could not be seeded (e.g. missing identity fields) and the engine
     skips child writes for it this poll. Defaults to :func:`default_seed_match`;
     the football pack overrides it with its reconcile-aware seeder.
+    """
+    persist_side_tables: PersistSideTables = field(default=default_persist_side_tables)
+    """Optional pack-owned side-table persistence hook.
+
+    ``persist_side_tables(conn, writer, match, seeded_match_id)`` is called by the
+    engine after ``seed_match`` succeeds and after new core events for that poll
+    are appended. Packs that normalize sport-specific detail into
+    ``NormalizedMatch.payload`` can project it into their own side tables here
+    (for example football lineups/stats). The hook must only touch pack-owned
+    additive tables and must write under ``writer.source`` plus the canonical
+    ``seeded_match_id`` returned by ``seed_match``. The default is a no-op so
+    core remains independent of every pack package.
     """
 
     @property

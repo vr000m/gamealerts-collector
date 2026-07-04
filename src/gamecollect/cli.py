@@ -29,6 +29,7 @@ is pack → core).
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import logging
 from collections.abc import Callable, Sequence
@@ -48,6 +49,46 @@ log = logging.getLogger(__name__)
 # The single-source-of-truth test subtracts these from the parser's subcommand
 # set to compare the remainder against the registry op names.
 HAND_WIRED_COMMANDS: tuple[str, ...] = ("collect", "tools")
+RESERVED_READ_OPTION_NAMES: frozenset[str] = frozenset({"db", "json"})
+
+
+def _copy_pack_with_operations(pack: Any, operations: tuple[Operation, ...]) -> Any:
+    """Return a shallow pack copy with filtered operations."""
+    filtered = copy.copy(pack)
+    filtered.operations = operations
+    return filtered
+
+
+def _validated_pack_for_cli(name: str, pack: Any, accepted: list[Any]) -> Any:
+    """Drop pack ops that would break argparse or the merged registry."""
+    existing_names = set(build_registry(accepted).names) | set(HAND_WIRED_COMMANDS)
+    kept: list[Operation] = []
+    for op in getattr(pack, "operations", ()):
+        if op.name in existing_names:
+            log.warning(
+                "skipping operation %r from pack %r for CLI registry: name collides "
+                "with an existing or hand-wired command",
+                op.name,
+                name,
+            )
+            continue
+        reserved_params = sorted(
+            param.name for param in op.params if param.name in RESERVED_READ_OPTION_NAMES
+        )
+        if reserved_params:
+            log.warning(
+                "skipping operation %r from pack %r for CLI registry: parameter "
+                "name(s) %s collide with reserved CLI option names",
+                op.name,
+                name,
+                reserved_params,
+            )
+            continue
+        kept.append(op)
+        existing_names.add(op.name)
+    if tuple(getattr(pack, "operations", ())) == tuple(kept):
+        return pack
+    return _copy_pack_with_operations(pack, tuple(kept))
 
 
 def load_registry(
@@ -104,10 +145,10 @@ def load_registry(
                 exc,
             )
             continue
-        # Validate this pack's ops merge cleanly against core + already-accepted
-        # packs before accepting it. build_registry raises ValueError on a
-        # duplicate op name; a single bad pack must not abort the whole build, so
-        # trial-build with the candidate included and skip it on collision.
+        # Validate this pack's ops merge cleanly against core, hand-wired CLI
+        # commands, injected CLI options, and already-accepted packs before
+        # accepting it. A single bad contributed op must not abort the whole CLI.
+        pack = _validated_pack_for_cli(name, pack, accepted)
         try:
             build_registry([*accepted, pack])
         except ValueError as exc:

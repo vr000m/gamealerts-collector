@@ -52,6 +52,7 @@ from gamecollect.diffing import MatchDiff, diff_matches
 from gamecollect.fixture_io import fixture_stem, write_fixture
 from gamecollect.packs.spec import SportPack
 from gamecollect.provider import (
+    LIVE_STATUSES,
     MatchDataProvider,
     NormalizedEvent,
     NormalizedMatch,
@@ -225,7 +226,7 @@ class CollectorEngine:
         the FULL event list and catches up rather than baking the skipped
         events into the baseline and losing them forever.
         """
-        matches = self._provider.fetch_live_matches()
+        matches = self._fetch_poll_snapshots()
         if self._record_path is not None:
             self._accumulate_record(matches)
         for diff in diff_matches(matches, self._last):
@@ -282,7 +283,33 @@ class CollectorEngine:
             return False
         if diff.new_events:
             self._writer.append_events(seeded_id, [_event_to_row(e) for e in diff.new_events])
+        self._pack.persist_side_tables(self._conn, self._writer, match, seeded_id)
         return True
+
+    def _fetch_poll_snapshots(self) -> list[NormalizedMatch]:
+        """Fetch the live slate, replacing in-progress rows with full detail.
+
+        The provider contract allows ``fetch_live_matches`` to return a
+        scoreboard-level snapshot whose event list is empty or partial. The
+        engine must diff/write the detail snapshot for live matches so adapters
+        such as ESPN can persist events and payload extras that only exist on a
+        per-match summary endpoint. ``fetch_match_detail`` is a pure current-state
+        read for replay/fakes, so this does not advance replay beyond the single
+        ``fetch_live_matches`` call that defines a poll.
+        """
+        matches = self._provider.fetch_live_matches()
+        hydrated: list[NormalizedMatch] = []
+        for match in matches:
+            if match.status in LIVE_STATUSES:
+                detail = self._provider.fetch_match_detail(match.match_id)
+                # Preserve scoreboard-level payload keys that a detail endpoint
+                # does not repeat, while letting detail-owned keys win.
+                payload = dict(match.payload)
+                payload.update(detail.payload)
+                hydrated.append(replace(detail, payload=payload))
+            else:
+                hydrated.append(match)
+        return hydrated
 
     def stop(self) -> None:
         """Signal the loop to finish its current iteration and shut down."""
