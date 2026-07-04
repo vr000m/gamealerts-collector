@@ -8,10 +8,11 @@ below and are validated by :mod:`gamecollect.packs.registry` at load time.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from gamecollect.provider import MatchDataProvider, NormalizedMatch
 
@@ -44,9 +45,35 @@ def default_seed_match(
     returns that id so the engine can proceed with child writes. A pack that
     reconciles against a canonical schedule (football) overrides this with its
     own hook; this default keeps the contract usable for packs that emit
-    already-canonical ids. ``conn`` is unused here but is part of the hook
-    signature so reconciling packs can read existing rows.
+    already-canonical ids.
+
+    Identity (``home_team``/``away_team``) and the sport-extras ``payload`` are
+    persisted too — in ``matches.payload`` JSON per the
+    schedule-metadata-in-payload convention (schema comment; the football
+    reconciler writes the same keys). The diff engine counts those fields in
+    its state key and advances its baseline after a successful apply, so a
+    seeder that dropped them would silently baseline-and-lose every identity
+    or payload correction. ``upsert_match`` replaces ``payload`` wholesale, so
+    the existing row's payload is read via ``conn`` and merged first
+    (existing ← ``match.payload`` ← team names).
     """
+    from gamecollect.db import reader  # runtime import: keep module import light
+
+    payload: dict[str, Any] = {}
+    existing = reader.get_state(conn, match.match_id)
+    if existing is not None and existing.get("payload"):
+        try:
+            decoded = json.loads(existing["payload"])
+        except (TypeError, ValueError):
+            decoded = None
+        if isinstance(decoded, dict):
+            payload = decoded
+    payload.update(match.payload)
+    if match.home_team is not None:
+        payload["home_team"] = match.home_team
+    if match.away_team is not None:
+        payload["away_team"] = match.away_team
+
     writer.upsert_match(
         {
             "match_id": match.match_id,
@@ -56,6 +83,7 @@ def default_seed_match(
             "score_away": match.score_away,
             "display_clock": match.display_clock,
             "kickoff_utc": match.kickoff_utc,
+            "payload": payload,
         }
     )
     return match.match_id

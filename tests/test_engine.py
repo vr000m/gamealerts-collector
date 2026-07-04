@@ -920,6 +920,53 @@ def test_engine_persists_display_clock_to_db(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
+# default_seed_match persists identity + payload (no baseline-and-drop)
+# --------------------------------------------------------------------------- #
+
+
+def test_default_seed_persists_identity_and_payload_corrections(tmp_path):
+    """Review fix: the diff state key counts home_team/away_team/payload and the
+    engine baselines after a successful apply, so default_seed_match must persist
+    them — otherwise an identity/payload correction is detected, "applied"
+    without those fields, baselined, and dropped forever. Drive two polls: the
+    seed poll and a correction poll changing home_team + a payload key; both
+    must land in matches.payload."""
+    from dataclasses import replace
+
+    from gamecollect.engine import CollectorEngine
+    from gamecollect.packs.spec import default_seed_match
+
+    db = tmp_path / "identity.db"
+    poll1 = replace(
+        nm("m-id", (ev(0, "goal"),)),
+        payload={"round_name": "Group A", "venue": "BMO Field"},
+    )
+    # The correction: provider fixes the home team name and the venue.
+    poll2 = replace(
+        nm("m-id", (ev(0, "goal"),), home_team="Canada MNT"),
+        payload={"round_name": "Group A", "venue": "BC Place"},
+    )
+    provider = ScriptedProvider([[poll1], [poll2]])
+    pack = make_pack(provider, seed_match=default_seed_match)
+    engine = CollectorEngine(pack, str(db), SOURCE, 0.01)
+    run_engine(engine, provider)
+
+    conn = read_db(db)
+    try:
+        row = reader.get_state(conn, "m-id")
+    finally:
+        conn.close()
+    assert row is not None, "the match row was not seeded"
+    payload = json.loads(row["payload"])
+    assert payload["home_team"] == "Canada MNT", (
+        "a later identity correction must land, not be baselined-and-dropped"
+    )
+    assert payload["away_team"] == "Qatar"
+    assert payload["venue"] == "BC Place", "a later payload correction must land"
+    assert payload["round_name"] == "Group A"
+
+
+# --------------------------------------------------------------------------- #
 # close(): flush-once, always close the connection, idempotent
 # --------------------------------------------------------------------------- #
 

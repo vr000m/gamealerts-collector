@@ -17,7 +17,7 @@ from gamecollect.packs.spec import SportPack
 from gamecollect.provider import NormalizedMatch
 from gamecollect_football.espn import ESPNAdapter
 from gamecollect_football.operations import FOOTBALL_OPERATIONS
-from gamecollect_football.reconcile import register_unreconciled_match
+from gamecollect_football.reconcile import seed_or_reconcile_match
 from gamecollect_football.taxonomy import TAXONOMY
 
 __all__ = ["FOOTBALL_SIDE_TABLE_DDL", "pack", "persist_football_side_tables"]
@@ -234,11 +234,16 @@ def pack() -> SportPack:
         # above; merged onto the core registry at load. Core never imports this
         # pack — the ops carry their own impls (dependency direction pack → core).
         operations=FOOTBALL_OPERATIONS,
-        # Reconcile-aware seed hook: register_unreconciled_match seeds a
-        # source-qualified strip row (returning its id) or returns None when the
-        # scoreboard match lacks identity fields — the engine then skips child
-        # writes for it. Its (conn, writer, match) -> str | None signature is the
-        # SportPack.seed_match contract exactly, so it wires in directly.
-        seed_match=register_unreconciled_match,
+        # Reconcile-aware seed hook (amended from the plan's direct
+        # register_unreconciled_match wiring per code review): first resolves
+        # the provider match against the canonical schedule via
+        # resolve_canonical_match_id and upserts live state onto the canonical
+        # row when it resolves — so events land there instead of on a duplicate
+        # source-qualified strip — falling back to register_unreconciled_match
+        # otherwise. Returns None only when nothing resolved AND identity
+        # fields are missing; the engine then skips child writes for it. Its
+        # (conn, writer, match) -> str | None signature (provider defaulted)
+        # is the SportPack.seed_match contract, so it wires in directly.
+        seed_match=seed_or_reconcile_match,
         persist_side_tables=persist_football_side_tables,
     )

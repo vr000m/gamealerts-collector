@@ -34,6 +34,7 @@ from gamecollect_football.reconcile import (
     canonical_team_name,
     register_unreconciled_match,
     resolve_canonical_match_id,
+    seed_or_reconcile_match,
 )
 
 PROVIDER = "espn"
@@ -204,6 +205,32 @@ class TestRegisterUnreconciledMatch:
         assert payload["home_team"] == "Australia"
         assert payload["away_team"] == "Turkey"
 
+    def test_match_payload_extras_survive_and_canonical_names_win(self, db):
+        """Review fix: the snapshot's own payload (adapter sport extras such as
+        round_name/venue/HT scores) must be merged into the stored payload —
+        while the canonical DISPLAY team names still win over any raw
+        provider-supplied home_team/away_team payload keys."""
+        import json
+        from dataclasses import replace
+
+        conn, writer = db
+        match = replace(
+            _match(),
+            payload={
+                "round_name": "Group B",
+                "venue": "Estadio Azteca",
+                "away_team": "Türkiye",  # raw provider name; canonical must win
+            },
+        )
+        qualified = register_unreconciled_match(conn, writer, match)
+        payload = json.loads(get_state(conn, qualified)["payload"])
+        assert payload["round_name"] == "Group B"
+        assert payload["venue"] == "Estadio Azteca"
+        assert payload["home_team"] == "Australia"
+        assert payload["away_team"] == "Turkey", (
+            "canonical display name must win over the raw provider payload key"
+        )
+
     def test_two_sources_same_provider_id_do_not_collide(self, tmp_path):
         """THE source-qualification invariant (plan §Phase 2/4): two sources
         collecting the same provider-native id must land on two DISTINCT
@@ -293,3 +320,102 @@ class TestResolveCrossSourceIsolation:
         other.upsert_match({"match_id": match.match_id, "status": "SCHEDULED"})
 
         assert resolve_canonical_match_id(conn, writer, match, PROVIDER) is None
+
+
+# ===========================================================================
+# 6. seed_or_reconcile_match — the pack's reconcile-first seed hook.
+# ===========================================================================
+
+
+class TestSeedOrReconcileMatch:
+    """Review fix: pack.seed_match must reconcile BEFORE seeding a strip row,
+    so a live match whose canonical schedule row exists gets its events under
+    the canonical id instead of a duplicate source-qualified strip."""
+
+    CANONICAL = "wc2026_md03_m04"
+
+    def _seed_schedule_row(self, writer):
+        writer.upsert_match(
+            {
+                "match_id": self.CANONICAL,
+                "status": "SCHEDULED",
+                "kickoff_utc": "2026-06-14T04:00:00+00:00",
+                "payload": {
+                    "home_team": "Australia",
+                    "away_team": "Turkey",
+                    "round_name": "Group B",
+                },
+            }
+        )
+
+    def test_resolves_to_canonical_row_when_schedule_row_exists(self, db):
+        import json
+
+        conn, writer = db
+        self._seed_schedule_row(writer)
+
+        seeded = seed_or_reconcile_match(conn, writer, _match(), PROVIDER)
+        assert seeded == self.CANONICAL
+
+        row = get_state(conn, self.CANONICAL)
+        assert row["status"] == MatchStatus.IN_PLAY.value
+        assert row["minute"] == 27
+        assert row["score_home"] == 1
+        payload = json.loads(row["payload"])
+        assert payload["home_team"] == "Australia"
+        assert payload["away_team"] == "Turkey", "schedule-seeded names must be preserved"
+        assert payload["round_name"] == "Group B"
+        # No duplicate source-qualified strip row was created.
+        assert get_state(conn, f"{SOURCE_A}:760421") is None
+
+    def test_resolved_upsert_merges_snapshot_payload_extras(self, db):
+        import json
+        from dataclasses import replace
+
+        conn, writer = db
+        self._seed_schedule_row(writer)
+        match = replace(_match(), payload={"venue": "Estadio Azteca", "away_team": "Türkiye"})
+
+        seeded = seed_or_reconcile_match(conn, writer, match, PROVIDER)
+        payload = json.loads(get_state(conn, seeded)["payload"])
+        assert payload["venue"] == "Estadio Azteca"
+        assert payload["away_team"] == "Turkey", (
+            "canonical schedule name must win over the raw provider payload key"
+        )
+
+    def test_falls_back_to_unreconciled_strip_row(self, db):
+        conn, writer = db
+        seeded = seed_or_reconcile_match(conn, writer, _match(), PROVIDER)
+        assert seeded == f"{SOURCE_A}:760421"
+        assert get_state(conn, seeded) is not None
+
+    def test_missing_identity_and_no_resolution_returns_none(self, db):
+        conn, writer = db
+        match = _match(home=None, away=None, kickoff=None)
+        assert seed_or_reconcile_match(conn, writer, match, PROVIDER) is None
+        (count,) = conn.execute("SELECT COUNT(*) FROM matches").fetchone()
+        assert count == 0
+
+    def test_missing_identity_but_cached_resolution_still_seeds(self, db):
+        """A cache hit resolves without identity fields — the canonical row
+        already carries them, so live state must still land (str return)."""
+        conn, writer = db
+        self._seed_schedule_row(writer)
+        writer.map_provider_match(PROVIDER, "760421", self.CANONICAL)
+
+        match = _match(home=None, away=None, kickoff=None)
+        seeded = seed_or_reconcile_match(conn, writer, match, PROVIDER)
+        assert seeded == self.CANONICAL
+        assert get_state(conn, self.CANONICAL)["status"] == MatchStatus.IN_PLAY.value
+
+    def test_repolls_stay_on_the_canonical_row(self, db):
+        """Poll twice: the second poll must resolve via the cached bind and
+        keep writing the same canonical row (no strip-row drift)."""
+        conn, writer = db
+        self._seed_schedule_row(writer)
+
+        first = seed_or_reconcile_match(conn, writer, _match(), PROVIDER)
+        second = seed_or_reconcile_match(conn, writer, _match(), PROVIDER)
+        assert first == second == self.CANONICAL
+        (count,) = conn.execute("SELECT COUNT(*) FROM matches").fetchone()
+        assert count == 1

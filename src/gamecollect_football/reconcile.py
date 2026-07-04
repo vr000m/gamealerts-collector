@@ -45,6 +45,7 @@ __all__ = [
     "canonical_player_name",
     "resolve_canonical_match_id",
     "register_unreconciled_match",
+    "seed_or_reconcile_match",
 ]
 
 log = logging.getLogger(__name__)
@@ -379,15 +380,14 @@ def register_unreconciled_match(
     # function re-runs on every poll while the match stays unreconciled — a
     # bare {home_team, away_team} write would erase richer keys (stats,
     # lineups, schedule metadata) another path put on the row.
-    existing = reader.get_state(conn, qualified_id)
-    payload: dict[str, Any] = {}
-    if existing is not None and existing.get("payload"):
-        try:
-            decoded = json.loads(existing["payload"])
-        except (TypeError, ValueError):
-            decoded = None
-        if isinstance(decoded, dict):
-            payload = decoded
+    payload = _stored_payload(conn, qualified_id)
+
+    # Merge the snapshot's sport extras (round_name, venue, HT scores, lineups,
+    # stats — the adapter pins them to matches.payload; the engine merges
+    # scoreboard+detail payloads before seeding). Merged BEFORE the canonical
+    # team names below so canonical names still win over any raw provider
+    # home_team/away_team keys a payload might carry.
+    payload.update(match.payload)
 
     # Fold provider names to the canonical DISPLAY name at the write seam
     # (the single authority): the unreconciled row carries `Turkey`, not
@@ -409,6 +409,84 @@ def register_unreconciled_match(
         }
     )
     return qualified_id
+
+
+def seed_or_reconcile_match(
+    conn: sqlite3.Connection,
+    writer: PartitionWriter,
+    match: NormalizedMatch,
+    provider: str = "espn",
+) -> str | None:
+    """
+    Reconcile-first seed hook: the football pack's :attr:`SportPack.seed_match`.
+
+    First tries :func:`resolve_canonical_match_id`; when the provider match
+    resolves to an existing seeded row (canonical schedule slug, direct-seed
+    back-compat, or a prior source-qualified strip row), the live state is
+    upserted onto THAT row and its id returned — so the engine's child writes
+    (events, side tables) land on the canonical row instead of accumulating a
+    duplicate source-qualified strip. Only when nothing resolves does it fall
+    back to :func:`register_unreconciled_match`.
+
+    Return contract (the :attr:`SportPack.seed_match` pin): a ``str`` always
+    names a seeded row satisfying the writer's child-write precondition;
+    ``None`` means identity fields were missing AND nothing resolved, so the
+    engine skips child writes this poll. A cache/direct-seed resolution can
+    succeed without identity fields — the canonical row already carries them.
+
+    ``kickoff_utc`` and payload ``home_team``/``away_team`` on a resolved
+    canonical row are schedule-owned and are NOT overwritten with provider
+    values; the snapshot's other payload extras are merged in (existing ←
+    ``match.payload``, canonical identity keys preserved).
+    """
+    canonical_id = resolve_canonical_match_id(conn, writer, match, provider)
+    if canonical_id is None:
+        return register_unreconciled_match(conn, writer, match)
+
+    payload = _stored_payload(conn, canonical_id)
+    schedule_home = payload.get("home_team")
+    schedule_away = payload.get("away_team")
+    payload.update(match.payload)
+    # Schedule-seeded canonical names win over any provider-supplied payload
+    # keys; fill from the (display-folded) snapshot names only when the
+    # resolved row lacks them (e.g. a direct-seed row without payload names).
+    if schedule_home:
+        payload["home_team"] = schedule_home
+    elif match.home_team:
+        payload["home_team"] = canonical_display_name(match.home_team)
+    if schedule_away:
+        payload["away_team"] = schedule_away
+    elif match.away_team:
+        payload["away_team"] = canonical_display_name(match.away_team)
+
+    writer.upsert_match(
+        {
+            "match_id": canonical_id,
+            "payload": payload,
+            "status": match.status.value,
+            "minute": match.minute,
+            "score_home": match.score_home,
+            "score_away": match.score_away,
+            "display_clock": match.display_clock,
+        }
+    )
+    return canonical_id
+
+
+def _stored_payload(conn: sqlite3.Connection, match_id: str) -> dict[str, Any]:
+    """Decode the stored ``matches.payload`` JSON for *match_id* (``{}`` when
+    absent/unparseable). Write paths must read-merge-write because
+    ``upsert_match`` replaces ``payload`` wholesale."""
+    existing = reader.get_state(conn, match_id)
+    payload: dict[str, Any] = {}
+    if existing is not None and existing.get("payload"):
+        try:
+            decoded = json.loads(existing["payload"])
+        except (TypeError, ValueError):
+            decoded = None
+        if isinstance(decoded, dict):
+            payload = decoded
+    return payload
 
 
 def _parse_instant(kickoff_iso: str | None) -> datetime | None:
