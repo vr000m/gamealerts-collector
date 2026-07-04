@@ -2578,6 +2578,204 @@ def test_slate_flicker_then_live_resumption_pops_tracker_for_fresh_ft_budget(tmp
     )
 
 
+def test_flicker_over_rich_fallback_retains_it_for_eventual_give_up(tmp_path, caplog):
+    """Round-7 finding A: a bogus single-poll LIVE flicker must NOT discard a
+    rich terminal fallback captured on a live→final transition. When the match
+    vanishes again and hydration keeps failing, the give-up must persist the
+    captured full-time score AND events — not a sparse rebuild off the flicker
+    baseline. (Complements the pop-on-resumption test above: there the fallback
+    was a sparse reset board and the tracker IS dropped.)"""
+    from gamecollect.engine import _MAX_TRANSITION_DETAIL_FAILURES, CollectorEngine
+
+    db = tmp_path / "engine.db"
+    live_board = nm("m1", (), status=MatchStatus.IN_PLAY, minute=44)
+    live_detail = nm(
+        "m1", (ev(0, "goal", minute=30),), status=MatchStatus.IN_PLAY, minute=44, score_home=1
+    )
+    # live→final transition, detail fetch fails: the rich FT board (2-1 with a
+    # full-time goal, seq 1) is captured as the tracker's fallback.
+    ft_board = nm(
+        "m1",
+        (ev(0, "goal", minute=30), ev(1, "goal", minute=90, team="Qatar")),
+        status=MatchStatus.FINISHED,
+        minute=None,
+        score_home=2,
+        score_away=1,
+        display_clock="FT",
+    )
+    # ONE stale scoreboard poll shows the match LIVE again at the SAME score.
+    flicker_live = nm("m1", (), status=MatchStatus.IN_PLAY, minute=44, score_home=2, score_away=1)
+    polls = [
+        ([live_board], {"m1": live_detail}),
+        ([ft_board], {"m1": ProviderUnavailableError("summary 503 at the whistle")}),
+        ([flicker_live], {"m1": flicker_live}),  # bogus flicker: LIVE again, same score
+    ]
+    # Vanishes again; detail keeps failing to the cap → give up.
+    polls += [
+        ([], {"m1": ProviderUnavailableError(f"gone #{i}")})
+        for i in range(_MAX_TRANSITION_DETAIL_FAILURES)
+    ]
+    provider = ScriptedDetailProvider(polls)
+    engine = CollectorEngine(make_pack(provider), str(db), SOURCE, 0.01, provider=provider)
+    with caplog.at_level(logging.ERROR, logger="gamecollect.engine"):
+        try:
+            for _ in range(len(polls)):
+                engine.poll_once()
+        finally:
+            engine.close()
+
+    state = reader.get_state(read_db(db), qualified("m1"))
+    assert state is not None and state["status"] == MatchStatus.FINISHED.value
+    assert state["score_home"] == 2 and state["score_away"] == 1, (
+        "the captured full-time score must survive the flicker"
+    )
+    assert event_seqs(db, qualified("m1")) == [0, 1], (
+        "the fallback's full-time event must persist through the flicker — a pop "
+        "would rebuild from the sparse flicker baseline and lose seq 1"
+    )
+    assert any(
+        "persisted best-known terminal state" in r.getMessage() and r.levelno == logging.ERROR
+        for r in caplog.records
+    ), "the eventual give-up must be logged"
+
+
+def test_score_advanced_resumption_drops_stale_fallback_at_give_up(tmp_path):
+    """Round-7 finding A (case c): a genuine resumption whose score advances
+    PAST the captured fallback must drop it — a stale 2-1 FT fallback must not
+    beat a 3-1 reality when the match later gives up."""
+    from gamecollect.engine import _MAX_TRANSITION_DETAIL_FAILURES, CollectorEngine
+
+    db = tmp_path / "engine.db"
+    live1 = nm("m1", (), status=MatchStatus.IN_PLAY, minute=44, score_home=2, score_away=1)
+    live_detail1 = nm(
+        "m1",
+        (ev(0, "goal", minute=30), ev(1, "goal", minute=44, team="Qatar")),
+        status=MatchStatus.IN_PLAY,
+        minute=44,
+        score_home=2,
+        score_away=1,
+    )
+    ft_board = nm(
+        "m1",
+        (ev(0, "goal", minute=30), ev(1, "goal", minute=44, team="Qatar")),
+        status=MatchStatus.FINISHED,
+        minute=None,
+        score_home=2,
+        score_away=1,
+        display_clock="FT",
+    )
+    # Genuine resumption: the match was actually still going and reaches 3-1.
+    live2 = nm("m1", (), status=MatchStatus.IN_PLAY, minute=80, score_home=3, score_away=1)
+    live_detail2 = nm(
+        "m1",
+        (
+            ev(0, "goal", minute=30),
+            ev(1, "goal", minute=44, team="Qatar"),
+            ev(2, "goal", minute=80),
+        ),
+        status=MatchStatus.IN_PLAY,
+        minute=80,
+        score_home=3,
+        score_away=1,
+    )
+    polls = [
+        ([live1], {"m1": live_detail1}),
+        (
+            [ft_board],
+            {"m1": ProviderUnavailableError("premature FT board")},
+        ),  # capture 2-1 fallback
+        ([live2], {"m1": live_detail2}),  # resumption: score climbs past the fallback
+    ]
+    polls += [
+        ([], {"m1": ProviderUnavailableError(f"gone #{i}")})
+        for i in range(_MAX_TRANSITION_DETAIL_FAILURES)
+    ]
+    provider = ScriptedDetailProvider(polls)
+    engine = CollectorEngine(make_pack(provider), str(db), SOURCE, 0.01, provider=provider)
+    try:
+        for _ in range(len(polls)):
+            engine.poll_once()
+    finally:
+        engine.close()
+
+    state = reader.get_state(read_db(db), qualified("m1"))
+    assert state is not None and state["status"] == MatchStatus.FINISHED.value
+    assert state["score_home"] == 3 and state["score_away"] == 1, (
+        "the advanced live score must win at give-up; the stale 2-1 fallback must be dropped"
+    )
+
+
+def test_abandoned_tracker_does_not_hot_loop_and_recovers_on_live_reappearance(tmp_path, caplog):
+    """Round-7 finding B: once a give-up snapshot's apply is abandoned at the
+    emissions cap the tracker is popped, but the stale live baseline stays in
+    self._last — without the abandonment latch the vanished-match path
+    re-tracks a fresh tracker every poll and the bounded give-up hot-loops
+    forever. The latch must make abandonment terminal for the daemon's life,
+    while a genuine LIVE reappearance clears it so real resumption recovers."""
+    from gamecollect.engine import (
+        _MAX_GIVE_UP_EMISSIONS,
+        _MAX_TRANSITION_DETAIL_FAILURES,
+        CollectorEngine,
+    )
+
+    db = tmp_path / "engine.db"
+    live1 = nm("m1", (), status=MatchStatus.IN_PLAY, minute=20)
+    live_detail1 = nm("m1", (ev(0, "goal", minute=20),), status=MatchStatus.IN_PLAY, minute=20)
+    # After it vanishes, detail keeps failing to the cap, then the give-up
+    # snapshot's apply keeps failing (permanent side-table outage on FINISHED)
+    # until the emissions cap abandons the tracker; extra polls prove no
+    # hot-loop afterwards.
+    n_vanished = _MAX_TRANSITION_DETAIL_FAILURES + _MAX_GIVE_UP_EMISSIONS + 4
+    polls = [([live1], {"m1": live_detail1})]
+    polls += [([], {"m1": ProviderUnavailableError(f"down #{i}")}) for i in range(n_vanished)]
+    provider = ScriptedDetailProvider(polls)
+    pack = make_pack(provider)
+    original_persist = pack.persist_side_tables
+    outage = {"active": True}
+
+    def flaky_persist(conn, writer, match, seeded_id):
+        if match.status is MatchStatus.FINISHED and outage["active"]:
+            raise RuntimeError("permanent side-table outage")
+        return original_persist(conn, writer, match, seeded_id)
+
+    pack.persist_side_tables = flaky_persist
+    engine = CollectorEngine(pack, str(db), SOURCE, 0.01, provider=provider)
+    try:
+        with caplog.at_level(logging.ERROR, logger="gamecollect.engine"):
+            for _ in range(len(polls)):
+                engine.poll_once()
+        abandon_errors = [r for r in caplog.records if "abandoning tracker" in r.getMessage()]
+        assert len(abandon_errors) == 1, "abandonment must latch — never re-fire the give-up cycle"
+        assert engine._transitions == {}, (
+            "an abandoned match must not be re-tracked off its stale live baseline (no hot-loop)"
+        )
+        assert "m1" in engine._abandoned
+
+        # Recovery: a genuine LIVE reappearance clears the latch; a clean FT
+        # transition (outage lifted) then persists terminal state.
+        outage["active"] = False
+        live2 = nm("m1", (), status=MatchStatus.IN_PLAY, minute=70)
+        live_detail2 = nm("m1", (ev(0, "goal", minute=20),), status=MatchStatus.IN_PLAY, minute=70)
+        ft_detail = nm(
+            "m1",
+            (ev(0, "goal", minute=20), ev(1, "goal", minute=90)),
+            status=MatchStatus.FINISHED,
+            minute=None,
+            score_home=1,
+        )
+        provider._polls.extend([([live2], {"m1": live_detail2}), ([], {"m1": ft_detail})])
+        engine.poll_once()  # live reappearance clears the latch
+        assert "m1" not in engine._abandoned, "a genuine LIVE reappearance must clear the latch"
+        engine.poll_once()  # clean FT transition recovers
+    finally:
+        engine.close()
+
+    state = reader.get_state(read_db(db), qualified("m1"))
+    assert state is not None and state["status"] == MatchStatus.FINISHED.value, (
+        "after the latch clears, a genuine transition must persist terminal state"
+    )
+
+
 def test_multi_provider_map_rows_warn_and_hydrate_without_wedge(tmp_path, caplog):
     """Finding 3: >1 DISTINCT provider ids mapped to one stored row (a
     multi-provider source) must WARN naming them and proceed with the first —

@@ -246,16 +246,33 @@ class _TransitionTracker:
       details, status resets) and is never reset. Reaching either cap
       triggers a give-up that persists the best-known state (merged, never
       raw) and sets ``give_up_pending``.
-    * **Discarded (popped) on healthy live resumption**: a tracked match
-      reappearing on the slate with a LIVE status was a slate flicker, not a
-      transition — the tracker (and its consumed retry budget / stale
-      fallback) is dropped so a genuine later transition starts fresh.
+    * **On healthy live resumption** (a tracked match reappearing on the slate
+      with a LIVE status — a slate flicker or a genuine resumption, which one
+      poll cannot distinguish): the consumed retry BUDGET
+      (``total_attempts``/``consecutive_failures``/``give_up_*``) is always
+      reset in place so an exhausted episode can never inherit into — and
+      force-close — a genuinely live match. The ``fallback`` is a separate
+      question: the tracker (holding it) is RETAINED only while the fallback is
+      still worth persisting (events, a known score, or FINISHED) AND the
+      applied live score has NOT climbed past it (scores are cumulative, so a
+      strictly higher live score proves the fallback stale); otherwise the
+      tracker is dropped. This keeps a rich full-time fallback across a
+      one-poll flicker without letting a stale one beat a genuinely higher
+      later score at give-up.
     * ``give_up_pending`` short-circuits further detail fetches: the give-up
       snapshot is re-emitted every poll until its apply lands, and the ERROR
       log stating what was persisted fires only after that durable success.
       ``give_up_emissions`` bounds the re-emission: an UNPERSISTABLE snapshot
       (identity missing, ``seed_match`` → ``None`` forever) is abandoned with
       one final ERROR after ``_MAX_GIVE_UP_EMISSIONS`` emissions.
+    * **Abandonment is a per-run latch**: when a give-up snapshot's apply never
+      lands (``_MAX_GIVE_UP_EMISSIONS`` exhausted, or nothing was ever known to
+      persist) the tracker is popped AND the match id is recorded in
+      ``CollectorEngine._abandoned``, which the re-track paths (on-slate
+      transition and vanished-match hydration) consult so the bounded give-up
+      cannot hot-loop forever on a match whose apply persistently fails. A
+      genuine LIVE slate reappearance clears the latch so real resumption still
+      recovers.
     * ``last_reported_status`` dedupes the non-terminal WARN: once per detail
       status change, not once per poll.
     """
@@ -340,6 +357,12 @@ class CollectorEngine:
         # invariants). Popped ONLY by _resolve_tracker after a non-live
         # snapshot for the match was durably applied.
         self._transitions: dict[str, _TransitionTracker] = {}
+        # Match ids whose give-up snapshot could never be durably applied and
+        # were abandoned this run (see _emit_give_up). Consulted by the
+        # re-track paths so a persistently-unapplyable match does not hot-loop
+        # a fresh bounded give-up every poll; cleared by a genuine LIVE slate
+        # reappearance (see _on_live_resumption).
+        self._abandoned: set[str] = set()
         self._record: dict[str, _RecordedMatch] = {}
         self._record_flush_failed = False
         self._backoff_multiplier = 1
@@ -711,14 +734,13 @@ class CollectorEngine:
         hydrated: list[NormalizedMatch] = []
         for match in matches:
             if match.status in LIVE_STATUSES:
-                # Healthy live resumption on the slate: any pending transition
-                # tracker was a slate flicker, and both its consumed retry
-                # budget (total_attempts is never reset) and its captured
-                # fallback are stale — pop it entirely so the genuine
-                # transition later in the match gets a fresh budget. (A
-                # NON-live slate appearance is the transition in progress and
-                # must keep its tracker.)
-                self._transitions.pop(match.match_id, None)
+                # Healthy live resumption on the slate. A genuine live board is
+                # also the only signal that clears an abandonment latch, so a
+                # match we gave up persisting can still recover. (A NON-live
+                # slate appearance is the transition in progress — handled
+                # below — and must keep its tracker.)
+                self._abandoned.discard(match.match_id)
+                self._on_live_resumption(match)
             previous = self._last.get(match.match_id)
             was_live = (
                 previous is not None and previous.status in LIVE_STATUSES
@@ -733,6 +755,13 @@ class CollectorEngine:
                 hydrated.append(match)
                 continue
             in_transition = was_live and match.status not in LIVE_STATUSES
+            if in_transition and match.match_id in self._abandoned:
+                # Abandoned earlier this run: the give-up snapshot's apply never
+                # landed (e.g. seed_match returns None forever), so rebuilding a
+                # tracker would only restart the bounded give-up cycle. Leave it
+                # dropped; a genuine LIVE reappearance (handled above) clears the
+                # latch and allows real recovery.
+                continue
             tracker = self._transitions.get(match.match_id)
             if in_transition and tracker is not None and self._tracker_at_cap(tracker):
                 # A give-up is already due (typically re-emitted because its
@@ -850,6 +879,9 @@ class CollectorEngine:
         # A pending tracker also marks an unresolved transition (restart-gap
         # or mid-retry): never dropped by slate absence alone.
         tracked.update(m for m in self._transitions if m not in slate_ids)
+        # Abandoned ids must not be re-tracked off a stale live baseline that
+        # the failed give-up never advanced — that is the give-up hot-loop.
+        tracked -= self._abandoned
         snapshots: list[NormalizedMatch] = []
         for match_id in sorted(tracked):
             tracker = self._tracker(match_id)
@@ -922,6 +954,71 @@ class CollectorEngine:
             or tracker.consecutive_failures >= _MAX_TRANSITION_DETAIL_FAILURES
             or tracker.total_attempts >= _MAX_TRANSITION_TOTAL_ATTEMPTS
         )
+
+    def _on_live_resumption(self, applied: NormalizedMatch) -> None:
+        """Reconcile a tracked match reappearing LIVE on the slate.
+
+        A live board is either a genuine resumption or a one-poll slate
+        flicker, and a single poll cannot tell them apart. Either way the
+        consumed retry BUDGET must not carry into a later genuine transition —
+        an exhausted episode must never force-close a live match — so the
+        budget fields are reset unconditionally. The captured ``fallback`` is a
+        separate question: a fallback too sparse to be worth persisting, or one
+        the resumed live score has already climbed past, is stale; but a bogus
+        flicker over a rich terminal fallback (full-time score/events) must NOT
+        lose it before the match vanishes again. So the tracker (which holds
+        the fallback) is RETAINED with a reset budget only when the fallback is
+        worth persisting AND the applied live score has not superseded it;
+        otherwise it is dropped entirely (a genuine fresh transition rebuilds).
+        """
+        tracker = self._transitions.get(applied.match_id)
+        if tracker is None:
+            return
+        fallback = tracker.fallback
+        if (
+            fallback is not None
+            and self._fallback_worth_retaining(fallback)
+            and not self._live_supersedes_fallback(applied, fallback)
+        ):
+            tracker.consecutive_failures = 0
+            tracker.total_attempts = 0
+            tracker.give_up_pending = False
+            tracker.give_up_emissions = 0
+            tracker.last_reported_status = None
+        else:
+            self._transitions.pop(applied.match_id, None)
+
+    @staticmethod
+    def _fallback_worth_retaining(fallback: NormalizedMatch) -> bool:
+        """True when a fallback carries terminal richness worth keeping.
+
+        A fallback with events, a known score, or a FINISHED status is a
+        best-known terminal state that must survive a bogus live flicker; a
+        sparse reset board (no events, NULL scores, non-terminal) carries
+        nothing a fresh transition would not rebuild, so its tracker is dropped.
+        """
+        return bool(
+            fallback.events
+            or fallback.score_home is not None
+            or fallback.score_away is not None
+            or fallback.status is MatchStatus.FINISHED
+        )
+
+    @staticmethod
+    def _live_supersedes_fallback(applied: NormalizedMatch, fallback: NormalizedMatch) -> bool:
+        """True when a live board proves the captured fallback is stale.
+
+        Scores only ever climb, so a live snapshot whose home or away score is
+        strictly greater than the fallback's proves the match progressed past
+        it — the fallback must be dropped so it cannot beat the real (higher)
+        score at a later give-up. A NULL score on either side proves nothing.
+        """
+        for field in ("score_home", "score_away"):
+            live = getattr(applied, field)
+            captured = getattr(fallback, field)
+            if live is not None and captured is not None and live > captured:
+                return True
+        return False
 
     @staticmethod
     def _richest_fallback(old: NormalizedMatch | None, new: NormalizedMatch) -> NormalizedMatch:
@@ -1013,6 +1110,7 @@ class CollectorEngine:
                 tracker.total_attempts,
             )
             self._transitions.pop(match_id, None)
+            self._abandoned.add(match_id)
             return
         tracker.give_up_emissions += 1
         if tracker.give_up_emissions > _MAX_GIVE_UP_EMISSIONS:
@@ -1026,6 +1124,7 @@ class CollectorEngine:
                 _MAX_GIVE_UP_EMISSIONS,
             )
             self._transitions.pop(match_id, None)
+            self._abandoned.add(match_id)
             return
         tracker.give_up_pending = True
         out.append(snapshot)
