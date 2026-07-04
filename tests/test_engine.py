@@ -1538,6 +1538,343 @@ def test_lagging_detail_live_status_does_not_regress_scoreboard_final(tmp_path):
     assert state["score_home"] == 2, "the scoreboard's final score wins over the lagging detail"
 
 
+def test_restart_gap_sparse_terminal_detail_merges_over_fallback_base(tmp_path):
+    """Round-5 finding 1: on a restart gap (stored row live, no in-memory
+    baseline) whose transition-poll detail fails, the captured scoreboard
+    fallback must serve as the MERGE BASE when a later (vanished) terminal
+    detail arrives sparse — never popped before the base is computed. A raw
+    sparse detail would seed identity-less (events dropped), fall out of
+    tracking, and leave the row in-play forever."""
+    from gamecollect.engine import CollectorEngine
+
+    db = tmp_path / "engine.db"
+    live_board = nm("m1", (), status=MatchStatus.IN_PLAY, minute=44)
+    live_detail = nm("m1", (ev(0, "goal", minute=44),), status=MatchStatus.IN_PLAY, minute=44)
+    p1 = ScriptedDetailProvider([([live_board], {"m1": live_detail})])
+    e1 = CollectorEngine(make_pack(p1), str(db), SOURCE, 0.01, provider=p1)
+    try:
+        e1.poll_once()
+    finally:
+        e1.close()
+
+    ft_board = nm("m1", (), status=MatchStatus.FINISHED, minute=None, score_home=2)
+    sparse_ft_detail = nm(
+        "m1",
+        (ev(0, "goal", minute=44), ev(1, "goal", minute=95, detail="Stoppage winner")),
+        status=MatchStatus.FINISHED,
+        minute=None,
+        score_home=None,
+        score_away=None,
+        home_team=None,
+        away_team=None,
+        kickoff_utc=None,
+    )
+    p2 = ScriptedDetailProvider(
+        [
+            # Restart gap: fresh engine, FT board on the slate, detail fails →
+            # tracker created (stored row is live), FT board kept as fallback.
+            ([ft_board], {"m1": ProviderUnavailableError("summary 503 at the whistle")}),
+            # The match then vanishes and the terminal detail arrives SPARSE.
+            ([], {"m1": sparse_ft_detail}),
+        ]
+    )
+    e2 = CollectorEngine(make_pack(p2), str(db), SOURCE, 0.01, provider=p2)
+    try:
+        e2.poll_once()
+        e2.poll_once()
+    finally:
+        e2.close()
+
+    state = reader.get_state(read_db(db), qualified("m1"))
+    assert state is not None and state["status"] == MatchStatus.FINISHED.value, (
+        "a sparse terminal detail on a restart gap must merge over the fallback "
+        "base and close the row out, not seed identity-less and stay in-play"
+    )
+    assert state["score_home"] == 2, "the fallback board's score must fill the detail's None"
+    assert state["kickoff_utc"] == "2026-06-18T18:00:00Z", "identity must survive the merge"
+    assert event_seqs(db, qualified("m1")) == [0, 1], "the stoppage-time event must land"
+
+
+def test_provider_status_reset_keeps_fallback_and_terminates_at_attempts_cap(tmp_path, caplog):
+    """Round-5 finding 2: a non-terminal non-live detail (SCHEDULED/UNKNOWN —
+    a postponed/abandoned provider reset) must NOT discard the captured
+    terminal fallback nor loop silently forever: the fallback is kept, the
+    WARN fires once per state change (not every poll), and at the
+    total-attempts cap the merged fallback is persisted so the row terminates."""
+    from gamecollect.engine import _MAX_TRANSITION_TOTAL_ATTEMPTS, CollectorEngine
+
+    db = tmp_path / "engine.db"
+    live_board = nm("m1", (), status=MatchStatus.IN_PLAY, minute=44)
+    live_detail = nm("m1", (ev(0, "goal", minute=44),), status=MatchStatus.IN_PLAY, minute=44)
+    ft_board = nm("m1", (), status=MatchStatus.FINISHED, minute=None, score_home=2)
+    reset_detail = nm(
+        "m1",
+        (),
+        status=MatchStatus.SCHEDULED,
+        minute=None,
+        score_home=None,
+        score_away=None,
+        display_clock=None,
+    )
+    polls = [
+        ([live_board], {"m1": live_detail}),
+        # Transition poll: detail fails → FT board captured as fallback (ta=1).
+        ([ft_board], {"m1": ProviderUnavailableError("summary 503 at the whistle")}),
+    ]
+    # The match vanishes; the detail endpoint keeps returning a status RESET.
+    polls += [([], {"m1": reset_detail}) for _ in range(_MAX_TRANSITION_TOTAL_ATTEMPTS - 1)]
+    provider = ScriptedDetailProvider(polls)
+    engine = CollectorEngine(make_pack(provider), str(db), SOURCE, 0.01, provider=provider)
+    with caplog.at_level(logging.DEBUG):
+        try:
+            for _ in range(len(polls)):
+                engine.poll_once()
+        finally:
+            engine.close()
+
+    state = reader.get_state(read_db(db), qualified("m1"))
+    assert state is not None and state["status"] == MatchStatus.FINISHED.value, (
+        "at the attempts cap the captured terminal fallback must be persisted — "
+        "a status reset must not leave the row live-tracked forever"
+    )
+    assert state["score_home"] == 2, "the fallback's final score must not be discarded"
+    reset_warns = [r for r in caplog.records if "status reset" in r.getMessage()]
+    assert len(reset_warns) == 1, "the reset WARN must fire once per state change, not per poll"
+    give_up_errors = [
+        r
+        for r in caplog.records
+        if r.levelno >= logging.ERROR and "giving up" in r.getMessage() and "m1" in r.getMessage()
+    ]
+    assert give_up_errors, "the capped give-up must be logged at ERROR"
+
+
+def test_give_up_merges_sparse_fallback_over_live_baseline_never_raw(tmp_path, caplog):
+    """Round-5 finding 3: the give-up path must run the sparse terminal
+    snapshot through the merge over the live baseline — persisting it RAW
+    would NULL known scores, or (identity-less) fail to seed at all while the
+    ERROR log claims persistence."""
+    from gamecollect.engine import _MAX_TRANSITION_DETAIL_FAILURES, CollectorEngine
+
+    db = tmp_path / "engine.db"
+    live_board = nm("m1", (), status=MatchStatus.IN_PLAY, minute=44)
+    live_detail = nm("m1", (ev(0, "goal", minute=44),), status=MatchStatus.IN_PLAY, minute=44)
+    sparse_ft_board = nm(
+        "m1",
+        (),
+        status=MatchStatus.FINISHED,
+        minute=None,
+        score_home=None,
+        score_away=None,
+        display_clock="FT",
+        home_team=None,
+        away_team=None,
+        kickoff_utc=None,
+    )
+    failing_polls = [
+        ([sparse_ft_board], {"m1": ProviderUnavailableError(f"summary 404 #{i}")})
+        for i in range(_MAX_TRANSITION_DETAIL_FAILURES)
+    ]
+    provider = ScriptedDetailProvider([([live_board], {"m1": live_detail}), *failing_polls])
+    engine = CollectorEngine(make_pack(provider), str(db), SOURCE, 0.01, provider=provider)
+    with caplog.at_level(logging.DEBUG):
+        try:
+            for _ in range(1 + _MAX_TRANSITION_DETAIL_FAILURES):
+                engine.poll_once()
+        finally:
+            engine.close()
+
+    state = reader.get_state(read_db(db), qualified("m1"))
+    assert state is not None and state["status"] == MatchStatus.FINISHED.value, (
+        "an identity-less give-up snapshot must merge the baseline's identity "
+        "and seed — not be dropped while the row stays in-play"
+    )
+    assert state["score_home"] == 1 and state["score_away"] == 0, (
+        "the sparse board's None scores must not NULL the baseline's known scores"
+    )
+    assert state["kickoff_utc"] == "2026-06-18T18:00:00Z"
+    give_up_errors = [
+        r
+        for r in caplog.records
+        if r.levelno >= logging.ERROR and "giving up" in r.getMessage() and "m1" in r.getMessage()
+    ]
+    assert give_up_errors, "the give-up must be logged at ERROR after the write landed"
+
+
+def test_give_up_snapshot_retried_when_apply_is_not_durable(tmp_path, caplog):
+    """Round-5 finding 4: the tracker (and its captured fallback) must survive
+    a give-up whose apply did not complete durably — the SAME best-known
+    snapshot is re-emitted next poll, instead of the old force-close with a
+    stale live score after the fallback was popped pre-durability."""
+    from gamecollect.engine import _MAX_TRANSITION_DETAIL_FAILURES, CollectorEngine
+
+    db = tmp_path / "engine.db"
+    live_board = nm("m1", (), status=MatchStatus.IN_PLAY, minute=44)
+    live_detail = nm("m1", (ev(0, "goal", minute=44),), status=MatchStatus.IN_PLAY, minute=44)
+    ft_board = nm("m1", (), status=MatchStatus.FINISHED, minute=None, score_home=2)
+    polls = [
+        ([live_board], {"m1": live_detail}),
+        # Transition poll: FT board captured as fallback (score 2), cf=1.
+        ([ft_board], {"m1": ProviderUnavailableError("summary 503 at the whistle")}),
+    ]
+    # Vanishes; detail keeps failing up to the cap, then keeps failing after.
+    polls += [
+        ([], {"m1": ProviderUnavailableError(f"summary 404 #{i}")})
+        for i in range(_MAX_TRANSITION_DETAIL_FAILURES + 2)
+    ]
+    provider = ScriptedDetailProvider(polls)
+    pack = make_pack(provider)
+    original_persist = pack.persist_side_tables
+    outage = {"pending": True}
+
+    def flaky_persist(conn, writer, match, seeded_id):
+        if match.status is MatchStatus.FINISHED and outage["pending"]:
+            outage["pending"] = False
+            raise RuntimeError("transient side-table outage")
+        return original_persist(conn, writer, match, seeded_id)
+
+    pack.persist_side_tables = flaky_persist
+    engine = CollectorEngine(pack, str(db), SOURCE, 0.01, provider=provider)
+    with caplog.at_level(logging.DEBUG):
+        try:
+            for _ in range(len(polls)):
+                engine.poll_once()
+        finally:
+            engine.close()
+
+    state = reader.get_state(read_db(db), qualified("m1"))
+    assert state is not None and state["status"] == MatchStatus.FINISHED.value
+    assert state["score_home"] == 2, (
+        "the retried give-up must re-persist the captured fallback score — not a "
+        "stale live-baseline force-close after the fallback was lost"
+    )
+    # The give-up short-circuits further fetches: 1 live hydration + the
+    # failures up to the cap; nothing after (old code restarted the counter
+    # and kept fetching).
+    assert provider.detail_calls == ["m1"] * (1 + _MAX_TRANSITION_DETAIL_FAILURES)
+    give_up_errors = [
+        r
+        for r in caplog.records
+        if r.levelno >= logging.ERROR
+        and "persisted best-known" in r.getMessage()
+        and "m1" in r.getMessage()
+    ]
+    assert len(give_up_errors) == 1, (
+        "persistence must be claimed exactly once, only after the durable apply"
+    )
+
+
+def test_still_live_detail_not_force_closed_by_terminal_fallback_base(tmp_path, caplog):
+    """Round-5 finding 5: a still-live detail merged over a TERMINAL fallback
+    base (restart gap: the fallback is the only base) must NOT be force-closed
+    by the base's FINISHED status — the WARN promises the match stays tracked,
+    and only the detail itself (or the fallback at give-up) may terminate it."""
+    from gamecollect.engine import CollectorEngine
+
+    db = tmp_path / "engine.db"
+    live_board = nm("m1", (), status=MatchStatus.IN_PLAY, minute=44)
+    live_detail = nm("m1", (ev(0, "goal", minute=44),), status=MatchStatus.IN_PLAY, minute=44)
+    p1 = ScriptedDetailProvider([([live_board], {"m1": live_detail})])
+    e1 = CollectorEngine(make_pack(p1), str(db), SOURCE, 0.01, provider=p1)
+    try:
+        e1.poll_once()
+    finally:
+        e1.close()
+
+    ft_board = nm("m1", (), status=MatchStatus.FINISHED, minute=None, score_home=2)
+    still_live_detail = nm(
+        "m1", (ev(0, "goal", minute=44),), status=MatchStatus.IN_PLAY, minute=88, score_home=2
+    )
+    ft_detail = nm(
+        "m1",
+        (ev(0, "goal", minute=44), ev(1, "goal", minute=95, detail="Stoppage winner")),
+        status=MatchStatus.FINISHED,
+        minute=None,
+        score_home=2,
+    )
+    p2 = ScriptedDetailProvider(
+        [
+            # Restart gap: transition poll fails → terminal FT board becomes
+            # the fallback (and the only merge base — self._last is empty).
+            ([ft_board], {"m1": ProviderUnavailableError("summary 503 at the whistle")}),
+            ([], {"m1": still_live_detail}),  # dropped early, still live
+            ([], {"m1": ft_detail}),
+        ]
+    )
+    e2 = CollectorEngine(make_pack(p2), str(db), SOURCE, 0.01, provider=p2)
+    with caplog.at_level(logging.DEBUG):
+        try:
+            e2.poll_once()
+            e2.poll_once()
+            state = reader.get_state(read_db(db), qualified("m1"))
+            assert state is not None and state["status"] == MatchStatus.IN_PLAY.value, (
+                "a still-live detail must not be force-closed by its terminal fallback merge base"
+            )
+            assert state["minute"] == 88, "the live detail's clock must persist"
+            e2.poll_once()
+        finally:
+            e2.close()
+
+    state = reader.get_state(read_db(db), qualified("m1"))
+    assert state is not None and state["status"] == MatchStatus.FINISHED.value
+    assert event_seqs(db, qualified("m1")) == [0, 1]
+    live_warns = [r for r in caplog.records if "still says live" in r.getMessage()]
+    assert live_warns, "the still-live tracking WARN must fire"
+
+
+def test_still_live_vanished_loop_capped_force_closes_with_error(tmp_path, caplog):
+    """Round-5 finding 6: a vanished match whose detail NEVER turns terminal
+    must not be re-fetched and WARNed about every poll forever — the
+    total-attempts cap force-closes the best-known live state loudly, the WARN
+    fires once (not per poll), and tracking stops after the durable close."""
+    from gamecollect.engine import _MAX_TRANSITION_TOTAL_ATTEMPTS, CollectorEngine
+
+    db = tmp_path / "engine.db"
+    live_board = nm("m1", (), status=MatchStatus.IN_PLAY, minute=44)
+    live_detail = nm("m1", (ev(0, "goal", minute=44),), status=MatchStatus.IN_PLAY, minute=44)
+    polls: list[tuple[list, dict]] = [([live_board], {"m1": live_detail})]
+    for i in range(_MAX_TRANSITION_TOTAL_ATTEMPTS):
+        polls.append(
+            (
+                [],
+                {
+                    "m1": nm(
+                        "m1",
+                        (ev(0, "goal", minute=44),),
+                        status=MatchStatus.IN_PLAY,
+                        minute=80 + i,
+                        score_home=3,
+                    )
+                },
+            )
+        )
+    polls.append(([], {}))  # one poll past the cap: nothing may be fetched
+    provider = ScriptedDetailProvider(polls)
+    engine = CollectorEngine(make_pack(provider), str(db), SOURCE, 0.01, provider=provider)
+    with caplog.at_level(logging.DEBUG):
+        try:
+            for _ in range(len(polls)):
+                engine.poll_once()
+        finally:
+            engine.close()
+
+    state = reader.get_state(read_db(db), qualified("m1"))
+    assert state is not None and state["status"] == MatchStatus.FINISHED.value, (
+        "the never-terminal loop must be capped and force-closed, not left live"
+    )
+    assert state["score_home"] == 3, "the freshest live detail's score is the best-known state"
+    assert provider.detail_calls == ["m1"] * (1 + _MAX_TRANSITION_TOTAL_ATTEMPTS), (
+        "after the capped close the match must not be re-fetched"
+    )
+    live_warns = [r for r in caplog.records if "still says live" in r.getMessage()]
+    assert len(live_warns) == 1, "the still-live WARN must fire once per state change"
+    give_up_errors = [
+        r
+        for r in caplog.records
+        if r.levelno >= logging.ERROR and "giving up" in r.getMessage() and "m1" in r.getMessage()
+    ]
+    assert len(give_up_errors) == 1
+
+
 def test_duplicate_seq_within_one_drift_snapshot_is_warned_not_retro_error(tmp_path, caplog):
     """A snapshot carrying the same beyond-head seq TWICE fails batched
     ``append_events`` (not strictly increasing) and reconciles per-row: the
