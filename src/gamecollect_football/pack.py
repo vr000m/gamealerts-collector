@@ -9,7 +9,10 @@ altered by a pack.
 
 from __future__ import annotations
 
+import logging
+import math
 import sqlite3
+from decimal import Decimal, InvalidOperation
 
 from gamecollect.db.writer import PartitionWriter
 from gamecollect.fold import fold
@@ -21,6 +24,8 @@ from gamecollect_football.reconcile import seed_or_reconcile_match
 from gamecollect_football.taxonomy import TAXONOMY
 
 __all__ = ["FOOTBALL_SIDE_TABLE_DDL", "pack", "persist_football_side_tables"]
+
+log = logging.getLogger(__name__)
 
 # Pack-owned side tables (typed homes for the football-specific shapes the
 # adapter carries in NormalizedMatch.payload: boxscore stats and lineups).
@@ -111,14 +116,34 @@ def _to_key_text(value: object) -> str | None:
 
     Bools are rejected outright (checked BEFORE the numeric coercion — ``bool``
     is an ``int`` subclass, and ``str(True)`` would mint a bogus ``"True"``
-    team/athlete key); an integral float canonicalizes to its int string (a
-    JSON payload spelling the same athlete as ``760421.0`` and ``"760421"``
-    must collapse to ONE primary-key row, not duplicate the player). Anything
-    else follows :func:`_to_text`."""
+    team/athlete key); non-finite floats are rejected too (a literal ``"nan"``
+    or ``"inf"`` PK key is garbage). An integral float canonicalizes to its
+    int string, and so does an integral float-SPELLED string — a JSON payload
+    spelling the same athlete as ``760421.0``, ``"760421.0"``, and ``"760421"``
+    must collapse to ONE primary-key row, not duplicate the player. Only
+    strings that look like float spellings (containing ``.`` or an exponent)
+    are reparsed: a plain digit string like ``"01"`` is an opaque id and must
+    keep its leading zero. Anything else follows :func:`_to_text`."""
     if isinstance(value, bool):
         return None
-    if isinstance(value, float) and value.is_integer():
-        return str(int(value))
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            return None
+        if value.is_integer():
+            return str(int(value))
+        return _to_text(value)
+    if isinstance(value, str):
+        # Canonicalize float SPELLINGS only ('.'/exponent present). Decimal
+        # parses the string exactly (no float precision loss), so the int
+        # string it yields represents the same number the payload carried.
+        if any(ch in value for ch in ".eE"):
+            try:
+                dec = Decimal(value)
+            except InvalidOperation:
+                return value  # genuinely non-numeric (e.g. a team name)
+            if dec.is_finite() and dec == dec.to_integral_value():
+                return str(int(dec))
+        return value
     return _to_text(value)
 
 
@@ -149,6 +174,11 @@ def _stats_rows(
             continue
         team = _to_key_text(row.get("team"))
         if not team:
+            log.warning(
+                "football_stats: skipping stats row for match %s — invalid team key %r",
+                seeded_match_id,
+                row.get("team"),
+            )
             continue
         rows[(source, seeded_match_id, team)] = (
             source,
@@ -182,6 +212,11 @@ def _lineup_rows(
             continue
         team = _to_key_text(lineup.get("team"))
         if not team:
+            log.warning(
+                "football_lineups: skipping entire lineup for match %s — invalid team key %r",
+                seeded_match_id,
+                lineup.get("team"),
+            )
             continue
         players = lineup.get("players") or []
         if not isinstance(players, list):
@@ -191,7 +226,16 @@ def _lineup_rows(
                 continue
             athlete_id = _to_key_text(player.get("athlete_id"))
             display_name = _to_text(player.get("display_name"))
-            if not athlete_id or not display_name:
+            if not athlete_id:
+                log.warning(
+                    "football_lineups: skipping player for match %s (team %s) — "
+                    "invalid athlete_id %r",
+                    seeded_match_id,
+                    team,
+                    player.get("athlete_id"),
+                )
+                continue
+            if not display_name:
                 continue
             key = (source, seeded_match_id, team, athlete_id)
             rows[key] = (

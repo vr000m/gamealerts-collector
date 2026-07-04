@@ -290,3 +290,109 @@ def test_bool_identifier_values_are_rejected_not_stringified(db):
         "SELECT COUNT(*) FROM football_lineups WHERE match_id = ?", (MATCH_ID,)
     ).fetchone()
     assert lineup_count == 0, "bool team/athlete_id must not mint 'True'/'False' PK rows"
+
+
+def test_string_float_spelling_collapses_with_float_and_bare_string(db):
+    """Review finding: ALL three spellings of one athlete id — float
+    ``760421.0``, string ``"760421.0"``, and string ``"760421"`` — must
+    collapse to ONE primary-key row (last-wins), not two or three."""
+    conn, writer = db
+    payload = {
+        "lineups": [
+            {
+                "team": "Canada",
+                "players": [
+                    {"athlete_id": 760421.0, "display_name": "Float Spelling"},
+                    {"athlete_id": "760421.0", "display_name": "String Float Spelling"},
+                    {"athlete_id": "760421", "display_name": "Bare String Spelling"},
+                ],
+            }
+        ]
+    }
+    persist_football_side_tables(conn, writer, _match(payload), MATCH_ID)
+    rows = conn.execute(
+        "SELECT athlete_id, display_name FROM football_lineups WHERE match_id = ?", (MATCH_ID,)
+    ).fetchall()
+    assert [tuple(r) for r in rows] == [("760421", "Bare String Spelling")], (
+        "float, string-float, and bare-string spellings must collapse to one row, last-wins"
+    )
+
+
+def test_leading_zero_id_string_is_not_reparsed(db):
+    """A non-float-looking id string like ``"01"`` is an opaque identifier —
+    canonicalization must NOT strip its leading zero."""
+    conn, writer = db
+    payload = {
+        "lineups": [{"team": "Canada", "players": [{"athlete_id": "01", "display_name": "Keeper"}]}]
+    }
+    persist_football_side_tables(conn, writer, _match(payload), MATCH_ID)
+    ids = {
+        row[0]
+        for row in conn.execute(
+            "SELECT athlete_id FROM football_lineups WHERE match_id = ?", (MATCH_ID,)
+        )
+    }
+    assert ids == {"01"}, "a plain digit string must keep its leading zero"
+
+
+def test_non_finite_float_identifiers_are_rejected(db):
+    """NaN/inf floats must not mint literal 'nan'/'inf' PK keys."""
+    conn, writer = db
+    payload = {
+        "stats": [{"team": float("nan"), "shots": 3}],
+        "lineups": [
+            {
+                "team": "Canada",
+                "players": [
+                    {"athlete_id": float("inf"), "display_name": "Ghost"},
+                    {"athlete_id": float("-inf"), "display_name": "Ghost Two"},
+                    {"athlete_id": float("nan"), "display_name": "Ghost Three"},
+                ],
+            }
+        ],
+    }
+    persist_football_side_tables(conn, writer, _match(payload), MATCH_ID)
+    (stats_count,) = conn.execute(
+        "SELECT COUNT(*) FROM football_stats WHERE match_id = ?", (MATCH_ID,)
+    ).fetchone()
+    (lineup_count,) = conn.execute(
+        "SELECT COUNT(*) FROM football_lineups WHERE match_id = ?", (MATCH_ID,)
+    ).fetchone()
+    assert stats_count == 0 and lineup_count == 0, (
+        "non-finite floats must never become 'nan'/'inf' primary-key rows"
+    )
+
+
+def test_skipped_rows_and_players_log_warnings(db, caplog):
+    """Review finding: silently dropping a whole stats row / lineup (invalid
+    team key) or a player (invalid athlete_id) hides provider garbage — each
+    skip must log a WARNING naming the match and the offending value."""
+    import logging
+
+    conn, writer = db
+    payload = {
+        "stats": [{"team": True, "shots": 3}],
+        "lineups": [
+            {
+                "team": False,
+                "players": [{"athlete_id": "a1", "display_name": "Ghost Team"}],
+            },
+            {
+                "team": "Canada",
+                "players": [{"athlete_id": True, "display_name": "Ghost Player"}],
+            },
+        ],
+    }
+    with caplog.at_level(logging.WARNING, logger="gamecollect_football.pack"):
+        persist_football_side_tables(conn, writer, _match(payload), MATCH_ID)
+
+    messages = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("football_stats" in m and MATCH_ID in m and "True" in m for m in messages), (
+        "skipping a stats row must WARN with the match id and offending team value"
+    )
+    assert any("football_lineups" in m and MATCH_ID in m and "False" in m for m in messages), (
+        "skipping an entire lineup must WARN with the match id and offending team value"
+    )
+    assert any("athlete_id" in m and MATCH_ID in m and "True" in m for m in messages), (
+        "skipping a player must WARN with the match id and offending athlete_id"
+    )

@@ -888,3 +888,124 @@ class TestSideTableCollisionFreshestWins:
             assert stranded == 0
         finally:
             conn.close()
+
+
+class TestStaleStubMapEntryHeals:
+    """Review finding: databases written by the previous repoint-on-refusal
+    revision hold provider→stub map entries. Resolver path (a) must treat a
+    cached source-qualified stub id as stale — purge it (INFO) and fall
+    through to normal resolution, so adoption is re-attempted instead of the
+    stub being returned forever."""
+
+    CANONICAL = "wc2026_md03_m04"
+    STUB = f"{SOURCE_A}:760421"
+
+    def _seed_schedule_row(self, writer):
+        writer.upsert_match(
+            {
+                "match_id": self.CANONICAL,
+                "status": "SCHEDULED",
+                "kickoff_utc": "2026-06-14T04:00:00+00:00",
+                "payload": {"home_team": "Australia", "away_team": "Turkey"},
+            }
+        )
+
+    def _plant_stale_entry(self, conn):
+        # Simulate the old code's repoint: a map entry at the stub id, the
+        # shape the resolver's own rules say must never be cached.
+        with conn:
+            conn.execute(
+                "INSERT INTO provider_match_map (source, provider, provider_match_id, match_id) "
+                "VALUES (?, ?, ?, ?)",
+                (SOURCE_A, PROVIDER, "760421", self.STUB),
+            )
+
+    def test_stale_stub_entry_is_purged_and_adoption_reattempted(self, db, caplog):
+        import logging
+
+        conn, writer = db
+        # Old-world state: stub row with events, canonical schedule row
+        # present, and a stale provider→stub map entry.
+        assert seed_or_reconcile_match(conn, writer, _match(), PROVIDER) == self.STUB
+        writer.append_events(self.STUB, [{"seq": 0, "type": "goal", "minute": 12}])
+        self._seed_schedule_row(writer)
+        self._plant_stale_entry(conn)
+
+        with caplog.at_level(logging.INFO, logger="gamecollect_football.reconcile"):
+            seeded = seed_or_reconcile_match(conn, writer, _match(), PROVIDER)
+        assert seeded == self.CANONICAL, (
+            "a stale stub map entry must not pin resolution to the stub forever"
+        )
+        assert any("stale" in r.getMessage() for r in caplog.records), (
+            "purging the stale entry must be logged at INFO"
+        )
+        assert get_state(conn, self.STUB) is None, "the stub must be adopted away"
+        row = conn.execute(
+            "SELECT match_id FROM provider_match_map WHERE source = ? AND provider = ? "
+            "AND provider_match_id = ?",
+            (SOURCE_A, PROVIDER, "760421"),
+        ).fetchone()
+        assert row is not None and row[0] == self.CANONICAL
+
+    def test_stale_entry_purged_via_public_resolver_too(self, db):
+        """resolve_canonical_match_id (the public wrapper) applies the same
+        stale-stub guard: the entry is purged and (c) re-binds canonically."""
+        conn, writer = db
+        assert seed_or_reconcile_match(conn, writer, _match(), PROVIDER) == self.STUB
+        self._seed_schedule_row(writer)
+        self._plant_stale_entry(conn)
+
+        assert resolve_canonical_match_id(conn, writer, _match(), PROVIDER) == self.CANONICAL
+        row = conn.execute(
+            "SELECT match_id FROM provider_match_map WHERE source = ? AND provider = ? "
+            "AND provider_match_id = ?",
+            (SOURCE_A, PROVIDER, "760421"),
+        ).fetchone()
+        assert row is not None and row[0] == self.CANONICAL
+
+
+class TestNoMapChurnDuringRefusal:
+    """Review finding: while a both-have-events refusal conflict persists, the
+    old cache-then-delete order performed an INSERT + DELETE on
+    provider_match_map every poll. With deferred caching the map must see NO
+    writes at all during a conflicted poll."""
+
+    CANONICAL = "wc2026_md03_m04"
+    STUB = f"{SOURCE_A}:760421"
+
+    def _setup_conflict(self, conn, writer):
+        assert seed_or_reconcile_match(conn, writer, _match(), PROVIDER) == self.STUB
+        writer.append_events(self.STUB, [{"seq": 0, "type": "goal", "minute": 12}])
+        writer.upsert_match(
+            {
+                "match_id": self.CANONICAL,
+                "status": "SCHEDULED",
+                "kickoff_utc": "2026-06-14T04:00:00+00:00",
+                "payload": {"home_team": "Australia", "away_team": "Turkey"},
+            }
+        )
+        writer.append_events(self.CANONICAL, [{"seq": 0, "type": "kickoff", "minute": 0}])
+
+    def test_conflicted_polls_perform_no_provider_map_writes(self, db):
+        conn, writer = db
+        self._setup_conflict(conn, writer)
+        # First conflicted poll flushes any one-time work.
+        assert seed_or_reconcile_match(conn, writer, _match(), PROVIDER) == self.STUB
+
+        statements: list[str] = []
+        conn.set_trace_callback(statements.append)
+        try:
+            assert seed_or_reconcile_match(conn, writer, _match(), PROVIDER) == self.STUB
+        finally:
+            conn.set_trace_callback(None)
+
+        map_writes = [
+            s
+            for s in statements
+            if "provider_match_map" in s
+            and any(op in s.upper() for op in ("INSERT", "DELETE", "UPDATE"))
+        ]
+        assert map_writes == [], (
+            "a persisting refusal conflict must not churn provider_match_map "
+            f"every poll; saw: {map_writes}"
+        )

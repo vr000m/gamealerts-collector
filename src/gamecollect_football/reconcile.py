@@ -144,6 +144,9 @@ def resolve_canonical_match_id(
           Tie-break by nearest kickoff. On a hit, persist the mapping and return
           the canonical id. Runs BEFORE (d) so a real content-derived slug always
           wins over a source-qualified strip row that may co-exist for the match.
+          (:func:`seed_or_reconcile_match` uses the internal deferred-cache
+          variant instead, persisting the mapping only after stub adoption
+          succeeds — no map churn while an adoption-refusal conflict persists.)
       (d) Source-qualified seed (last resort) — a live-schedule sync may seed the
           WHOLE schedule under ``f"{source}:{id}"`` ids, and
           :func:`register_unreconciled_match` writes under the same form. The
@@ -157,12 +160,65 @@ def resolve_canonical_match_id(
           permanently shadow the content slug that (c) should bind once it
           appears. On no hit, return ``None`` (caller skips).
     """
+    canonical_id, cache_pending = _resolve_canonical_match_id_deferred(
+        conn, writer, match, provider
+    )
+    if canonical_id is not None and cache_pending:
+        writer.map_provider_match(provider, match.match_id, canonical_id)
+    return canonical_id
+
+
+def _resolve_canonical_match_id_deferred(
+    conn: sqlite3.Connection,
+    writer: PartitionWriter,
+    match: NormalizedMatch,
+    provider: str,
+) -> tuple[str | None, bool]:
+    """Resolution engine behind :func:`resolve_canonical_match_id`.
+
+    Same precedence (a)-(d), but a (b)/(c) hit does NOT persist the provider
+    map entry itself — it returns ``(canonical_id, cache_pending=True)`` and
+    the caller decides when to write the mapping. This lets
+    :func:`seed_or_reconcile_match` persist the entry only AFTER stub adoption
+    succeeds: under the old cache-then-refuse order, every poll on a
+    both-have-events conflict did an INSERT (here) followed by a DELETE (in
+    the refusal path) — two write transactions of pure map churn per poll.
+    ``cache_pending`` is ``False`` for (a) hits (the entry already exists),
+    (d) hits (qualified ids are never cached), and ``None``.
+
+    Stale-map self-heal (path (a)): databases written by a previous revision
+    (which repointed the mapping at the stub on adoption refusal) can hold a
+    cached ``f"{source}:{provider_id}"`` stub id — exactly the shape
+    :func:`register_unreconciled_match` mints and the resolver's own rules
+    say must never be cached. Left in place, (a) would return the stub
+    forever and adoption would never be re-attempted. Such an entry is
+    deleted (INFO logged) and resolution falls through to (b)-(d), which
+    re-attempts adoption via the normal path.
+    """
     provider_id = match.match_id
 
     # (a) cache hit
     cached = _lookup_provider_match(conn, writer.source, provider, provider_id)
     if cached is not None:
-        return cached
+        if cached == f"{writer.source}:{provider_id}":
+            # Stale stub entry from the previous repoint-on-refusal behavior:
+            # purge it and fall through so adoption can be re-attempted.
+            log.info(
+                "purging stale provider_match_map entry %s -> %s (source %s, provider %s): "
+                "source-qualified stub ids are never cached; re-resolving",
+                provider_id,
+                cached,
+                writer.source,
+                provider,
+            )
+            with conn:
+                conn.execute(
+                    "DELETE FROM provider_match_map "
+                    "WHERE source = ? AND provider = ? AND provider_match_id = ?",
+                    (writer.source, provider, provider_id),
+                )
+        else:
+            return cached, False
 
     # (b) direct-seed back-compat: the provider id is itself a seeded canonical
     # row — but only when the row belongs to THIS source. In a shared
@@ -171,13 +227,13 @@ def resolve_canonical_match_id(
     # another partition's match. Fall through to (c)/(d) instead.
     seeded = reader.get_state(conn, provider_id)
     if seeded is not None and seeded["source"] == writer.source:
-        # Cache the bind (docstring contract: (b)/(c) cache, (d) does not) so
-        # subsequent polls resolve via (a) without re-running get_state. Safe:
-        # the row exists and is source-checked, satisfying map_provider_match's
-        # seeded-ownership precondition, and a provider_id → provider_id bind
-        # is stable (unlike (d)'s transient qualified row).
-        writer.map_provider_match(provider, provider_id, provider_id)
-        return provider_id
+        # Cache-pending bind (docstring contract: (b)/(c) cache, (d) does not)
+        # so subsequent polls resolve via (a) without re-running get_state.
+        # Safe: the row exists and is source-checked, satisfying
+        # map_provider_match's seeded-ownership precondition, and a
+        # provider_id → provider_id bind is stable (unlike (d)'s transient
+        # qualified row).
+        return provider_id, True
 
     # (c) reconcile by (kickoff instant, team-set). Runs BEFORE the qualified
     # fallback (d) so a real content-derived slug always wins over a
@@ -193,8 +249,7 @@ def resolve_canonical_match_id(
             candidates = []
         canonical_id = _reconcile_by_kickoff(match, candidates)
         if canonical_id is not None:
-            writer.map_provider_match(provider, provider_id, canonical_id)
-            return canonical_id
+            return canonical_id, True
 
     # (d) source-qualified seed (last resort): an existing row under
     # f"{source}:{provider_id}" IS the canonical row for this provider event;
@@ -202,9 +257,9 @@ def resolve_canonical_match_id(
     # both exist. Mirrors register_unreconciled_match's qualified id.
     qualified_id = f"{writer.source}:{provider_id}"
     if reader.get_state(conn, qualified_id) is not None:
-        return qualified_id
+        return qualified_id, False
 
-    return None
+    return None, False
 
 
 def _lookup_provider_match(
@@ -589,7 +644,9 @@ def seed_or_reconcile_match(
     poll for both canonical rows and stub re-polls (resolver path (d)), so a
     sparse post-FT snapshot must not clobber richer stored values here either.
     """
-    canonical_id = resolve_canonical_match_id(conn, writer, match, provider)
+    canonical_id, cache_pending = _resolve_canonical_match_id_deferred(
+        conn, writer, match, provider
+    )
     if canonical_id is None:
         return register_unreconciled_match(conn, writer, match)
 
@@ -601,27 +658,35 @@ def seed_or_reconcile_match(
     # collecting on the stub (never corrupt two timelines).
     stub_id = f"{writer.source}:{match.match_id}"
     if canonical_id != stub_id and not _adopt_stub_rows(conn, writer.source, stub_id, canonical_id):
-        # Split-brain guard: resolver path (c) has already cached
-        # provider → canonical in provider_match_map, but collection is
-        # staying on the stub — a map-following reader would see a frozen
-        # canonical timeline while live history lands on the stub. Do NOT
-        # repoint the mapping at the stub either: qualified ids are never
-        # cached (the resolver's own rule), and a cached stub id would make
-        # path (a) return the stub forever — adoption never re-attempted,
-        # the documented per-attempt ERROR fired only once, and healing
-        # (the operator clearing the canonical row's conflicting events)
-        # never picked up. Instead DELETE the mapping so no wrong entry
-        # exists for readers and return the stub id UNCACHED: the next poll
-        # re-resolves via (c) (one indexed lookup + kickoff-window scan),
-        # re-attempts adoption, re-logs the ERROR while the conflict
-        # persists, and adoption succeeds automatically once it is safe.
-        with conn:
-            conn.execute(
-                "DELETE FROM provider_match_map "
-                "WHERE source = ? AND provider = ? AND provider_match_id = ?",
-                (writer.source, provider, match.match_id),
-            )
+        # Split-brain guard: collection is staying on the stub, so NO
+        # provider_match_map entry may exist — a canonical entry would point
+        # map-following readers at a frozen timeline while live history lands
+        # on the stub, and a stub entry would make resolver path (a) return
+        # the stub forever (adoption never re-attempted, the documented
+        # per-attempt ERROR fired only once, healing never picked up).
+        # Resolution above was cache-DEFERRED, so nothing was written this
+        # poll and there is normally nothing to delete — no INSERT+DELETE
+        # churn while the conflict persists. Keep a defensive delete for an
+        # entry left behind by an older revision or an external writer. The
+        # stub id is returned UNCACHED: the next poll re-resolves via (c)
+        # (one indexed lookup + kickoff-window scan), re-attempts adoption,
+        # re-logs the ERROR while the conflict persists, and adoption
+        # succeeds automatically once it is safe.
+        if _lookup_provider_match(conn, writer.source, provider, match.match_id) is not None:
+            with conn:
+                conn.execute(
+                    "DELETE FROM provider_match_map "
+                    "WHERE source = ? AND provider = ? AND provider_match_id = ?",
+                    (writer.source, provider, match.match_id),
+                )
         return register_unreconciled_match(conn, writer, match)
+
+    # Adoption succeeded (or there was no stub to adopt): NOW persist the
+    # deferred (b)/(c) mapping so subsequent polls resolve via the (a) cache.
+    # Writing only on the success path is what keeps a persisting refusal
+    # conflict free of per-poll map churn.
+    if cache_pending:
+        writer.map_provider_match(provider, match.match_id, canonical_id)
 
     payload = reader.get_stored_payload(conn, canonical_id)
     schedule_home = payload.get("home_team")
