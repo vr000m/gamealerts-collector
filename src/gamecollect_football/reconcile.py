@@ -463,14 +463,25 @@ def _adopt_stub_rows(
     events, provider-id mappings, and football side-table rows would
     otherwise be stranded — readers of the canonical match would silently
     miss the early history. Migrates everything in ONE transaction (seqs
-    preserved) and deletes the stub ``matches`` row.
+    preserved), merges the stub's accumulated ``payload`` into the canonical
+    row (preserve-richer; canonical schedule-owned keys and team names win —
+    the adoption may fire on a sparse poll, so HT scores/venue/round_name the
+    stub collected must not be lost), and deletes the stub ``matches`` row.
+
+    Side-table PK collisions (e.g. fixture-imported lineups already under the
+    canonical id) resolve freshest-wins: the stub's rows were written by live
+    collection, so ``UPDATE OR REPLACE`` moves them onto the canonical id,
+    displacing any colliding canonical row rather than silently dropping the
+    stub's fresher data.
 
     Safety policy on seq collisions: migration only proceeds when the
     canonical row has NO events of its own (the common case — it was just
     seeded from the schedule). If BOTH rows carry events, interleaving two
     timelines could corrupt both, so nothing is migrated, an ERROR is logged
-    (re-logged every poll it persists), and the caller keeps collecting on
-    the stub. Partition discipline: only rows under *source* are touched.
+    on every adoption attempt, and the caller keeps collecting on the stub
+    (and must repoint ``provider_match_map`` at the stub — see
+    :func:`seed_or_reconcile_match`). Partition discipline: only rows under
+    *source* are touched.
 
     Returns ``True`` when the stub is gone (migrated or never existed),
     ``False`` on the both-have-events conflict.
@@ -492,8 +503,8 @@ def _adopt_stub_rows(
     if stub_events and canonical_events:
         log.error(
             "stub %s and canonical %s (source %s) BOTH carry events (%d stub, %d canonical); "
-            "refusing to interleave two timelines — keeping collection on the stub "
-            "(re-logged every poll this persists)",
+            "refusing to interleave two timelines — keeping collection on the stub; "
+            "this is SPLIT HISTORY needing manual repair (logged on every adoption attempt)",
             stub_id,
             canonical_id,
             source,
@@ -501,6 +512,13 @@ def _adopt_stub_rows(
             canonical_events,
         )
         return False
+    # Merge the stub's accumulated payload into the canonical row before the
+    # stub is deleted: stub payload as base, canonical payload merged on top
+    # with preserve-richer — canonical non-empty values (schedule-owned keys,
+    # canonical team names) win, while stub-collected keys the canonical row
+    # lacks (or holds empty) survive the adoption.
+    merged_payload = dict(reader.get_stored_payload(conn, stub_id))
+    _merge_preserving_richer(merged_payload, reader.get_stored_payload(conn, canonical_id))
     with conn:
         conn.execute(
             "UPDATE events SET match_id = ? WHERE source = ? AND match_id = ?",
@@ -513,18 +531,20 @@ def _adopt_stub_rows(
         for table in _MIGRATABLE_SIDE_TABLES:
             if not _table_exists(conn, table):
                 continue
-            # UPDATE OR IGNORE skips any row whose PK already exists under the
-            # canonical id (canonical was just seeded, so normally none); the
-            # DELETE clears any such leftovers so no stub-keyed orphans remain.
+            # Freshest-wins on PK collision: the stub's rows came from live
+            # collection, so they replace any canonical-keyed row with the
+            # same PK (e.g. fixture-imported lineups). UPDATE OR REPLACE
+            # moves every stub row (deleting the displaced canonical row on
+            # conflict), so no stub-keyed rows remain and none are dropped.
             conn.execute(
-                f"UPDATE OR IGNORE {table} SET match_id = ? "  # noqa: S608
+                f"UPDATE OR REPLACE {table} SET match_id = ? "  # noqa: S608
                 f"WHERE source = ? AND match_id = ?",
                 (canonical_id, source, stub_id),
             )
-            conn.execute(
-                f"DELETE FROM {table} WHERE source = ? AND match_id = ?",  # noqa: S608
-                (source, stub_id),
-            )
+        conn.execute(
+            "UPDATE matches SET payload = ? WHERE source = ? AND match_id = ?",
+            (json.dumps(merged_payload, ensure_ascii=False, sort_keys=True), source, canonical_id),
+        )
         conn.execute("DELETE FROM matches WHERE source = ? AND match_id = ?", (source, stub_id))
     log.info(
         "adopted stub %s onto canonical %s (source %s): %d event(s) migrated, stub row deleted",
@@ -561,8 +581,11 @@ def seed_or_reconcile_match(
 
     ``kickoff_utc`` and payload ``home_team``/``away_team`` on a resolved
     canonical row are schedule-owned and are NOT overwritten with provider
-    values; the snapshot's other payload extras are merged in (existing ←
-    ``match.payload``, canonical identity keys preserved).
+    values; the snapshot's other payload extras are merged in with the SAME
+    preserve-richer policy as :func:`register_unreconciled_match` (stored ←
+    incoming richer-wins ← canonical names last) — this path re-runs every
+    poll for both canonical rows and stub re-polls (resolver path (d)), so a
+    sparse post-FT snapshot must not clobber richer stored values here either.
     """
     canonical_id = resolve_canonical_match_id(conn, writer, match, provider)
     if canonical_id is None:
@@ -576,12 +599,27 @@ def seed_or_reconcile_match(
     # collecting on the stub (never corrupt two timelines).
     stub_id = f"{writer.source}:{match.match_id}"
     if canonical_id != stub_id and not _adopt_stub_rows(conn, writer.source, stub_id, canonical_id):
+        # Split-brain guard: resolver path (c) has already cached
+        # provider → canonical in provider_match_map, but collection is
+        # staying on the stub — a map-following reader would see a frozen
+        # canonical timeline while live history lands on the stub. Repoint
+        # the mapping at the stub (map_provider_match upserts on conflict,
+        # and the stub row is seeded/source-owned, satisfying its
+        # precondition) so subsequent resolves hit the stub via the (a)
+        # cache and mapping/collection cannot diverge again while the
+        # conflict persists. The split history still needs MANUAL repair;
+        # deleting the map entry retries adoption (and re-logs the ERROR).
+        writer.map_provider_match(provider, match.match_id, stub_id)
         return register_unreconciled_match(conn, writer, match)
 
     payload = reader.get_stored_payload(conn, canonical_id)
     schedule_home = payload.get("home_team")
     schedule_away = payload.get("away_team")
-    payload.update(match.payload)
+    # One merge policy everywhere: preserve-richer, same as
+    # register_unreconciled_match. A plain dict.update here would let a
+    # sparse snapshot clobber richer stored values on every poll after the
+    # first (the register-side guard only protects the registration path).
+    _merge_preserving_richer(payload, match.payload)
     # Schedule-seeded canonical names win over any provider-supplied payload
     # keys; fill from the (display-folded) snapshot names only when the
     # resolved row lacks them (e.g. a direct-seed row without payload names).

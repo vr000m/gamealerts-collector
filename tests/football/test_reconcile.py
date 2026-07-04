@@ -607,3 +607,243 @@ class TestStubAdoption:
         assert get_state(conn, self.STUB) is None
         (count,) = conn.execute("SELECT COUNT(*) FROM matches").fetchone()
         assert count == 1
+
+
+# ===========================================================================
+# 8. Review-finding fixes: preserve-richer on every poll, adoption payload
+#    merge, split-brain map repoint, freshest-wins side-table migration.
+# ===========================================================================
+
+
+class TestPreserveRicherOnRepoll:
+    """Review finding 1: seed_or_reconcile_match's payload merge must use the
+    SAME preserve-richer policy as register_unreconciled_match — on both the
+    canonical-row path and the stub re-poll path (resolver path (d)), a sparse
+    post-FT snapshot must not clobber richer stored values on poll 2+."""
+
+    CANONICAL = "wc2026_md03_m04"
+    STUB = f"{SOURCE_A}:760421"
+
+    def _seed_schedule_row(self, writer):
+        writer.upsert_match(
+            {
+                "match_id": self.CANONICAL,
+                "status": "SCHEDULED",
+                "kickoff_utc": "2026-06-14T04:00:00+00:00",
+                "payload": {"home_team": "Australia", "away_team": "Turkey"},
+            }
+        )
+
+    def test_sparse_repoll_does_not_clobber_richer_canonical_payload(self, db):
+        import json
+        from dataclasses import replace
+
+        conn, writer = db
+        self._seed_schedule_row(writer)
+        rich = replace(
+            _match(),
+            payload={"venue": "Estadio Azteca", "stats": [{"team": "Australia", "shots": 9}]},
+        )
+        assert seed_or_reconcile_match(conn, writer, rich, PROVIDER) == self.CANONICAL
+
+        sparse = replace(
+            _match(),
+            payload={"venue": None, "stats": [], "attendance": 83000},
+        )
+        assert seed_or_reconcile_match(conn, writer, sparse, PROVIDER) == self.CANONICAL
+
+        payload = json.loads(get_state(conn, self.CANONICAL)["payload"])
+        assert payload["venue"] == "Estadio Azteca", "None must not clobber a stored value"
+        assert payload["stats"] == [{"team": "Australia", "shots": 9}], (
+            "an empty list must not clobber stored rich data"
+        )
+        assert payload["attendance"] == 83000, "new non-empty keys still land"
+
+    def test_sparse_repoll_does_not_clobber_richer_stub_payload(self, db):
+        """Poll 2+ on an unreconciled match resolves via path (d) to the stub
+        id and flows through seed_or_reconcile_match's upsert branch — NOT
+        register_unreconciled_match — so the richer guard must hold there."""
+        import json
+        from dataclasses import replace
+
+        conn, writer = db
+        rich = replace(
+            _match(),
+            payload={"venue": "Estadio Azteca", "stats": [{"team": "Australia", "shots": 9}]},
+        )
+        assert seed_or_reconcile_match(conn, writer, rich, PROVIDER) == self.STUB
+
+        sparse = replace(_match(), payload={"venue": None, "stats": []})
+        assert seed_or_reconcile_match(conn, writer, sparse, PROVIDER) == self.STUB
+
+        payload = json.loads(get_state(conn, self.STUB)["payload"])
+        assert payload["venue"] == "Estadio Azteca"
+        assert payload["stats"] == [{"team": "Australia", "shots": 9}]
+
+
+class TestAdoptionPreservesStubPayload:
+    """Review finding 2: adoption must merge the stub's accumulated payload
+    into the canonical row before deleting the stub — HT scores/venue etc.
+    collected on the stub must survive even when adoption fires on a sparse
+    poll."""
+
+    CANONICAL = "wc2026_md03_m04"
+    STUB = f"{SOURCE_A}:760421"
+
+    def test_adoption_on_sparse_poll_keeps_stub_accumulated_keys(self, db):
+        import json
+        from dataclasses import replace
+
+        conn, writer = db
+        rich = replace(
+            _match(),
+            payload={
+                "venue": "Estadio Azteca",
+                "ht_score_home": 1,
+                "ht_score_away": 0,
+                "round_name": "Group B (provider)",
+            },
+        )
+        assert seed_or_reconcile_match(conn, writer, rich, PROVIDER) == self.STUB
+
+        writer.upsert_match(
+            {
+                "match_id": self.CANONICAL,
+                "status": "SCHEDULED",
+                "kickoff_utc": "2026-06-14T04:00:00+00:00",
+                "payload": {
+                    "home_team": "Australia",
+                    "away_team": "Turkey",
+                    "round_name": "Group B",
+                },
+            }
+        )
+        sparse = replace(_match(), payload={})
+        assert seed_or_reconcile_match(conn, writer, sparse, PROVIDER) == self.CANONICAL
+        assert get_state(conn, self.STUB) is None
+
+        payload = json.loads(get_state(conn, self.CANONICAL)["payload"])
+        assert payload["venue"] == "Estadio Azteca", "stub-collected venue must survive adoption"
+        assert payload["ht_score_home"] == 1
+        assert payload["ht_score_away"] == 0
+        assert payload["round_name"] == "Group B", "canonical schedule-owned keys win"
+        assert payload["home_team"] == "Australia"
+        assert payload["away_team"] == "Turkey", "canonical team names win over stub names"
+
+
+class TestAdoptionRefusalRepointsMap:
+    """Review finding 3: on the both-have-events adoption refusal, collection
+    stays on the stub — the provider_match_map entry (written by resolver
+    path (c)) must be repointed at the stub in the same poll so map-following
+    readers see the live timeline, and subsequent resolves stay on the stub."""
+
+    CANONICAL = "wc2026_md03_m04"
+    STUB = f"{SOURCE_A}:760421"
+
+    def _mapped_id(self, conn):
+        row = conn.execute(
+            "SELECT match_id FROM provider_match_map WHERE source = ? AND provider = ? "
+            "AND provider_match_id = ?",
+            (SOURCE_A, PROVIDER, "760421"),
+        ).fetchone()
+        return row[0] if row else None
+
+    def test_refusal_repoints_map_at_the_stub_and_stays_consistent(self, db, caplog):
+        import logging
+
+        conn, writer = db
+        assert seed_or_reconcile_match(conn, writer, _match(), PROVIDER) == self.STUB
+        writer.append_events(self.STUB, [{"seq": 0, "type": "goal", "minute": 12}])
+
+        writer.upsert_match(
+            {
+                "match_id": self.CANONICAL,
+                "status": "SCHEDULED",
+                "kickoff_utc": "2026-06-14T04:00:00+00:00",
+                "payload": {"home_team": "Australia", "away_team": "Turkey"},
+            }
+        )
+        writer.append_events(self.CANONICAL, [{"seq": 0, "type": "kickoff", "minute": 0}])
+
+        with caplog.at_level(logging.ERROR):
+            assert seed_or_reconcile_match(conn, writer, _match(), PROVIDER) == self.STUB
+        assert any("refusing to interleave" in r.getMessage() for r in caplog.records)
+        assert self._mapped_id(conn) == self.STUB, (
+            "the provider map must follow collection to the stub — a map-following "
+            "reader must see the growing (stub) timeline, not the frozen canonical one"
+        )
+
+        # A reader following the map sees the growing timeline.
+        writer.append_events(self.STUB, [{"seq": 1, "type": "goal", "minute": 44}])
+        (n,) = conn.execute(
+            "SELECT COUNT(*) FROM events WHERE source = ? AND match_id = ?",
+            (SOURCE_A, self._mapped_id(conn)),
+        ).fetchone()
+        assert n == 2
+
+        # Repeated polls stay on the stub; the mapping does not flip back.
+        assert seed_or_reconcile_match(conn, writer, _match(), PROVIDER) == self.STUB
+        assert seed_or_reconcile_match(conn, writer, _match(), PROVIDER) == self.STUB
+        assert self._mapped_id(conn) == self.STUB
+
+
+class TestSideTableCollisionFreshestWins:
+    """Review finding 4: on a side-table PK collision during adoption (e.g. a
+    fixture-imported row already under the canonical id), the stub's row was
+    written by live collection and must REPLACE the stale canonical row — not
+    be silently dropped."""
+
+    CANONICAL = "wc2026_md03_m04"
+    STUB = f"{SOURCE_A}:760421"
+
+    def test_stub_row_replaces_colliding_canonical_row(self, tmp_path):
+        from gamecollect_football.pack import FOOTBALL_SIDE_TABLE_DDL
+
+        conn = connect(tmp_path / "collide-adopt.db", side_table_ddl=FOOTBALL_SIDE_TABLE_DDL)
+        try:
+            writer = PartitionWriter(conn, SOURCE_A)
+            assert seed_or_reconcile_match(conn, writer, _match(), PROVIDER) == self.STUB
+            writer.upsert_match(
+                {
+                    "match_id": self.CANONICAL,
+                    "status": "SCHEDULED",
+                    "kickoff_utc": "2026-06-14T04:00:00+00:00",
+                    "payload": {"home_team": "Australia", "away_team": "Turkey"},
+                }
+            )
+            with conn:
+                # Fresher live-collected row on the stub...
+                conn.execute(
+                    "INSERT INTO football_stats (source, match_id, team, shots) "
+                    "VALUES (?, ?, ?, ?)",
+                    (SOURCE_A, self.STUB, "Australia", 9),
+                )
+                # ...colliding with a stale fixture-imported canonical row
+                # (same PK remainder: source + team).
+                conn.execute(
+                    "INSERT INTO football_stats (source, match_id, team, shots) "
+                    "VALUES (?, ?, ?, ?)",
+                    (SOURCE_A, self.CANONICAL, "Australia", 1),
+                )
+                # A non-colliding stub row must migrate too.
+                conn.execute(
+                    "INSERT INTO football_stats (source, match_id, team, shots) "
+                    "VALUES (?, ?, ?, ?)",
+                    (SOURCE_A, self.STUB, "Turkey", 4),
+                )
+
+            assert seed_or_reconcile_match(conn, writer, _match(), PROVIDER) == self.CANONICAL
+
+            rows = conn.execute(
+                "SELECT source, match_id, team, shots FROM football_stats ORDER BY team"
+            ).fetchall()
+            assert [tuple(r) for r in rows] == [
+                (SOURCE_A, self.CANONICAL, "Australia", 9),
+                (SOURCE_A, self.CANONICAL, "Turkey", 4),
+            ], "stub's fresher row must replace the stale canonical row; none dropped"
+            (stranded,) = conn.execute(
+                "SELECT COUNT(*) FROM football_stats WHERE match_id = ?", (self.STUB,)
+            ).fetchone()
+            assert stranded == 0
+        finally:
+            conn.close()
