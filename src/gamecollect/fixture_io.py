@@ -129,9 +129,15 @@ def write_fixture(
     )
 
 
-def _require(data: dict[str, Any], key: str) -> Any:
+def _require(data: dict[str, Any], key: str, path: str | Path, section: str = "") -> Any:
+    """Fetch ``key`` from ``data`` or raise a path-carrying missing-key error.
+
+    ``section`` names the sub-object being read (e.g. ``"'match'"``) so nested
+    missing-key errors share the same message shape as top-level ones.
+    """
     if key not in data:
-        raise FixtureFormatError(f"fixture is missing required key {key!r}")
+        where = f"fixture {path!r} {section}" if section else f"fixture {path!r}"
+        raise FixtureFormatError(f"{where} is missing required key {key!r}")
     return data[key]
 
 
@@ -148,13 +154,13 @@ def read_fixture(path: str | Path) -> Fixture:
     if not isinstance(data, dict):
         raise FixtureFormatError(f"fixture {path!r} is not a JSON object")
 
-    version = _require(data, "format_version")
+    version = _require(data, "format_version", path)
     if version != FORMAT_VERSION:
         raise FixtureFormatError(
             f"fixture {path!r} is format_version {version!r}; this library reads {FORMAT_VERSION}"
         )
 
-    header = _require(data, "match")
+    header = _require(data, "match", path)
     if not isinstance(header, dict):
         raise FixtureFormatError(f"fixture {path!r} 'match' is not a JSON object")
     try:
@@ -202,10 +208,7 @@ def read_fixture(path: str | Path) -> Fixture:
             ) from exc
     events.sort(key=lambda e: e.seq)
 
-    try:
-        match_id = header["match_id"]
-    except KeyError as exc:
-        raise FixtureFormatError(f"fixture {path!r} 'match' is missing required key {exc}") from exc
+    match_id = _require(header, "match_id", path, "'match'")
     match = NormalizedMatch(
         match_id=match_id,
         status=status,

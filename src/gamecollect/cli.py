@@ -32,13 +32,14 @@ import argparse
 import copy
 import json
 import logging
+import sys
 from collections.abc import Callable, Sequence
 from typing import Any
 
 from gamecollect import __version__
 from gamecollect.db import reader
 from gamecollect.engine import CollectorEngine
-from gamecollect.packs.registry import PackError, load_pack, pack_names
+from gamecollect.packs.registry import PackError, PackNotFoundError, load_pack, pack_names
 from gamecollect.registry import Operation, Registry, build_registry
 
 __all__ = ["main", "build_parser", "load_registry", "HAND_WIRED_COMMANDS", "cli_subcommand_names"]
@@ -325,7 +326,14 @@ def _run_collect(
     """
     pack = (loaded_packs or {}).get(args.pack)
     if pack is None:
-        pack = pack_loader(args.pack)
+        try:
+            pack = pack_loader(args.pack)
+        except PackNotFoundError:
+            print(f"error: no pack named {args.pack!r}", file=sys.stderr)
+            return 2
+        except PackError as exc:
+            print(f"error: pack {args.pack!r} failed to load: {exc}", file=sys.stderr)
+            return 2
     engine = engine_factory(pack, args.db, args.source, provider=provider, record_path=args.record)
     try:
         (runner or _default_runner)(engine)

@@ -341,3 +341,33 @@ def test_fixture_rejects_duplicate_or_non_integer_event_seq(tmp_path, events, ne
     message = str(excinfo.value)
     assert str(path) in message
     assert needle in message
+
+
+@pytest.mark.parametrize(
+    "mutate, needle",
+    [
+        (lambda d: d.pop("format_version"), "format_version"),
+        (lambda d: d.pop("match"), "match"),
+        (lambda d: d["match"].pop("match_id"), "match_id"),
+    ],
+)
+def test_missing_key_errors_carry_the_fixture_path(tmp_path, mutate, needle):
+    """Every missing-required-key error (top-level ``format_version``/``match``
+    and the nested ``match_id``) must name both the missing key and the fixture
+    path — a bare "fixture is missing required key" is useless when replaying a
+    directory of fixtures."""
+    fio = _fixture_io()
+    data = _valid_fixture_dict()
+    mutate(data)
+    path = tmp_path / "missing-key.json"
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+    with pytest.raises(fio.FixtureFormatError) as excinfo:
+        _read(fio, path)
+
+    message = str(excinfo.value)
+    assert str(path) in message, f"{message!r} must carry the fixture path"
+    assert needle in message, f"{message!r} must name the missing key {needle!r}"
+    assert "missing required key" in message, (
+        f"{message!r} should share the one missing-key message shape"
+    )

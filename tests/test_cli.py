@@ -764,3 +764,53 @@ def test_collect_closes_engine_even_when_runner_raises(tmp_path):
         raise AssertionError("collect swallowed the runner's exception")
 
     assert built and built[0].closed, "engine must be closed even when the runner raises"
+
+
+def test_collect_unknown_pack_exits_nonzero_with_one_line_error(tmp_path, capsys):
+    """``collect --pack nonexistent`` must exit non-zero with a clean one-line
+    error on stderr — never a raw ``PackNotFoundError`` traceback through the
+    ``raise SystemExit(main())`` entry point. Uses the real default
+    ``pack_loader`` (``load_pack``) so the real not-found path is exercised."""
+    rc = cli.main(
+        [
+            "collect",
+            "--pack",
+            "nonexistent",
+            "--db",
+            str(tmp_path / "c.db"),
+            "--source",
+            "s",
+        ],
+        registry=_registry(),
+    )
+
+    assert rc != 0, "a missing pack must exit non-zero"
+    captured = capsys.readouterr()
+    assert captured.out == "", "the error must go to stderr, not stdout"
+    assert "Traceback" not in captured.err
+    error_lines = [line for line in captured.err.splitlines() if line]
+    assert error_lines == ["error: no pack named 'nonexistent'"]
+
+
+def test_collect_broken_pack_exits_nonzero_with_one_line_error(tmp_path, capsys):
+    """A pack that exists but fails to load (any ``PackError``) surfaces as a
+    clean one-line stderr error and a non-zero exit, not a traceback."""
+    from gamecollect.packs.registry import PackValidationError
+
+    def broken_loader(name: str) -> Any:
+        raise PackValidationError("provider factory raised: boom")
+
+    rc = cli.main(
+        ["collect", "--pack", PACK_NAME, "--db", str(tmp_path / "c.db"), "--source", "s"],
+        registry=_registry(),
+        pack_loader=broken_loader,
+    )
+
+    assert rc != 0, "a broken pack must exit non-zero"
+    captured = capsys.readouterr()
+    assert captured.out == "", "the error must go to stderr, not stdout"
+    assert "Traceback" not in captured.err
+    error_lines = [line for line in captured.err.splitlines() if line]
+    assert error_lines == [
+        f"error: pack {PACK_NAME!r} failed to load: provider factory raised: boom"
+    ]
