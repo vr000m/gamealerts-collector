@@ -108,19 +108,26 @@ def _event_to_row(event: NormalizedEvent) -> dict[str, Any]:
     return row
 
 
-# NormalizedMatch identity fields where ``None`` unambiguously means "not
-# provided". A detail endpoint that omits one must not wipe the scoreboard's
-# value: detail wins where it has a value; the scoreboard fills detail's Nones.
-# Live-state fields (``minute``/``display_clock``/``score_home``/``score_away``)
-# are deliberately NOT filled: at HT/FT a detail endpoint may legitimately null
-# the clock, and backfilling would freeze a stale live minute in stored state —
-# detail wins for those, including ``None``. ``status`` is a non-optional enum
-# (merged with the forward-only rule below) and ``events``/``payload`` merge
-# separately, so they are not listed.
+# NormalizedMatch fields where ``None`` unambiguously means "not provided".
+# A detail endpoint that omits one must not wipe the scoreboard's value:
+# detail wins where it has a value; the scoreboard fills detail's Nones.
+# Scores are listed too: they are cumulative facts that are never legitimately
+# "cleared" mid- or post-match, so a detail ``None`` score must not null a
+# known scoreboard score in ANY branch — the equal-rank live poll and the
+# FINISHED transition poll included (the lagging-detail branch additionally
+# restores non-``None`` scoreboard scores over stale detail values). Clock
+# fields (``minute``/``display_clock``) are deliberately NOT filled: at HT/FT
+# a detail endpoint may legitimately null the clock, and backfilling would
+# freeze a stale live minute in stored state — detail wins for those,
+# including ``None``. ``status`` is a non-optional enum (merged with the
+# forward-only rule below) and ``events``/``payload`` merge separately, so
+# they are not listed.
 _MERGE_FILL_FIELDS = (
     "home_team",
     "away_team",
     "kickoff_utc",
+    "score_home",
+    "score_away",
 )
 
 # Lifecycle rank for the merge's forward-only status rule: when scoreboard and
@@ -141,11 +148,14 @@ _STATUS_RANK: dict[MatchStatus, int] = {
 def _merge_detail(scoreboard: NormalizedMatch, detail: NormalizedMatch) -> NormalizedMatch:
     """Merge a detail snapshot over its scoreboard snapshot, field by field.
 
-    Payload keys merge with detail winning; identity fields take the detail
-    value unless it is ``None``, in which case the scoreboard value fills it —
-    a detail endpoint omitting ``kickoff_utc``/``home_team``/``away_team``
-    must not wipe stored identity to NULL (or make ``seed_match`` return
-    ``None`` and drop the poll's events).
+    Payload keys merge with detail winning; identity fields and scores take
+    the detail value unless it is ``None``, in which case the scoreboard value
+    fills it — a detail endpoint omitting ``kickoff_utc``/``home_team``/
+    ``away_team`` must not wipe stored identity to NULL (or make ``seed_match``
+    return ``None`` and drop the poll's events), and a detail omitting
+    ``score_home``/``score_away`` must not null a known score (scores are
+    cumulative facts; only ``minute``/``display_clock`` are legitimately
+    nulled at HT/FT, so those stay detail-wins including ``None``).
 
     Status is forward-only (see ``_STATUS_RANK``): when the detail's status
     lags BEHIND the scoreboard's, the scoreboard's status wins, and so do its
@@ -246,6 +256,11 @@ class CollectorEngine:
         # provider-native match id: a transient failure on the exact transition
         # poll must be retried, not baselined away (see _fetch_poll_snapshots).
         self._transition_detail_failures: dict[str, int] = {}
+        # Best-known terminal snapshot per match id: the sparse final
+        # scoreboard snapshot seen on a transition-retry skip. If the match
+        # then drops off the slate and detail keeps failing, this is persisted
+        # at the failure cap instead of leaving the row live forever.
+        self._transition_fallbacks: dict[str, NormalizedMatch] = {}
         self._record: dict[str, _RecordedMatch] = {}
         self._record_flush_failed = False
         self._backoff_multiplier = 1
@@ -576,13 +591,14 @@ class CollectorEngine:
         scoreboard snapshot (a permanently-404ing post-FT detail endpoint must
         not wedge the slate). Slate-level errors from ``fetch_live_matches``
         still propagate to the loop's backoff.
+
+        Previously-live matches that dropped OFF the slate entirely are
+        hydrated too (see :meth:`_hydrate_vanished_matches`): a scoreboard may
+        drop a match without ever showing its final status, and the stored
+        row must not stay in-play forever.
         """
         matches = self._provider.fetch_live_matches()
-        # A match gone from the slate has nothing left to retry; drop its
-        # transition-failure counter so the dict cannot grow unboundedly.
         slate_ids = {m.match_id for m in matches}
-        for match_id in [m for m in self._transition_detail_failures if m not in slate_ids]:
-            del self._transition_detail_failures[match_id]
         hydrated: list[NormalizedMatch] = []
         for match in matches:
             previous = self._last.get(match.match_id)
@@ -619,6 +635,11 @@ class CollectorEngine:
                     failures = self._transition_detail_failures.get(match.match_id, 0) + 1
                     if failures < _MAX_TRANSITION_DETAIL_FAILURES:
                         self._transition_detail_failures[match.match_id] = failures
+                        # Remember the sparse final scoreboard snapshot: if the
+                        # match drops off the slate before the retries land,
+                        # this is the best-known terminal state to persist at
+                        # the failure cap (see _hydrate_vanished_matches).
+                        self._transition_fallbacks[match.match_id] = match
                         log.warning(
                             "final-detail fetch failed on live→final transition for "
                             "match %s on source %s (attempt %d/%d): skipping match "
@@ -631,6 +652,7 @@ class CollectorEngine:
                         )
                         continue
                     del self._transition_detail_failures[match.match_id]
+                    self._transition_fallbacks.pop(match.match_id, None)
                     log.error(
                         "final-detail fetch failed %d consecutive times on "
                         "live→final transition for match %s on source %s: giving "
@@ -643,8 +665,120 @@ class CollectorEngine:
                 hydrated.append(match)
                 continue
             self._transition_detail_failures.pop(match.match_id, None)
+            self._transition_fallbacks.pop(match.match_id, None)
             hydrated.append(_merge_detail(match, detail))
+        hydrated.extend(self._hydrate_vanished_matches(slate_ids))
         return hydrated
+
+    def _hydrate_vanished_matches(self, slate_ids: set[str]) -> list[NormalizedMatch]:
+        """Hydrate previously-live matches that dropped off the slate.
+
+        A live match can simply vanish from ``fetch_live_matches`` without
+        ever showing a final status on the slate (an early scoreboard drop),
+        or drop off mid transition-retry. Without an explicit detail fetch its
+        stored row would stay live forever and final-only events (stoppage
+        winners, full-time) would be lost.
+
+        Tracking: a match is vanished-tracked while its diff baseline in
+        ``self._last`` is still live (or a transition-retry counter is
+        pending) and its id is absent from the current slate. Each tracked
+        match gets a per-match isolated ``fetch_match_detail``; the returned
+        snapshot flows through the normal diff/apply path, so a terminal
+        detail persists its final status + events and drops the match out of
+        tracking (the baseline stops being live). A detail that still says
+        live keeps the match tracked — the scoreboard may have dropped it
+        early. Failures share the transition-retry counters and cap: after
+        ``_MAX_TRANSITION_DETAIL_FAILURES`` consecutive failures the engine
+        gives up LOUDLY (ERROR) and persists the best-known terminal state —
+        the sparse final scoreboard snapshot captured during a
+        transition-retry skip when one exists, else the live baseline
+        force-closed to FINISHED — rather than silently leaving the row
+        in-play. The tracked set is bounded by the live baselines; the
+        counter/fallback dicts are pruned for ids neither on the slate nor
+        tracked. Known limitation: after a daemon restart ``self._last`` is
+        empty, so a match that vanished across the restart (never reappearing
+        on the slate) is not tracked — same as pre-fix.
+        """
+        tracked = {
+            match_id
+            for match_id, previous in self._last.items()
+            if match_id not in slate_ids and previous.status in LIVE_STATUSES
+        }
+        # A pending transition-retry counter also marks a live baseline (the
+        # restart-gap case tracks in storage, not self._last).
+        tracked.update(m for m in self._transition_detail_failures if m not in slate_ids)
+        # Bound the retry/fallback dicts: an id neither on the slate nor
+        # vanished-tracked has nothing left to retry.
+        for match_id in [
+            m
+            for m in {*self._transition_detail_failures, *self._transition_fallbacks}
+            if m not in slate_ids and m not in tracked
+        ]:
+            self._transition_detail_failures.pop(match_id, None)
+            self._transition_fallbacks.pop(match_id, None)
+        snapshots: list[NormalizedMatch] = []
+        for match_id in sorted(tracked):
+            try:
+                detail = self._provider.fetch_match_detail(match_id)
+            except (ProviderUnavailableError, ShapeDriftError) as exc:
+                failures = self._transition_detail_failures.get(match_id, 0) + 1
+                if failures < _MAX_TRANSITION_DETAIL_FAILURES:
+                    self._transition_detail_failures[match_id] = failures
+                    log.warning(
+                        "match %s vanished from the slate on source %s while live and "
+                        "its detail fetch failed (attempt %d/%d): %s — terminal "
+                        "hydration retried next poll",
+                        match_id,
+                        self._source,
+                        failures,
+                        _MAX_TRANSITION_DETAIL_FAILURES,
+                        exc,
+                    )
+                    continue
+                self._transition_detail_failures.pop(match_id, None)
+                fallback = self._transition_fallbacks.pop(match_id, None)
+                if fallback is None:
+                    previous = self._last.get(match_id)
+                    if previous is not None:
+                        # Never saw a terminal snapshot: force-close the live
+                        # baseline so the row does not stay in-play forever.
+                        fallback = replace(previous, status=MatchStatus.FINISHED)
+                if fallback is None:
+                    log.error(
+                        "detail fetch failed %d consecutive times for match %s which "
+                        "vanished from the slate on source %s while live, and no "
+                        "baseline or terminal snapshot is known: giving up with "
+                        "nothing to persist",
+                        failures,
+                        match_id,
+                        self._source,
+                    )
+                    continue
+                log.error(
+                    "detail fetch failed %d consecutive times for match %s which "
+                    "vanished from the slate on source %s while live: giving up and "
+                    "persisting the best-known terminal state (status %s) — "
+                    "final-whistle events may be lost",
+                    failures,
+                    match_id,
+                    self._source,
+                    fallback.status.value,
+                )
+                snapshots.append(fallback)
+                continue
+            self._transition_detail_failures.pop(match_id, None)
+            if detail.status in LIVE_STATUSES:
+                log.warning(
+                    "match %s vanished from the slate on source %s but its detail "
+                    "still says live; keeping it tracked for terminal hydration",
+                    match_id,
+                    self._source,
+                )
+            else:
+                self._transition_fallbacks.pop(match_id, None)
+            base = self._last.get(match_id) or self._transition_fallbacks.get(match_id)
+            snapshots.append(_merge_detail(base, detail) if base is not None else detail)
+        return snapshots
 
     def _stored_status_is_live(self, provider_match_id: str) -> bool:
         """True when the stored ``matches`` row for this match is still live.

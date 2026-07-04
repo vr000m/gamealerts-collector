@@ -731,11 +731,16 @@ class TestAdoptionPreservesStubPayload:
         assert payload["away_team"] == "Turkey", "canonical team names win over stub names"
 
 
-class TestAdoptionRefusalRepointsMap:
-    """Review finding 3: on the both-have-events adoption refusal, collection
-    stays on the stub — the provider_match_map entry (written by resolver
-    path (c)) must be repointed at the stub in the same poll so map-following
-    readers see the live timeline, and subsequent resolves stay on the stub."""
+class TestAdoptionRefusalClearsMap:
+    """Review finding: on the both-have-events adoption refusal the resolver's
+    path-(c) cache entry must be DELETED, not repointed at the stub. A cached
+    source-qualified stub id violates the resolver's own never-cache-qualified
+    rule and makes path (a) return the stub forever — adoption never
+    re-attempted (contradicting the documented per-attempt ERROR) and healing
+    (the operator clearing the canonical row's conflicting events) never
+    picked up. With NO entry, every poll re-resolves via (c), re-attempts
+    adoption, re-logs the ERROR while the conflict persists, and adoption
+    succeeds automatically once it becomes safe."""
 
     CANONICAL = "wc2026_md03_m04"
     STUB = f"{SOURCE_A}:760421"
@@ -748,13 +753,9 @@ class TestAdoptionRefusalRepointsMap:
         ).fetchone()
         return row[0] if row else None
 
-    def test_refusal_repoints_map_at_the_stub_and_stays_consistent(self, db, caplog):
-        import logging
-
-        conn, writer = db
+    def _setup_conflict(self, conn, writer):
         assert seed_or_reconcile_match(conn, writer, _match(), PROVIDER) == self.STUB
         writer.append_events(self.STUB, [{"seq": 0, "type": "goal", "minute": 12}])
-
         writer.upsert_match(
             {
                 "match_id": self.CANONICAL,
@@ -765,26 +766,66 @@ class TestAdoptionRefusalRepointsMap:
         )
         writer.append_events(self.CANONICAL, [{"seq": 0, "type": "kickoff", "minute": 0}])
 
+    def test_refusal_leaves_no_map_entry_and_relogs_error_every_poll(self, db, caplog):
+        import logging
+
+        conn, writer = db
+        self._setup_conflict(conn, writer)
+
         with caplog.at_level(logging.ERROR):
             assert seed_or_reconcile_match(conn, writer, _match(), PROVIDER) == self.STUB
         assert any("refusing to interleave" in r.getMessage() for r in caplog.records)
-        assert self._mapped_id(conn) == self.STUB, (
-            "the provider map must follow collection to the stub — a map-following "
-            "reader must see the growing (stub) timeline, not the frozen canonical one"
+        assert self._mapped_id(conn) is None, (
+            "a refusal must leave NO provider_match_map entry — a cached stub id "
+            "would freeze adoption forever, and a canonical entry points readers "
+            "at the frozen timeline"
         )
 
-        # A reader following the map sees the growing timeline.
+        # Every subsequent poll re-attempts adoption and re-logs the ERROR
+        # while the conflict persists; the map stays empty.
+        caplog.clear()
+        with caplog.at_level(logging.ERROR):
+            assert seed_or_reconcile_match(conn, writer, _match(), PROVIDER) == self.STUB
+        assert any("refusing to interleave" in r.getMessage() for r in caplog.records), (
+            "the adoption ERROR must be re-logged on EVERY poll, not once"
+        )
+        assert self._mapped_id(conn) is None
+
+        # The stub keeps collecting the live timeline meanwhile.
         writer.append_events(self.STUB, [{"seq": 1, "type": "goal", "minute": 44}])
         (n,) = conn.execute(
             "SELECT COUNT(*) FROM events WHERE source = ? AND match_id = ?",
-            (SOURCE_A, self._mapped_id(conn)),
+            (SOURCE_A, self.STUB),
         ).fetchone()
         assert n == 2
 
-        # Repeated polls stay on the stub; the mapping does not flip back.
+    def test_clearing_canonical_events_heals_adoption_on_next_poll(self, db):
+        conn, writer = db
+        self._setup_conflict(conn, writer)
         assert seed_or_reconcile_match(conn, writer, _match(), PROVIDER) == self.STUB
-        assert seed_or_reconcile_match(conn, writer, _match(), PROVIDER) == self.STUB
-        assert self._mapped_id(conn) == self.STUB
+        assert self._mapped_id(conn) is None
+
+        # Operator repairs the split history: the canonical row's conflicting
+        # events are cleared. The very next poll must adopt automatically.
+        with conn:
+            conn.execute(
+                "DELETE FROM events WHERE source = ? AND match_id = ?",
+                (SOURCE_A, self.CANONICAL),
+            )
+        assert seed_or_reconcile_match(conn, writer, _match(), PROVIDER) == self.CANONICAL
+
+        seqs = [
+            r[0]
+            for r in conn.execute(
+                "SELECT seq FROM events WHERE source = ? AND match_id = ? ORDER BY seq",
+                (SOURCE_A, self.CANONICAL),
+            )
+        ]
+        assert seqs == [0], "the stub's timeline must migrate on the healing poll"
+        assert get_state(conn, self.STUB) is None, "the stub row must be adopted away"
+        assert self._mapped_id(conn) == self.CANONICAL, (
+            "after healing, the map must point at the canonical row"
+        )
 
 
 class TestSideTableCollisionFreshestWins:

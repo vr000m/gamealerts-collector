@@ -197,7 +197,9 @@ def test_helper_replace_uses_partition_and_match_scope(db):
 
 def test_numeric_athlete_id_and_team_are_coerced_not_dropped(db):
     """Scalar-but-not-str identifiers coerce to TEXT (review: narrowed filters
-    silently dropped rows the old hook stored)."""
+    silently dropped rows the old hook stored). Integral floats CANONICALIZE
+    to their int string (review: ``12345.0`` used to mint the key "12345.0",
+    duplicating the player against a later "12345")."""
     conn, writer = db
     payload = {
         "lineups": [
@@ -218,9 +220,73 @@ def test_numeric_athlete_id_and_team_are_coerced_not_dropped(db):
             "SELECT athlete_id FROM football_lineups WHERE match_id = ?", (MATCH_ID,)
         )
     }
-    assert ids == {"12345.0", "67890"}
+    assert ids == {"12345", "67890"}
     teams = {
         row[0]
         for row in conn.execute("SELECT team FROM football_stats WHERE match_id = ?", (MATCH_ID,))
     }
     assert teams == {"42"}
+
+
+def test_integral_float_and_string_athlete_id_collapse_to_one_row(db):
+    """The same athlete spelled as JSON float ``760421.0`` and string
+    ``"760421"`` must collapse to ONE primary-key row (last-wins), not two."""
+    conn, writer = db
+    payload = {
+        "lineups": [
+            {
+                "team": "Canada",
+                "players": [
+                    {"athlete_id": 760421.0, "display_name": "First Spelling"},
+                    {"athlete_id": "760421", "display_name": "Second Spelling"},
+                ],
+            }
+        ]
+    }
+    persist_football_side_tables(conn, writer, _match(payload), MATCH_ID)
+    rows = conn.execute(
+        "SELECT athlete_id, display_name FROM football_lineups WHERE match_id = ?", (MATCH_ID,)
+    ).fetchall()
+    assert [tuple(r) for r in rows] == [("760421", "Second Spelling")], (
+        "float and string spellings of one athlete id must collapse to one row, last-wins"
+    )
+    # A NON-integral float keeps its str() form (no information loss).
+    payload2 = {
+        "lineups": [{"team": "Canada", "players": [{"athlete_id": 7.5, "display_name": "Odd Id"}]}]
+    }
+    persist_football_side_tables(conn, writer, _match(payload2), MATCH_ID)
+    ids = {
+        row[0]
+        for row in conn.execute(
+            "SELECT athlete_id FROM football_lineups WHERE match_id = ?", (MATCH_ID,)
+        )
+    }
+    assert "7.5" in ids
+
+
+def test_bool_identifier_values_are_rejected_not_stringified(db):
+    """A bool team/athlete_id (untrusted JSON true/false) must be REJECTED —
+    ``str(True)`` would mint a literal "True" primary-key row."""
+    conn, writer = db
+    payload = {
+        "stats": [{"team": True, "shots": 3}],
+        "lineups": [
+            {
+                "team": False,
+                "players": [{"athlete_id": "a1", "display_name": "Ghost Team"}],
+            },
+            {
+                "team": "Canada",
+                "players": [{"athlete_id": True, "display_name": "Ghost Player"}],
+            },
+        ],
+    }
+    persist_football_side_tables(conn, writer, _match(payload), MATCH_ID)
+    (stats_count,) = conn.execute(
+        "SELECT COUNT(*) FROM football_stats WHERE match_id = ?", (MATCH_ID,)
+    ).fetchone()
+    assert stats_count == 0, "a bool team must not become a 'True' stats row"
+    (lineup_count,) = conn.execute(
+        "SELECT COUNT(*) FROM football_lineups WHERE match_id = ?", (MATCH_ID,)
+    ).fetchone()
+    assert lineup_count == 0, "bool team/athlete_id must not mint 'True'/'False' PK rows"

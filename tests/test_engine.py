@@ -1083,10 +1083,12 @@ def test_detail_none_identity_fields_fall_back_to_scoreboard_but_state_is_not_ba
     """A detail endpoint omitting IDENTITY fields (``None`` home/away/kickoff)
     must not wipe the scoreboard's values — ``seed_match`` would return
     ``None`` (events dropped) or stored kickoff would NULL out every poll.
-    Live-STATE fields are the opposite: at HT/FT a detail may legitimately
-    null ``minute``/``display_clock`` (and scores), so the scoreboard must NOT
-    backfill them — detail wins for those, including ``None`` — or stored
-    state keeps showing a stale live clock."""
+    Scores backfill too: they are cumulative facts a detail ``None`` must
+    never null (review finding: detail None scores wiped known scoreboard
+    scores outside the lagging branch). CLOCK fields are the opposite: at
+    HT/FT a detail may legitimately null ``minute``/``display_clock``, so the
+    scoreboard must NOT backfill them — detail wins for those, including
+    ``None`` — or stored state keeps showing a stale live clock."""
     from gamecollect.engine import CollectorEngine
 
     db = tmp_path / "engine.db"
@@ -1117,11 +1119,66 @@ def test_detail_none_identity_fields_fall_back_to_scoreboard_but_state_is_not_ba
     assert state["kickoff_utc"] == "2026-06-18T18:00:00Z", (
         "detail None must not wipe scoreboard kickoff_utc"
     )
-    # Live-state fields take the detail's None (no stale-clock backfill).
+    # Clock fields take the detail's None (no stale-clock backfill)...
     assert state["minute"] is None, "scoreboard minute must not backfill a detail None"
-    assert state["score_home"] is None and state["score_away"] is None, (
-        "scoreboard scores must not backfill detail Nones"
+    # ...but scores are cumulative facts: the scoreboard fills detail Nones.
+    assert state["score_home"] == 1 and state["score_away"] == 0, (
+        "a detail None score must not null the scoreboard's known score"
     )
+
+
+def test_detail_none_scores_keep_scoreboard_scores_in_every_merge_branch(tmp_path):
+    """Scores are cumulative facts, never legitimately cleared mid/post-match:
+    a detail snapshot with ``None`` scores must not null the scoreboard's
+    known scores on the equal-rank LIVE poll nor on the FINISHED transition
+    poll (review finding: the restore only ran in the lagging-detail branch).
+    Minute/display_clock stay detail-wins — legitimately nulled at HT/FT."""
+    from gamecollect.engine import CollectorEngine
+
+    db = tmp_path / "engine.db"
+    live_board = nm("m1", (), status=MatchStatus.IN_PLAY, minute=44, score_home=1, score_away=0)
+    live_detail = nm(
+        "m1",
+        (ev(0, "goal", minute=12),),
+        status=MatchStatus.IN_PLAY,  # equal rank: no lagging-branch restore
+        minute=45,
+        score_home=None,
+        score_away=None,
+    )
+    ft_board = nm("m1", (), status=MatchStatus.FINISHED, minute=None, score_home=2, score_away=0)
+    ft_detail = nm(
+        "m1",
+        (ev(0, "goal", minute=12), ev(1, "goal", minute=95, detail="Stoppage winner")),
+        status=MatchStatus.FINISHED,  # equal rank on the transition poll too
+        minute=None,
+        score_home=None,
+        score_away=None,
+    )
+    provider = ScriptedDetailProvider(
+        [
+            ([live_board], {"m1": live_detail}),
+            ([ft_board], {"m1": ft_detail}),
+        ]
+    )
+    engine = CollectorEngine(make_pack(provider), str(db), SOURCE, 0.01, provider=provider)
+    try:
+        engine.poll_once()
+        state = reader.get_state(read_db(db), qualified("m1"))
+        assert state["score_home"] == 1 and state["score_away"] == 0, (
+            "equal-rank live detail None scores must not null the scoreboard's scores"
+        )
+        assert state["minute"] == 45, "minute stays detail-wins"
+        engine.poll_once()
+    finally:
+        engine.close()
+
+    state = reader.get_state(read_db(db), qualified("m1"))
+    assert state["status"] == MatchStatus.FINISHED.value
+    assert state["score_home"] == 2 and state["score_away"] == 0, (
+        "FINISHED-transition detail None scores must not null the final scores"
+    )
+    assert state["minute"] is None, "detail None minute still wins at FT"
+    assert event_seqs(db, qualified("m1")) == [0, 1]
 
 
 @pytest.mark.parametrize("use_qualified_seed", [True, False], ids=["qualified-id", "bare-id"])
@@ -1262,6 +1319,168 @@ def test_transition_detail_failures_cap_then_accept_scoreboard_with_error(tmp_pa
     assert state is not None and state["status"] == MatchStatus.FINISHED.value, (
         "after the retry cap the scoreboard FINAL must be accepted, not wedged"
     )
+    assert event_seqs(db, qualified("m1")) == [0]
+    give_up_errors = [
+        r
+        for r in caplog.records
+        if r.levelno >= logging.ERROR and "giving up" in r.getMessage() and "m1" in r.getMessage()
+    ]
+    assert give_up_errors, "the capped give-up must be logged at ERROR"
+
+
+def test_live_match_vanishing_from_slate_gets_terminal_detail_hydration(tmp_path):
+    """A live match that simply vanishes from ``fetch_live_matches`` (never
+    showing a final status on the slate) must still be closed out: the engine
+    explicitly fetches its detail and processes it through the normal
+    diff/apply path, persisting the final status and the final-only events."""
+    from gamecollect.engine import CollectorEngine
+
+    db = tmp_path / "engine.db"
+    live_board = nm("m1", (), status=MatchStatus.IN_PLAY, minute=44)
+    live_detail = nm("m1", (ev(0, "goal", minute=44),), status=MatchStatus.IN_PLAY, minute=44)
+    ft_detail = nm(
+        "m1",
+        (ev(0, "goal", minute=44), ev(1, "goal", minute=95, detail="Stoppage winner")),
+        status=MatchStatus.FINISHED,
+        minute=None,
+        score_home=2,
+    )
+    provider = ScriptedDetailProvider(
+        [
+            ([live_board], {"m1": live_detail}),
+            # The match drops off the slate entirely; detail is still served.
+            ([], {"m1": ft_detail}),
+        ]
+    )
+    engine = CollectorEngine(make_pack(provider), str(db), SOURCE, 0.01, provider=provider)
+    try:
+        engine.poll_once()
+        engine.poll_once()
+    finally:
+        engine.close()
+
+    assert provider.detail_calls == ["m1", "m1"], "the vanished match must be detail-fetched"
+    assert event_seqs(db, qualified("m1")) == [0, 1], "final-only events must land"
+    state = reader.get_state(read_db(db), qualified("m1"))
+    assert state is not None and state["status"] == MatchStatus.FINISHED.value
+    assert state["score_home"] == 2
+
+
+def test_vanished_match_with_still_live_detail_stays_tracked_until_final(tmp_path, caplog):
+    """A scoreboard may drop a match EARLY while its detail endpoint still says
+    live: the match must stay on the tracked set and keep being re-fetched
+    until a terminal detail arrives."""
+    from gamecollect.engine import CollectorEngine
+
+    db = tmp_path / "engine.db"
+    live_board = nm("m1", (), status=MatchStatus.IN_PLAY, minute=44)
+    live_detail = nm("m1", (ev(0, "goal", minute=44),), status=MatchStatus.IN_PLAY, minute=44)
+    still_live_detail = nm("m1", (ev(0, "goal", minute=44),), status=MatchStatus.IN_PLAY, minute=88)
+    ft_detail = nm(
+        "m1",
+        (ev(0, "goal", minute=44), ev(1, "goal", minute=95, detail="Stoppage winner")),
+        status=MatchStatus.FINISHED,
+        minute=None,
+        score_home=2,
+    )
+    provider = ScriptedDetailProvider(
+        [
+            ([live_board], {"m1": live_detail}),
+            ([], {"m1": still_live_detail}),  # dropped early, still live
+            ([], {"m1": ft_detail}),
+        ]
+    )
+    engine = CollectorEngine(make_pack(provider), str(db), SOURCE, 0.01, provider=provider)
+    with caplog.at_level(logging.DEBUG):
+        try:
+            engine.poll_once()
+            engine.poll_once()
+            engine.poll_once()
+        finally:
+            engine.close()
+
+    assert provider.detail_calls == ["m1", "m1", "m1"], (
+        "a still-live vanished match must stay tracked and be re-fetched"
+    )
+    assert event_seqs(db, qualified("m1")) == [0, 1]
+    state = reader.get_state(read_db(db), qualified("m1"))
+    assert state is not None and state["status"] == MatchStatus.FINISHED.value
+
+
+def test_vanished_match_detail_failures_cap_gives_up_loudly_persisting_best_known(tmp_path, caplog):
+    """A vanished live match whose detail fetch fails the full retry cap must
+    not be left IN_PLAY silently: the engine gives up with an ERROR and
+    persists the best-known terminal state (the live baseline force-closed to
+    FINISHED when no final snapshot was ever seen)."""
+    from gamecollect.engine import _MAX_TRANSITION_DETAIL_FAILURES, CollectorEngine
+
+    db = tmp_path / "engine.db"
+    live_board = nm("m1", (), status=MatchStatus.IN_PLAY, minute=44)
+    live_detail = nm("m1", (ev(0, "goal", minute=44),), status=MatchStatus.IN_PLAY, minute=44)
+    failing_polls = [
+        ([], {"m1": ProviderUnavailableError(f"summary 404 #{i}")})
+        for i in range(_MAX_TRANSITION_DETAIL_FAILURES)
+    ]
+    provider = ScriptedDetailProvider([([live_board], {"m1": live_detail}), *failing_polls])
+    engine = CollectorEngine(make_pack(provider), str(db), SOURCE, 0.01, provider=provider)
+    with caplog.at_level(logging.DEBUG):
+        try:
+            for _ in range(1 + _MAX_TRANSITION_DETAIL_FAILURES):
+                engine.poll_once()
+        finally:
+            engine.close()
+
+    state = reader.get_state(read_db(db), qualified("m1"))
+    assert state is not None and state["status"] == MatchStatus.FINISHED.value, (
+        "at the failure cap the best-known terminal state must be persisted, "
+        "not a row left IN_PLAY forever"
+    )
+    assert event_seqs(db, qualified("m1")) == [0], "events collected while live survive"
+    give_up_errors = [
+        r
+        for r in caplog.records
+        if r.levelno >= logging.ERROR and "giving up" in r.getMessage() and "m1" in r.getMessage()
+    ]
+    assert give_up_errors, "the vanished-match give-up must be logged at ERROR"
+
+
+def test_mid_transition_retry_slate_drop_still_ends_finished(tmp_path, caplog):
+    """The earlier confirmed variant: a live→final transition poll whose detail
+    fails is skipped (live baseline kept, counter=1); if the match then drops
+    off the slate before the retries land, the retry state must NOT be erased
+    by slate cleanup — the vanished-match path keeps counting, and at the cap
+    the sparse final scoreboard snapshot captured on the transition poll is
+    persisted, so the row ends FINISHED instead of IN_PLAY forever."""
+    from gamecollect.engine import _MAX_TRANSITION_DETAIL_FAILURES, CollectorEngine
+
+    db = tmp_path / "engine.db"
+    live_board = nm("m1", (), status=MatchStatus.IN_PLAY, minute=44)
+    live_detail = nm("m1", (ev(0, "goal", minute=44),), status=MatchStatus.IN_PLAY, minute=44)
+    ft_board = nm("m1", (), status=MatchStatus.FINISHED, minute=None, score_home=2)
+    polls = [
+        ([live_board], {"m1": live_detail}),
+        # Transition poll: FT on the slate, detail fails → skip + counter=1.
+        ([ft_board], {"m1": ProviderUnavailableError("summary 503 at the whistle")}),
+    ]
+    # The match then vanishes; detail keeps failing until the cap.
+    polls += [
+        ([], {"m1": ProviderUnavailableError(f"summary 404 #{i}")})
+        for i in range(_MAX_TRANSITION_DETAIL_FAILURES - 1)
+    ]
+    provider = ScriptedDetailProvider(polls)
+    engine = CollectorEngine(make_pack(provider), str(db), SOURCE, 0.01, provider=provider)
+    with caplog.at_level(logging.DEBUG):
+        try:
+            for _ in range(len(polls)):
+                engine.poll_once()
+        finally:
+            engine.close()
+
+    state = reader.get_state(read_db(db), qualified("m1"))
+    assert state is not None and state["status"] == MatchStatus.FINISHED.value, (
+        "the sparse final snapshot captured mid-retry must be persisted at the cap"
+    )
+    assert state["score_home"] == 2, "the captured final scoreboard score must land"
     assert event_seqs(db, qualified("m1")) == [0]
     give_up_errors = [
         r

@@ -479,9 +479,11 @@ def _adopt_stub_rows(
     seeded from the schedule). If BOTH rows carry events, interleaving two
     timelines could corrupt both, so nothing is migrated, an ERROR is logged
     on every adoption attempt, and the caller keeps collecting on the stub
-    (and must repoint ``provider_match_map`` at the stub — see
-    :func:`seed_or_reconcile_match`). Partition discipline: only rows under
-    *source* are touched.
+    (and must DELETE the ``provider_match_map`` entry — never cache the
+    qualified stub id — so the next poll re-resolves and re-attempts
+    adoption; see :func:`seed_or_reconcile_match`). Adoption therefore heals
+    automatically once the operator clears the canonical row's conflicting
+    events. Partition discipline: only rows under *source* are touched.
 
     Returns ``True`` when the stub is gone (migrated or never existed),
     ``False`` on the both-have-events conflict.
@@ -602,14 +604,23 @@ def seed_or_reconcile_match(
         # Split-brain guard: resolver path (c) has already cached
         # provider → canonical in provider_match_map, but collection is
         # staying on the stub — a map-following reader would see a frozen
-        # canonical timeline while live history lands on the stub. Repoint
-        # the mapping at the stub (map_provider_match upserts on conflict,
-        # and the stub row is seeded/source-owned, satisfying its
-        # precondition) so subsequent resolves hit the stub via the (a)
-        # cache and mapping/collection cannot diverge again while the
-        # conflict persists. The split history still needs MANUAL repair;
-        # deleting the map entry retries adoption (and re-logs the ERROR).
-        writer.map_provider_match(provider, match.match_id, stub_id)
+        # canonical timeline while live history lands on the stub. Do NOT
+        # repoint the mapping at the stub either: qualified ids are never
+        # cached (the resolver's own rule), and a cached stub id would make
+        # path (a) return the stub forever — adoption never re-attempted,
+        # the documented per-attempt ERROR fired only once, and healing
+        # (the operator clearing the canonical row's conflicting events)
+        # never picked up. Instead DELETE the mapping so no wrong entry
+        # exists for readers and return the stub id UNCACHED: the next poll
+        # re-resolves via (c) (one indexed lookup + kickoff-window scan),
+        # re-attempts adoption, re-logs the ERROR while the conflict
+        # persists, and adoption succeeds automatically once it is safe.
+        with conn:
+            conn.execute(
+                "DELETE FROM provider_match_map "
+                "WHERE source = ? AND provider = ? AND provider_match_id = ?",
+                (writer.source, provider, match.match_id),
+            )
         return register_unreconciled_match(conn, writer, match)
 
     payload = reader.get_stored_payload(conn, canonical_id)

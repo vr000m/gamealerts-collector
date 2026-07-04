@@ -106,6 +106,22 @@ def _to_text(value: object) -> str | None:
     return None
 
 
+def _to_key_text(value: object) -> str | None:
+    """Coerce an identifier scalar (PK component) to its canonical TEXT key.
+
+    Bools are rejected outright (checked BEFORE the numeric coercion — ``bool``
+    is an ``int`` subclass, and ``str(True)`` would mint a bogus ``"True"``
+    team/athlete key); an integral float canonicalizes to its int string (a
+    JSON payload spelling the same athlete as ``760421.0`` and ``"760421"``
+    must collapse to ONE primary-key row, not duplicate the player). Anything
+    else follows :func:`_to_text`."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return _to_text(value)
+
+
 _STATS_COLUMNS = (
     "source, match_id, team, possession, shots, shots_on_target, "
     "corners, fouls, yellow_cards, red_cards, offsides"
@@ -124,12 +140,14 @@ def _stats_rows(
 
     Keyed by the table's PRIMARY KEY so a duplicate team entry within one
     payload collapses last-wins (the old ON CONFLICT semantics). Non-scalar
-    values are coerced to ``None`` rather than passed to sqlite."""
+    values are coerced to ``None`` rather than passed to sqlite; the ``team``
+    PK component goes through :func:`_to_key_text` (bool rejected, integral
+    float canonicalized) so numeric spellings cannot mint duplicate keys."""
     rows: dict[tuple[str, str, str], tuple] = {}
     for row in stats:
         if not isinstance(row, dict):
             continue
-        team = _to_text(row.get("team"))
+        team = _to_key_text(row.get("team"))
         if not team:
             continue
         rows[(source, seeded_match_id, team)] = (
@@ -154,12 +172,15 @@ def _lineup_rows(
     """Project the payload ``lineups`` section onto football_lineups row tuples.
 
     Keyed by the table's PRIMARY KEY (last-wins on duplicates, mirroring the
-    old ON CONFLICT semantics); non-scalar values coerce to ``None``."""
+    old ON CONFLICT semantics); non-scalar values coerce to ``None``. The
+    ``team``/``athlete_id`` PK components go through :func:`_to_key_text`
+    (bool rejected, integral float canonicalized) so ``760421.0`` and
+    ``"760421"`` collapse to one player row instead of duplicating it."""
     rows: dict[tuple[str, str, str, str], tuple] = {}
     for lineup in lineups:
         if not isinstance(lineup, dict):
             continue
-        team = _to_text(lineup.get("team"))
+        team = _to_key_text(lineup.get("team"))
         if not team:
             continue
         players = lineup.get("players") or []
@@ -168,7 +189,7 @@ def _lineup_rows(
         for player in players:
             if not isinstance(player, dict):
                 continue
-            athlete_id = _to_text(player.get("athlete_id"))
+            athlete_id = _to_key_text(player.get("athlete_id"))
             display_name = _to_text(player.get("display_name"))
             if not athlete_id or not display_name:
                 continue
