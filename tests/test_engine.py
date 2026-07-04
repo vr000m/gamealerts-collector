@@ -1077,11 +1077,16 @@ def test_one_match_detail_failure_does_not_stop_siblings(tmp_path, caplog, error
     assert failure_logs, "a failed detail fetch must be logged at the documented level"
 
 
-def test_detail_none_top_level_fields_fall_back_to_scoreboard(tmp_path):
-    """A detail endpoint omitting top-level fields (``None``) must not wipe the
-    scoreboard's values: identity fields (home/away/kickoff) missing from the
-    detail would otherwise make ``seed_match`` return ``None`` (events dropped)
-    or NULL out stored kickoff/score/minute every poll."""
+def test_detail_none_identity_fields_fall_back_to_scoreboard_but_state_is_not_backfilled(
+    tmp_path,
+):
+    """A detail endpoint omitting IDENTITY fields (``None`` home/away/kickoff)
+    must not wipe the scoreboard's values — ``seed_match`` would return
+    ``None`` (events dropped) or stored kickoff would NULL out every poll.
+    Live-STATE fields are the opposite: at HT/FT a detail may legitimately
+    null ``minute``/``display_clock`` (and scores), so the scoreboard must NOT
+    backfill them — detail wins for those, including ``None`` — or stored
+    state keeps showing a stale live clock."""
     from gamecollect.engine import CollectorEngine
 
     db = tmp_path / "engine.db"
@@ -1112,8 +1117,242 @@ def test_detail_none_top_level_fields_fall_back_to_scoreboard(tmp_path):
     assert state["kickoff_utc"] == "2026-06-18T18:00:00Z", (
         "detail None must not wipe scoreboard kickoff_utc"
     )
-    assert state["score_home"] == 1 and state["score_away"] == 0
-    assert state["minute"] == 10
+    # Live-state fields take the detail's None (no stale-clock backfill).
+    assert state["minute"] is None, "scoreboard minute must not backfill a detail None"
+    assert state["score_home"] is None and state["score_away"] is None, (
+        "scoreboard scores must not backfill detail Nones"
+    )
+
+
+@pytest.mark.parametrize("use_qualified_seed", [True, False], ids=["qualified-id", "bare-id"])
+def test_restart_hydrates_final_when_stored_row_was_live(tmp_path, use_qualified_seed):
+    """A daemon restart between the last live poll and the final poll empties
+    the in-memory baseline, but the stored ``matches`` row still says live —
+    the live→final transition is detectable from storage. The fresh engine
+    must consult it and hydrate the transition poll's sparse final scoreboard
+    snapshot, or stoppage-time events are permanently lost. Covered for both
+    stored-id forms core knows: the source-qualified unreconciled id and the
+    bare provider id (``default_seed_match``)."""
+    from gamecollect.engine import CollectorEngine
+    from gamecollect.packs.spec import default_seed_match
+
+    db = tmp_path / "engine.db"
+    seed = _seed_match if use_qualified_seed else default_seed_match
+    sid = qualified("m1") if use_qualified_seed else "m1"
+
+    live_board = nm("m1", (), status=MatchStatus.IN_PLAY, minute=44)
+    live_detail = nm("m1", (ev(0, "goal", minute=44),), status=MatchStatus.IN_PLAY, minute=44)
+    p1 = ScriptedDetailProvider([([live_board], {"m1": live_detail})])
+    e1 = CollectorEngine(make_pack(p1, seed_match=seed), str(db), SOURCE, 0.01, provider=p1)
+    try:
+        e1.poll_once()
+    finally:
+        e1.close()
+    state = reader.get_state(read_db(db), sid)
+    assert state is not None and state["status"] == MatchStatus.IN_PLAY.value
+
+    # Restart: a FRESH engine (empty self._last) sees the FT slate directly.
+    ft_board = nm("m1", (), status=MatchStatus.FINISHED, minute=90, score_home=2)
+    ft_detail = nm(
+        "m1",
+        (ev(0, "goal", minute=44), ev(1, "goal", minute=95, detail="Stoppage winner")),
+        status=MatchStatus.FINISHED,
+        minute=90,
+        score_home=2,
+    )
+    p2 = ScriptedDetailProvider([([ft_board], {"m1": ft_detail})])
+    e2 = CollectorEngine(make_pack(p2, seed_match=seed), str(db), SOURCE, 0.01, provider=p2)
+    try:
+        e2.poll_once()
+    finally:
+        e2.close()
+
+    assert p2.detail_calls == ["m1"], "restart must not skip live→final detail hydration"
+    # The stoppage-time event landed and the row closed out.
+    assert event_seqs(db, sid) == [0, 1]
+    state = reader.get_state(read_db(db), sid)
+    assert state is not None and state["status"] == MatchStatus.FINISHED.value
+
+
+def test_transient_detail_failure_on_transition_poll_is_retried_next_poll(tmp_path, caplog):
+    """A detail fetch that fails once on the exact live→final poll must not
+    baseline the sparse final scoreboard snapshot (``events=[]``) — that would
+    make every later poll see previous=FINISHED and never hydrate again,
+    silently losing the stoppage-time events. The engine skips the match that
+    poll (live baseline kept, stored row untouched) and retries the final
+    hydration on the next poll."""
+    from gamecollect.engine import CollectorEngine
+
+    db = tmp_path / "engine.db"
+    live_board = nm("m1", (), status=MatchStatus.IN_PLAY, minute=44)
+    live_detail = nm("m1", (ev(0, "goal", minute=44),), status=MatchStatus.IN_PLAY, minute=44)
+    ft_board = nm("m1", (), status=MatchStatus.FINISHED, minute=90, score_home=2)
+    ft_detail = nm(
+        "m1",
+        (ev(0, "goal", minute=44), ev(1, "goal", minute=95, detail="Stoppage winner")),
+        status=MatchStatus.FINISHED,
+        minute=90,
+        score_home=2,
+    )
+    provider = ScriptedDetailProvider(
+        [
+            ([live_board], {"m1": live_detail}),
+            # The transition poll's detail fetch fails transiently.
+            ([ft_board], {"m1": ProviderUnavailableError("summary 503 at the whistle")}),
+            ([ft_board], {"m1": ft_detail}),
+        ]
+    )
+    engine = CollectorEngine(make_pack(provider), str(db), SOURCE, 0.01, provider=provider)
+    with caplog.at_level(logging.DEBUG):
+        try:
+            engine.poll_once()
+            engine.poll_once()
+            # The failed transition poll must NOT have written the sparse
+            # FINAL snapshot: the stored row still says live, so the
+            # hydration window is still open.
+            state = reader.get_state(read_db(db), qualified("m1"))
+            assert state is not None and state["status"] == MatchStatus.IN_PLAY.value, (
+                "a failed transition-detail poll must not baseline the sparse final snapshot"
+            )
+            engine.poll_once()
+        finally:
+            engine.close()
+
+    # The retry hydrated: stoppage event landed, row closed out.
+    assert provider.detail_calls == ["m1", "m1", "m1"]
+    assert event_seqs(db, qualified("m1")) == [0, 1]
+    state = reader.get_state(read_db(db), qualified("m1"))
+    assert state is not None and state["status"] == MatchStatus.FINISHED.value
+    retry_logs = [
+        r
+        for r in caplog.records
+        if "retried next poll" in r.getMessage() and "m1" in r.getMessage()
+    ]
+    assert retry_logs, "the transition skip-and-retry must be logged"
+
+
+def test_transition_detail_failures_cap_then_accept_scoreboard_with_error(tmp_path, caplog):
+    """A detail endpoint that permanently fails post-FT (e.g. a 404ing summary)
+    must not wedge the match on the slate forever: after
+    ``_MAX_TRANSITION_DETAIL_FAILURES`` consecutive transition-poll failures
+    the engine gives up loudly (ERROR) and accepts the scoreboard snapshot, so
+    the row still closes out as FINISHED."""
+    from gamecollect.engine import _MAX_TRANSITION_DETAIL_FAILURES, CollectorEngine
+
+    db = tmp_path / "engine.db"
+    live_board = nm("m1", (), status=MatchStatus.IN_PLAY, minute=44)
+    live_detail = nm("m1", (ev(0, "goal", minute=44),), status=MatchStatus.IN_PLAY, minute=44)
+    ft_board = nm("m1", (), status=MatchStatus.FINISHED, minute=90, score_home=2)
+    failing_polls = [
+        ([ft_board], {"m1": ProviderUnavailableError(f"summary 404 #{i}")})
+        for i in range(_MAX_TRANSITION_DETAIL_FAILURES)
+    ]
+    provider = ScriptedDetailProvider([([live_board], {"m1": live_detail}), *failing_polls])
+    engine = CollectorEngine(make_pack(provider), str(db), SOURCE, 0.01, provider=provider)
+    with caplog.at_level(logging.DEBUG):
+        try:
+            for _ in range(1 + _MAX_TRANSITION_DETAIL_FAILURES):
+                engine.poll_once()
+        finally:
+            engine.close()
+
+    # Capped out: the scoreboard snapshot was accepted — the row closed out
+    # FINISHED with only the events collected while live.
+    state = reader.get_state(read_db(db), qualified("m1"))
+    assert state is not None and state["status"] == MatchStatus.FINISHED.value, (
+        "after the retry cap the scoreboard FINAL must be accepted, not wedged"
+    )
+    assert event_seqs(db, qualified("m1")) == [0]
+    give_up_errors = [
+        r
+        for r in caplog.records
+        if r.levelno >= logging.ERROR and "giving up" in r.getMessage() and "m1" in r.getMessage()
+    ]
+    assert give_up_errors, "the capped give-up must be logged at ERROR"
+
+
+def test_lagging_detail_live_status_does_not_regress_scoreboard_final(tmp_path):
+    """On the transition poll a cached/lagging detail endpoint may still say
+    IN_PLAY while the scoreboard already says FINISHED. Status is forward-only
+    in the merge: the detail's events are taken (the point of hydrating), but
+    its stale live status/minute must not overwrite the scoreboard's FINAL —
+    if the match then drops off the slate, the DB would stay in-progress
+    forever."""
+    from gamecollect.engine import CollectorEngine
+
+    db = tmp_path / "engine.db"
+    live_board = nm("m1", (), status=MatchStatus.IN_PLAY, minute=44)
+    live_detail = nm("m1", (ev(0, "goal", minute=44),), status=MatchStatus.IN_PLAY, minute=44)
+    ft_board = nm(
+        "m1", (), status=MatchStatus.FINISHED, minute=None, display_clock="FT", score_home=2
+    )
+    lagging_detail = nm(
+        "m1",
+        (ev(0, "goal", minute=44), ev(1, "goal", minute=95, detail="Stoppage winner")),
+        status=MatchStatus.IN_PLAY,  # cached: still live
+        minute=88,
+        display_clock="88'",
+        score_home=1,
+    )
+    provider = ScriptedDetailProvider(
+        [
+            ([live_board], {"m1": live_detail}),
+            ([ft_board], {"m1": lagging_detail}),
+        ]
+    )
+    engine = CollectorEngine(make_pack(provider), str(db), SOURCE, 0.01, provider=provider)
+    try:
+        engine.poll_once()
+        engine.poll_once()
+    finally:
+        engine.close()
+
+    # Detail's events landed...
+    assert event_seqs(db, qualified("m1")) == [0, 1]
+    # ...but the scoreboard's FINAL and clock progression won the merge.
+    state = reader.get_state(read_db(db), qualified("m1"))
+    assert state is not None
+    assert state["status"] == MatchStatus.FINISHED.value, (
+        "a lagging detail's live status must never regress the scoreboard's FINAL"
+    )
+    assert state["minute"] is None, "the lagging detail's stale live minute must not persist"
+    assert state["score_home"] == 2, "the scoreboard's final score wins over the lagging detail"
+
+
+def test_duplicate_seq_within_one_drift_snapshot_is_warned_not_retro_error(tmp_path, caplog):
+    """A snapshot carrying the same beyond-head seq TWICE fails batched
+    ``append_events`` (not strictly increasing) and reconciles per-row: the
+    first copy lands, and the second must be classified as a
+    duplicate-in-snapshot (WARN) — not as a 'retroactive insertion below the
+    stored head' ERROR, which it structurally is not."""
+    db = tmp_path / "engine.db"
+    p1 = nm("m1", (ev(0, "goal"), ev(1, "yellow", detail="Booking")))
+    new_event = ev(2, "goal", minute=50, detail="Second goal")
+    p2 = nm("m1", (ev(0, "goal"), ev(1, "yellow", detail="Booking"), new_event, new_event))
+    provider = ScriptedProvider([[p1], [p2]])
+    with caplog.at_level(logging.DEBUG):
+        run_engine(_engine(make_pack(provider), db), provider)
+
+    # The new seq landed exactly once; nothing else was disturbed.
+    assert event_seqs(db, qualified("m1")) == [0, 1, 2]
+    dup_warnings = [
+        r
+        for r in caplog.records
+        if r.levelno == logging.WARNING
+        and "duplicate" in r.getMessage()
+        and "seq 2" in r.getMessage()
+    ]
+    assert dup_warnings, "an in-snapshot duplicate must be logged as a WARN duplicate"
+    retro_errors = [
+        r
+        for r in caplog.records
+        if r.levelno >= logging.ERROR
+        and "retroactive" in r.getMessage()
+        and "seq 2" in r.getMessage()
+    ]
+    assert not retro_errors, (
+        "an in-snapshot duplicate must NOT be misclassified as a retroactive insertion"
+    )
 
 
 # --------------------------------------------------------------------------- #

@@ -57,8 +57,10 @@ from gamecollect.diffing import MatchDiff, diff_matches
 from gamecollect.fixture_io import fixture_stem, write_fixture
 from gamecollect.packs.spec import SportPack
 from gamecollect.provider import (
+    LIVE_STATUS_VALUES,
     LIVE_STATUSES,
     MatchDataProvider,
+    MatchStatus,
     NormalizedEvent,
     NormalizedMatch,
     ProviderUnavailableError,
@@ -73,6 +75,11 @@ log = logging.getLogger(__name__)
 _MAX_BACKOFF_MULTIPLIER = 8
 # Healthy-poll jitter as a fraction of poll_interval (± this).
 _JITTER_FRACTION = 0.20
+# Consecutive detail-fetch failures tolerated on a live→final transition poll
+# before the engine gives up retrying and accepts the sparse scoreboard
+# snapshot (a provider whose detail endpoint permanently 404s post-FT must not
+# wedge the match on the slate forever).
+_MAX_TRANSITION_DETAIL_FAILURES = 3
 
 
 def _event_to_row(event: NormalizedEvent) -> dict[str, Any]:
@@ -101,30 +108,50 @@ def _event_to_row(event: NormalizedEvent) -> dict[str, Any]:
     return row
 
 
-# NormalizedMatch top-level fields where ``None`` means "not provided" (identity
-# and timing/state fields optional on partial snapshots). A detail endpoint that
-# omits one must not wipe the scoreboard's value: detail wins where it has a
-# value; the scoreboard fills detail's Nones. ``status`` is a non-optional enum
-# and ``events``/``payload`` merge separately, so they are not listed.
+# NormalizedMatch identity fields where ``None`` unambiguously means "not
+# provided". A detail endpoint that omits one must not wipe the scoreboard's
+# value: detail wins where it has a value; the scoreboard fills detail's Nones.
+# Live-state fields (``minute``/``display_clock``/``score_home``/``score_away``)
+# are deliberately NOT filled: at HT/FT a detail endpoint may legitimately null
+# the clock, and backfilling would freeze a stale live minute in stored state —
+# detail wins for those, including ``None``. ``status`` is a non-optional enum
+# (merged with the forward-only rule below) and ``events``/``payload`` merge
+# separately, so they are not listed.
 _MERGE_FILL_FIELDS = (
     "home_team",
     "away_team",
     "kickoff_utc",
-    "minute",
-    "score_home",
-    "score_away",
-    "display_clock",
 )
+
+# Lifecycle rank for the merge's forward-only status rule: when scoreboard and
+# detail describe the SAME poll, status may only move forward — a cached or
+# lagging detail endpoint still saying live must never regress the scoreboard's
+# FINISHED (the match may drop off the slate right after, leaving the DB
+# in-progress forever). IN_PLAY/PAUSED share a rank (either direction is a
+# legal live oscillation, detail wins); UNKNOWN never beats a known status.
+_STATUS_RANK: dict[MatchStatus, int] = {
+    MatchStatus.UNKNOWN: -1,
+    MatchStatus.SCHEDULED: 0,
+    MatchStatus.IN_PLAY: 1,
+    MatchStatus.PAUSED: 1,
+    MatchStatus.FINISHED: 2,
+}
 
 
 def _merge_detail(scoreboard: NormalizedMatch, detail: NormalizedMatch) -> NormalizedMatch:
     """Merge a detail snapshot over its scoreboard snapshot, field by field.
 
-    Payload keys merge with detail winning; top-level fields take the detail
+    Payload keys merge with detail winning; identity fields take the detail
     value unless it is ``None``, in which case the scoreboard value fills it —
     a detail endpoint omitting ``kickoff_utc``/``home_team``/``away_team``
-    must not wipe stored identity/timing to NULL (or make ``seed_match``
-    return ``None`` and drop the poll's events).
+    must not wipe stored identity to NULL (or make ``seed_match`` return
+    ``None`` and drop the poll's events).
+
+    Status is forward-only (see ``_STATUS_RANK``): when the detail's status
+    lags BEHIND the scoreboard's, the scoreboard's status wins, and so do its
+    ``minute``/``display_clock`` (a lagging detail's clock is stale live state
+    by definition) and its non-``None`` scores. The detail's events/payload
+    are still taken — that is the whole point of hydrating the transition poll.
     """
     payload = dict(scoreboard.payload)
     payload.update(detail.payload)
@@ -133,7 +160,19 @@ def _merge_detail(scoreboard: NormalizedMatch, detail: NormalizedMatch) -> Norma
         for name in _MERGE_FILL_FIELDS
         if getattr(detail, name) is None
     }
-    return replace(detail, payload=payload, **fills)
+    merged = replace(detail, payload=payload, **fills)
+    if _STATUS_RANK[detail.status] < _STATUS_RANK[scoreboard.status]:
+        overrides: dict[str, Any] = {
+            "status": scoreboard.status,
+            "minute": scoreboard.minute,
+            "display_clock": scoreboard.display_clock,
+        }
+        for name in ("score_home", "score_away"):
+            value = getattr(scoreboard, name)
+            if value is not None:
+                overrides[name] = value
+        merged = replace(merged, **overrides)
+    return merged
 
 
 class CollectorEngine:
@@ -203,6 +242,10 @@ class CollectorEngine:
         # Last-written provider snapshot per provider-native match_id (the diff
         # baseline) and, when recording, the merged fixture accumulator.
         self._last: dict[str, NormalizedMatch] = {}
+        # Consecutive live→final transition detail-fetch failures per
+        # provider-native match id: a transient failure on the exact transition
+        # poll must be retried, not baselined away (see _fetch_poll_snapshots).
+        self._transition_detail_failures: dict[str, int] = {}
         self._record: dict[str, _RecordedMatch] = {}
         self._record_flush_failed = False
         self._backoff_multiplier = 1
@@ -400,7 +443,10 @@ class CollectorEngine:
           loud-but-alive, not silently swallowed.
         * seq strictly beyond the stored head — appended one row at a time in
           ascending order, so the writer's strictly-increasing invariant holds
-          for every insert it performs.
+          for every insert it performs. Appended seqs join the stored set, so
+          a seq the SAME snapshot carries twice is classified as a
+          duplicate-in-snapshot (WARN, second copy never written), not as a
+          retroactive insertion.
 
         Other writer rejections stay fatal to the poll for this match (they
         propagate to ``poll_once``'s per-match isolation). Returns the events
@@ -408,9 +454,24 @@ class CollectorEngine:
         """
         stored_seqs = {event.seq for event in self._stored_events(seeded_id)}
         head = max(stored_seqs) if stored_seqs else None
+        appended_this_batch: set[int] = set()
         for row in rows:
             seq = row.get("seq")
             if head is not None and isinstance(seq, int) and seq <= head:
+                if seq in appended_this_batch:
+                    # The SAME snapshot carried this seq twice and the first
+                    # copy was just appended: a duplicate-in-snapshot, not a
+                    # retroactive insertion below a pre-existing head. Never
+                    # written twice; WARN, not ERROR.
+                    log.warning(
+                        "duplicate seq %s within one snapshot for match %s on "
+                        "source %s: first copy appended this poll, duplicate "
+                        "NOT written",
+                        seq,
+                        provider_match_id,
+                        self._source,
+                    )
+                    continue
                 if seq in stored_seqs:
                     try:
                         self._writer.append_events(seeded_id, [row])
@@ -449,6 +510,8 @@ class CollectorEngine:
                 continue
             if isinstance(seq, int):
                 head = seq if head is None else max(head, seq)
+                stored_seqs.add(seq)
+                appended_this_batch.add(seq)
         return self._stored_events(seeded_id)
 
     def _stored_events(self, seeded_id: str) -> list[NormalizedEvent]:
@@ -494,47 +557,116 @@ class CollectorEngine:
         A match whose PREVIOUS baseline was live is also hydrated even when the
         fresh status is not: the transition poll's final scoreboard snapshot
         carries ``events=[]`` (the documented ESPN shape), so skipping detail
-        there would permanently lose stoppage-time events.
+        there would permanently lose stoppage-time events. The live baseline
+        may also live only in STORAGE: after a daemon restart ``self._last``
+        is empty, so a non-live slate match with no in-memory baseline
+        consults the stored ``matches`` row — a stored live status means the
+        live→final transition happened across the restart and the match is
+        hydrated all the same.
 
         One match's failed detail fetch must not abort the slate: it is logged
         (WARNING for unavailability, ERROR for shape drift) and that match
         falls back to its scoreboard snapshot while the others proceed —
-        per-match isolation. Slate-level errors from ``fetch_live_matches``
+        per-match isolation. EXCEPT on a live→final transition poll: there the
+        sparse fallback snapshot would become the final baseline and the
+        detail would never be re-fetched, so the match is skipped this poll
+        (live baseline kept) and the hydration retried while the match stays
+        on the slate — up to ``_MAX_TRANSITION_DETAIL_FAILURES`` consecutive
+        failures, after which the engine logs an ERROR and accepts the
+        scoreboard snapshot (a permanently-404ing post-FT detail endpoint must
+        not wedge the slate). Slate-level errors from ``fetch_live_matches``
         still propagate to the loop's backoff.
         """
         matches = self._provider.fetch_live_matches()
+        # A match gone from the slate has nothing left to retry; drop its
+        # transition-failure counter so the dict cannot grow unboundedly.
+        slate_ids = {m.match_id for m in matches}
+        for match_id in [m for m in self._transition_detail_failures if m not in slate_ids]:
+            del self._transition_detail_failures[match_id]
         hydrated: list[NormalizedMatch] = []
         for match in matches:
             previous = self._last.get(match.match_id)
             was_live = previous is not None and previous.status in LIVE_STATUSES
+            if previous is None and match.status not in LIVE_STATUSES:
+                # No in-memory baseline (typically the first poll after a
+                # restart): the transition may have happened while we were
+                # down — the stored row still says live. Cheap: fires only
+                # until the match is first baselined.
+                was_live = self._stored_status_is_live(match.match_id)
             if match.status not in LIVE_STATUSES and not was_live:
                 hydrated.append(match)
                 continue
+            in_transition = was_live and match.status not in LIVE_STATUSES
             try:
                 detail = self._provider.fetch_match_detail(match.match_id)
-            except ProviderUnavailableError as exc:
-                log.warning(
-                    "detail fetch unavailable for match %s on source %s: %s "
-                    "(falling back to scoreboard snapshot; other matches proceed)",
-                    match.match_id,
-                    self._source,
-                    exc,
-                )
+            except (ProviderUnavailableError, ShapeDriftError) as exc:
+                if isinstance(exc, ShapeDriftError):
+                    log.error(
+                        "detail shape drift for match %s on source %s: %s",
+                        match.match_id,
+                        self._source,
+                        exc,
+                        exc_info=True,
+                    )
+                else:
+                    log.warning(
+                        "detail fetch unavailable for match %s on source %s: %s",
+                        match.match_id,
+                        self._source,
+                        exc,
+                    )
+                if in_transition:
+                    failures = self._transition_detail_failures.get(match.match_id, 0) + 1
+                    if failures < _MAX_TRANSITION_DETAIL_FAILURES:
+                        self._transition_detail_failures[match.match_id] = failures
+                        log.warning(
+                            "final-detail fetch failed on live→final transition for "
+                            "match %s on source %s (attempt %d/%d): skipping match "
+                            "this poll, keeping live baseline; hydration retried "
+                            "next poll",
+                            match.match_id,
+                            self._source,
+                            failures,
+                            _MAX_TRANSITION_DETAIL_FAILURES,
+                        )
+                        continue
+                    del self._transition_detail_failures[match.match_id]
+                    log.error(
+                        "final-detail fetch failed %d consecutive times on "
+                        "live→final transition for match %s on source %s: giving "
+                        "up and accepting the sparse scoreboard snapshot — "
+                        "final-whistle events may be lost",
+                        failures,
+                        match.match_id,
+                        self._source,
+                    )
                 hydrated.append(match)
                 continue
-            except ShapeDriftError as exc:
-                log.error(
-                    "detail shape drift for match %s on source %s: %s "
-                    "(falling back to scoreboard snapshot; other matches proceed)",
-                    match.match_id,
-                    self._source,
-                    exc,
-                    exc_info=True,
-                )
-                hydrated.append(match)
-                continue
+            self._transition_detail_failures.pop(match.match_id, None)
             hydrated.append(_merge_detail(match, detail))
         return hydrated
+
+    def _stored_status_is_live(self, provider_match_id: str) -> bool:
+        """True when the stored ``matches`` row for this match is still live.
+
+        Consulted only for a non-live slate match with no in-memory diff
+        baseline (a restart gap). The row is looked up under this source by
+        BOTH id forms core can know about: the provider-native id (the
+        ``default_seed_match`` shape) and the source-qualified
+        ``f"{source}:{id}"`` unreconciled form (the reader-contract shape
+        packs write for unreconciled live matches). A pack that reconciles
+        provider ids to canonical ids it alone can map is out of core's
+        reach — such matches fall back to no hydration, same as pre-fix.
+        """
+        rows = self._conn.execute(
+            "SELECT status FROM matches WHERE source = ? AND match_id IN (?, ?)",
+            (
+                self._source,
+                provider_match_id,
+                f"{self._source}:{provider_match_id}",
+            ),
+        ).fetchall()
+        return any(status in LIVE_STATUS_VALUES for (status,) in rows)
 
     def stop(self) -> None:
         """Signal the loop to finish its current iteration and shut down."""
