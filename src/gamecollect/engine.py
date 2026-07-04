@@ -86,6 +86,12 @@ _MAX_TRANSITION_DETAIL_FAILURES = 3
 # a detail endpoint that never turns terminal must not be re-fetched and
 # WARNed about every poll forever.
 _MAX_TRANSITION_TOTAL_ATTEMPTS = 10
+# Give-up snapshot emissions tolerated before the tracker is abandoned: an
+# UNPERSISTABLE give-up snapshot (e.g. ``seed_match`` returns ``None`` on
+# missing identity, so ``_apply`` returns ``None`` every poll) must not
+# re-emit forever. After this many emissions whose apply never landed, ONE
+# final ERROR is logged and the tracker is dropped.
+_MAX_GIVE_UP_EMISSIONS = 3
 
 
 def _event_to_row(event: NormalizedEvent) -> dict[str, Any]:
@@ -240,9 +246,16 @@ class _TransitionTracker:
       details, status resets) and is never reset. Reaching either cap
       triggers a give-up that persists the best-known state (merged, never
       raw) and sets ``give_up_pending``.
+    * **Discarded (popped) on healthy live resumption**: a tracked match
+      reappearing on the slate with a LIVE status was a slate flicker, not a
+      transition — the tracker (and its consumed retry budget / stale
+      fallback) is dropped so a genuine later transition starts fresh.
     * ``give_up_pending`` short-circuits further detail fetches: the give-up
       snapshot is re-emitted every poll until its apply lands, and the ERROR
       log stating what was persisted fires only after that durable success.
+      ``give_up_emissions`` bounds the re-emission: an UNPERSISTABLE snapshot
+      (identity missing, ``seed_match`` → ``None`` forever) is abandoned with
+      one final ERROR after ``_MAX_GIVE_UP_EMISSIONS`` emissions.
     * ``last_reported_status`` dedupes the non-terminal WARN: once per detail
       status change, not once per poll.
     """
@@ -251,6 +264,7 @@ class _TransitionTracker:
     consecutive_failures: int = 0
     total_attempts: int = 0
     give_up_pending: bool = False
+    give_up_emissions: int = 0
     last_reported_status: MatchStatus | None = None
 
 
@@ -696,6 +710,15 @@ class CollectorEngine:
             self._restart_scan_done = True
         hydrated: list[NormalizedMatch] = []
         for match in matches:
+            if match.status in LIVE_STATUSES:
+                # Healthy live resumption on the slate: any pending transition
+                # tracker was a slate flicker, and both its consumed retry
+                # budget (total_attempts is never reset) and its captured
+                # fallback are stale — pop it entirely so the genuine
+                # transition later in the match gets a fresh budget. (A
+                # NON-live slate appearance is the transition in progress and
+                # must keep its tracker.)
+                self._transitions.pop(match.match_id, None)
             previous = self._last.get(match.match_id)
             was_live = (
                 previous is not None and previous.status in LIVE_STATUSES
@@ -861,7 +884,9 @@ class CollectorEngine:
                 snapshots.append(merged)
                 continue
             tracker.total_attempts += 1
-            self._warn_nonterminal(match_id, tracker, detail.status)
+            # Feed MERGED status, same as the on-slate path: one consistent
+            # dedupe key and log content across both hydration paths.
+            self._warn_nonterminal(match_id, tracker, merged.status)
             if self._tracker_at_cap(tracker):
                 self._emit_give_up(
                     snapshots,
@@ -971,7 +996,10 @@ class CollectorEngine:
         the durable apply, so a failed write re-emits the SAME snapshot next
         poll instead of losing the captured terminal state. When nothing at
         all is known to persist the tracker is dropped with an ERROR (there
-        is no write that could ever succeed).
+        is no write that could ever succeed). Re-emission is BOUNDED
+        (``_MAX_GIVE_UP_EMISSIONS``): a snapshot whose apply never lands
+        (e.g. missing identity — ``seed_match`` returns ``None`` every poll)
+        is abandoned with one final ERROR instead of re-emitting forever.
         """
         snapshot = self._build_give_up_snapshot(match_id, tracker, fresh)
         if snapshot is None:
@@ -983,6 +1011,19 @@ class CollectorEngine:
                 self._source,
                 tracker.consecutive_failures,
                 tracker.total_attempts,
+            )
+            self._transitions.pop(match_id, None)
+            return
+        tracker.give_up_emissions += 1
+        if tracker.give_up_emissions > _MAX_GIVE_UP_EMISSIONS:
+            log.error(
+                "could not persist terminal state for match %s on source %s: "
+                "the give-up snapshot's apply never landed after %d emissions "
+                "(e.g. identity missing, seed_match returns None every poll) — "
+                "abandoning tracker",
+                match_id,
+                self._source,
+                _MAX_GIVE_UP_EMISSIONS,
             )
             self._transitions.pop(match_id, None)
             return
@@ -1063,18 +1104,38 @@ class CollectorEngine:
         (``home_team``/``away_team`` ride in the payload JSON per the
         ``default_seed_match`` convention, when present) and last-known
         scores so a sparse terminal snapshot does not seed identity-less or
-        NULL known scores. Looked up under both id forms core knows, like
-        :meth:`_stored_status_is_live`.
+        NULL known scores. Looked up under all THREE id forms core knows
+        (like :meth:`_stored_status_is_live`): the bare provider id, the
+        source-qualified stub, and — when neither matches — the canonical
+        (reconciled) row resolved through ``provider_match_map``; a
+        restart-seeded reconciled match whose detail keeps failing must
+        find its canonical row here, or the give-up would have nothing to
+        persist and the row would stay in-play forever. When both bare and
+        qualified rows exist, the freshest (``updated_at``) wins
+        deterministically.
         """
         row = self._conn.execute(
             "SELECT status, minute, score_home, score_away, display_clock, "
-            "kickoff_utc, payload FROM matches WHERE source = ? AND match_id IN (?, ?)",
+            "kickoff_utc, payload FROM matches WHERE source = ? AND match_id IN (?, ?) "
+            "ORDER BY updated_at DESC LIMIT 1",
             (
                 self._source,
                 provider_match_id,
                 f"{self._source}:{provider_match_id}",
             ),
         ).fetchone()
+        if row is None:
+            # Canonical/reconciled row: the stored id is a pack-owned
+            # canonical id reachable only through provider_match_map.
+            row = self._conn.execute(
+                "SELECT m.status, m.minute, m.score_home, m.score_away, "
+                "m.display_clock, m.kickoff_utc, m.payload "
+                "FROM provider_match_map pm "
+                "JOIN matches m ON m.source = pm.source AND m.match_id = pm.match_id "
+                "WHERE pm.source = ? AND pm.provider_match_id = ? "
+                "ORDER BY m.updated_at DESC LIMIT 1",
+                (self._source, provider_match_id),
+            ).fetchone()
         if row is None:
             return None
         status_value, minute, score_home, score_away, display_clock, kickoff_utc, payload = row
@@ -1108,19 +1169,26 @@ class CollectorEngine:
 
         Consulted only for a non-live slate match with no in-memory diff
         baseline (a restart gap). The row is looked up under this source by
-        BOTH id forms core can know about: the provider-native id (the
-        ``default_seed_match`` shape) and the source-qualified
+        ALL THREE id forms core can know about: the provider-native id (the
+        ``default_seed_match`` shape), the source-qualified
         ``f"{source}:{id}"`` unreconciled form (the reader-contract shape
-        packs write for unreconciled live matches). A pack that reconciles
-        provider ids to canonical ids it alone can map is out of core's
-        reach — such matches fall back to no hydration, same as pre-fix.
+        packs write for unreconciled live matches), and the canonical
+        (reconciled) id resolved through ``provider_match_map`` — a pack
+        that reconciles provider ids onto canonical rows must still get its
+        transition-across-restart hydrated.
         """
         rows = self._conn.execute(
-            "SELECT status FROM matches WHERE source = ? AND match_id IN (?, ?)",
+            "SELECT status FROM matches WHERE source = ? AND match_id IN (?, ?) "
+            "UNION ALL "
+            "SELECT m.status FROM provider_match_map pm "
+            "JOIN matches m ON m.source = pm.source AND m.match_id = pm.match_id "
+            "WHERE pm.source = ? AND pm.provider_match_id = ?",
             (
                 self._source,
                 provider_match_id,
                 f"{self._source}:{provider_match_id}",
+                self._source,
+                provider_match_id,
             ),
         ).fetchall()
         return any(status in LIVE_STATUS_VALUES for (status,) in rows)
@@ -1189,20 +1257,43 @@ class CollectorEngine:
           entry the id is NOT a provider id and cannot be trusted as one, so
           the caller must skip it (WARNING logged here) — the residual gap
           the vanished-hydration docstring documents.
+
+        SINGLE-PROVIDER ASSUMPTION: a source is expected to map each
+        canonical row through exactly one provider. When the map holds more
+        than one DISTINCT provider id for the row (a multi-provider source),
+        this WARNs naming all of them and proceeds with the first in
+        ``(provider, provider_match_id)`` order — graceful loud degradation:
+        even if the chosen id's detail fetch never succeeds, the give-up
+        path closes the row from the stored base
+        (:meth:`_stored_match_snapshot` resolves it via the map), so a wrong
+        pick cannot wedge the row in-play.
         """
         prefix = f"{self._source}:"
         if stored_match_id.startswith(prefix):
             return stored_match_id[len(prefix) :]
         if self._pack.seed_match is default_seed_match:
             return stored_match_id
-        row = self._conn.execute(
-            "SELECT provider_match_id FROM provider_match_map "
+        rows = self._conn.execute(
+            "SELECT DISTINCT provider, provider_match_id FROM provider_match_map "
             "WHERE source = ? AND match_id = ? "
-            "ORDER BY provider, provider_match_id LIMIT 1",
+            "ORDER BY provider, provider_match_id",
             (self._source, stored_match_id),
-        ).fetchone()
-        if row is not None:
-            return row[0]
+        ).fetchall()
+        if rows:
+            distinct_ids = {provider_id for _, provider_id in rows}
+            if len(distinct_ids) > 1:
+                log.warning(
+                    "stored match %s on source %s maps to multiple provider ids (%s); "
+                    "proceeding with %s from provider %s — single-provider-per-source "
+                    "assumption violated; a failed hydration still closes the row "
+                    "from the stored base at give-up",
+                    stored_match_id,
+                    self._source,
+                    ", ".join(f"{provider}:{provider_id}" for provider, provider_id in rows),
+                    rows[0][1],
+                    rows[0][0],
+                )
+            return rows[0][1]
         log.warning(
             "stored match %s on source %s is live from before a restart and "
             "absent from the slate, but has no provider_match_map entry to "

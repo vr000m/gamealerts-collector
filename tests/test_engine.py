@@ -2478,3 +2478,264 @@ def test_restart_scan_runs_exactly_once(tmp_path):
     finally:
         engine._conn.set_trace_callback(None)
         engine.close()
+
+
+# --------------------------------------------------------------------------- #
+# 2026-07 review findings: map-resolved give-up base, flicker budget reset,
+# multi-provider map, bounded give-up re-emission, warn consistency,
+# deterministic stored-row choice
+# --------------------------------------------------------------------------- #
+
+
+def test_restart_seeded_canonical_row_give_up_persists_via_map_lookup(tmp_path, caplog):
+    """Finding 1: a restart-seeded RECONCILED match whose detail keeps failing
+    must, at give-up, resolve its canonical stored row through
+    provider_match_map and close it — not log "nothing to persist" and leave
+    the row IN_PLAY forever (the exact wedge the restart scan targets)."""
+    from gamecollect.engine import CollectorEngine
+
+    db = tmp_path / "engine.db"
+    _prepare_restart_db(db, "canada-vs-qatar-2026-06-18", map_provider_id="m1")
+
+    fail = ProviderUnavailableError("detail endpoint down")
+    provider = ScriptedDetailProvider([([], {"m1": fail})] * 3)
+    pack = make_pack(provider, seed_match=_reconciling_seed)
+    engine = CollectorEngine(pack, str(db), SOURCE, 0.01, provider=provider)
+    try:
+        with caplog.at_level(logging.WARNING, logger="gamecollect.engine"):
+            for _ in range(3):
+                engine.poll_once()
+        assert engine._transitions == {}, "the give-up must consume the tracker durably"
+    finally:
+        engine.close()
+
+    assert not any("nothing to persist" in rec.message for rec in caplog.records), (
+        "the canonical row IS reachable via provider_match_map — never 'nothing to persist'"
+    )
+    assert any(
+        "persisted best-known terminal state" in rec.message and rec.levelno == logging.ERROR
+        for rec in caplog.records
+    )
+    state = reader.get_state(read_db(db), "canada-vs-qatar-2026-06-18")
+    assert state is not None and state["status"] == MatchStatus.FINISHED.value, (
+        "the canonical row must leave IN_PLAY via the map-resolved stored base"
+    )
+    assert state["score_home"] == 1 and state["score_away"] == 0, (
+        "stored scores must survive the force-close"
+    )
+
+
+def test_slate_flicker_then_live_resumption_pops_tracker_for_fresh_ft_budget(tmp_path):
+    """Finding 2: slate flicker earlier in the match must not permanently
+    consume the retry budget of the genuine FT transition — a healthy LIVE
+    resumption on the slate pops the tracker entirely."""
+    from gamecollect.engine import _MAX_TRANSITION_TOTAL_ATTEMPTS, CollectorEngine
+
+    db = tmp_path / "engine.db"
+    live1 = nm("m1", (ev(0),), status=MatchStatus.IN_PLAY, minute=10)
+    flicker = nm("m1", status=MatchStatus.SCHEDULED, minute=None, score_home=None, score_away=None)
+    live2 = nm("m1", (ev(0),), status=MatchStatus.IN_PLAY, minute=55, display_clock="55'")
+    final = nm(
+        "m1",
+        (ev(0), ev(1, "goal", minute=90)),
+        status=MatchStatus.FINISHED,
+        minute=None,
+        score_home=2,
+        score_away=0,
+    )
+    provider = ScriptedDetailProvider(
+        [
+            ([live1], {"m1": live1}),
+            ([flicker], {"m1": flicker}),  # flicker: non-terminal transition attempt
+            ([live2], {"m1": live2}),  # healthy live resumption
+            ([final], {"m1": final}),  # the genuine FT transition
+        ]
+    )
+    engine = CollectorEngine(make_pack(provider), str(db), SOURCE, 0.01, provider=provider)
+    try:
+        engine.poll_once()
+        engine.poll_once()
+        assert "m1" in engine._transitions, "the flicker poll must create a tracker"
+        # Simulate a long flicker history: the budget is fully consumed, so
+        # WITHOUT the fix the FT poll's at-cap pre-check would give up
+        # without a single detail fetch.
+        engine._transitions["m1"].total_attempts = _MAX_TRANSITION_TOTAL_ATTEMPTS
+        engine.poll_once()  # live resumption
+        assert engine._transitions == {}, (
+            "a healthy live resumption on the slate must pop the stale tracker"
+        )
+        engine.poll_once()  # genuine FT transition: fresh budget, detail fetched
+        assert engine._transitions == {}
+    finally:
+        engine.close()
+
+    assert provider.detail_calls[-1] == "m1", "the FT poll must actually fetch detail"
+    state = reader.get_state(read_db(db), qualified("m1"))
+    assert state is not None and state["status"] == MatchStatus.FINISHED.value
+    assert state["score_home"] == 2
+    assert event_seqs(db, qualified("m1")) == [0, 1], (
+        "the genuine transition's final events must land (no premature give-up)"
+    )
+
+
+def test_multi_provider_map_rows_warn_and_hydrate_without_wedge(tmp_path, caplog):
+    """Finding 3: >1 DISTINCT provider ids mapped to one stored row (a
+    multi-provider source) must WARN naming them and proceed with the first —
+    graceful loud degradation, never a wedge."""
+    from gamecollect.engine import CollectorEngine
+
+    db = tmp_path / "engine.db"
+    _prepare_restart_db(db, "canada-vs-qatar-2026-06-18", map_provider_id="m1")
+    conn = sqlite3.connect(str(db))
+    try:
+        conn.execute(
+            "INSERT INTO provider_match_map (source, provider, provider_match_id, match_id) "
+            "VALUES (?, ?, ?, ?)",
+            (SOURCE, "zprov", "x9", "canada-vs-qatar-2026-06-18"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    provider = ScriptedDetailProvider([([], {"m1": _restart_ft_detail()})])
+    pack = make_pack(provider, seed_match=_reconciling_seed)
+    engine = CollectorEngine(pack, str(db), SOURCE, 0.01, provider=provider)
+    try:
+        with caplog.at_level(logging.WARNING, logger="gamecollect.engine"):
+            engine.poll_once()
+    finally:
+        engine.close()
+
+    warns = [r for r in caplog.records if "multiple provider ids" in r.message]
+    assert len(warns) == 1 and "espn:m1" in warns[0].getMessage(), (
+        "the ambiguity must be WARNed about, naming the candidate ids"
+    )
+    assert "zprov:x9" in warns[0].getMessage()
+    assert provider.detail_calls == ["m1"], (
+        "the first id in (provider, provider_match_id) order must be used"
+    )
+    state = reader.get_state(read_db(db), "canada-vs-qatar-2026-06-18")
+    assert state is not None and state["status"] == MatchStatus.FINISHED.value
+
+
+def test_unpersistable_give_up_bounded_reemits_then_final_error_and_pop(tmp_path, caplog):
+    """Finding 4: a give-up snapshot that can NEVER persist (missing identity,
+    seed_match returns None every poll) must re-emit a bounded number of times,
+    then log ONE final ERROR and drop the tracker — not loop forever."""
+    from gamecollect.engine import (
+        _MAX_GIVE_UP_EMISSIONS,
+        _MAX_TRANSITION_DETAIL_FAILURES,
+        CollectorEngine,
+        _TransitionTracker,
+    )
+
+    db = tmp_path / "engine.db"
+    provider = ScriptedDetailProvider([([], {})] * 5)
+    engine = CollectorEngine(make_pack(provider), str(db), SOURCE, 0.01, provider=provider)
+    engine._restart_scan_done = True
+    identityless = nm(
+        "m1",
+        status=MatchStatus.FINISHED,
+        home_team=None,
+        away_team=None,
+        kickoff_utc=None,
+    )
+    engine._transitions["m1"] = _TransitionTracker(
+        fallback=identityless,
+        consecutive_failures=_MAX_TRANSITION_DETAIL_FAILURES,  # already at cap
+    )
+    try:
+        with caplog.at_level(logging.INFO, logger="gamecollect.engine"):
+            for _ in range(5):
+                engine.poll_once()
+        assert engine._transitions == {}, "the exhausted tracker must be abandoned"
+    finally:
+        engine.close()
+
+    unpersisted = [r for r in caplog.records if "seed_match returned None" in r.message]
+    assert len(unpersisted) == _MAX_GIVE_UP_EMISSIONS, (
+        f"exactly {_MAX_GIVE_UP_EMISSIONS} re-emission applies must be attempted"
+    )
+    finals = [
+        r
+        for r in caplog.records
+        if "could not persist terminal state" in r.message and r.levelno == logging.ERROR
+    ]
+    assert len(finals) == 1, "exactly ONE final abandonment ERROR"
+    assert "abandoning tracker" in finals[0].getMessage()
+
+
+def test_nonterminal_warn_dedupes_consistently_across_slate_and_vanished_paths(tmp_path, caplog):
+    """Finding 5: both hydration paths must feed the SAME source (merged
+    status) into _warn_nonterminal — one dedupe key, so an unchanged
+    non-terminal status warns once across an on-slate poll and a subsequent
+    vanished poll."""
+    from gamecollect.engine import CollectorEngine
+
+    db = tmp_path / "engine.db"
+    live = nm("m1", (ev(0),), status=MatchStatus.IN_PLAY, minute=80)
+    reset = nm("m1", status=MatchStatus.SCHEDULED, minute=None, score_home=None, score_away=None)
+    provider = ScriptedDetailProvider(
+        [
+            ([live], {"m1": live}),
+            ([reset], {"m1": reset}),  # on-slate non-terminal reset: WARN once
+            ([], {"m1": reset}),  # vanished, same merged status: deduped
+        ]
+    )
+    engine = CollectorEngine(make_pack(provider), str(db), SOURCE, 0.01, provider=provider)
+    try:
+        with caplog.at_level(logging.WARNING, logger="gamecollect.engine"):
+            for _ in range(3):
+                engine.poll_once()
+    finally:
+        engine.close()
+
+    warns = [r for r in caplog.records if "non-terminal status" in r.message]
+    assert len(warns) == 1, "the same non-terminal status across both paths must WARN exactly once"
+    assert MatchStatus.SCHEDULED.value in warns[0].getMessage()
+
+
+def test_stored_snapshot_prefers_freshest_when_bare_and_qualified_rows_exist(tmp_path):
+    """Finding 6: with BOTH the bare and the source-qualified row stored, the
+    merge base must deterministically be the freshest (updated_at DESC), not
+    whichever row sqlite happens to return first."""
+    from gamecollect.db.connection import connect
+    from gamecollect.engine import CollectorEngine
+
+    db = tmp_path / "engine.db"
+    conn = connect(str(db), side_table_ddl=FAKE_SIDE_TABLE_DDL)
+    try:
+        with conn:
+            for match_id, score_home, updated_at in (
+                # Older row inserted FIRST: without ORDER BY, rowid order
+                # would (wrongly) pick it.
+                ("m1", 1, "2026-06-18T19:00:00Z"),
+                (qualified("m1"), 2, "2026-06-18T20:00:00Z"),
+            ):
+                conn.execute(
+                    "INSERT INTO matches (match_id, source, kickoff_utc, status, minute, "
+                    "score_home, score_away, payload, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        match_id,
+                        SOURCE,
+                        "2026-06-18T18:00:00Z",
+                        MatchStatus.IN_PLAY.value,
+                        88,
+                        score_home,
+                        0,
+                        json.dumps({"home_team": "Canada", "away_team": "Qatar"}),
+                        updated_at,
+                    ),
+                )
+    finally:
+        conn.close()
+
+    provider = ScriptedDetailProvider([])
+    engine = CollectorEngine(make_pack(provider), str(db), SOURCE, 0.01, provider=provider)
+    try:
+        snap = engine._stored_match_snapshot("m1")
+    finally:
+        engine.close()
+    assert snap is not None
+    assert snap.score_home == 2, "the freshest (updated_at) row must win deterministically"

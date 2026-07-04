@@ -396,3 +396,98 @@ def test_skipped_rows_and_players_log_warnings(db, caplog):
     assert any("athlete_id" in m and MATCH_ID in m and "True" in m for m in messages), (
         "skipping a player must WARN with the match id and offending athlete_id"
     )
+
+
+# --------------------------------------------------------------------------- #
+# 2026-07 review findings: exponent-form ids stay opaque; skip WARNs dedupe
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture(autouse=True)
+def _reset_warned_skips():
+    """The skip-WARNING dedupe set is module-level state: clear it around every
+    test so caplog assertions stay order-independent."""
+    from gamecollect_football import pack as pack_module
+
+    pack_module._WARNED_SKIPS.clear()
+    yield
+    pack_module._WARNED_SKIPS.clear()
+
+
+def test_key_text_canonicalizes_plain_decimals_only():
+    """Findings 7+8: only PLAIN decimal spellings canonicalize; exponent-form
+    strings are opaque ids and pass through verbatim — '1E2' must NOT collide
+    with '100', and a huge exponent must not materialize an astronomical digit
+    string (poll-loop hang / MemoryError)."""
+    from gamecollect_football.pack import _to_key_text
+
+    assert _to_key_text("123.0") == "123"
+    assert _to_key_text("760421.0") == "760421"
+    assert _to_key_text("-5.0") == "-5"
+    assert _to_key_text(123.0) == "123"
+    assert _to_key_text("123.45") == "123.45"  # non-integral: verbatim
+    assert _to_key_text("1E2") == "1E2", "exponent-form ids are opaque, never '100'"
+    assert _to_key_text("3e4") == "3e4"
+    assert _to_key_text("1e999999999") == "1e999999999", (
+        "a huge exponent must pass through verbatim, instantly"
+    )
+    assert _to_key_text("01") == "01"
+
+
+def test_exponent_form_athlete_id_does_not_collide_with_numeric_equivalent(db):
+    """'1E2' and '100' are two DIFFERENT opaque athlete ids: reparsing the
+    exponent form would silently attribute one player's rows to the other."""
+    conn, writer = db
+    payload = {
+        "lineups": [
+            {
+                "team": "Canada",
+                "players": [
+                    {"athlete_id": "1E2", "display_name": "Exponent Id"},
+                    {"athlete_id": "100", "display_name": "Numeric Id"},
+                ],
+            }
+        ]
+    }
+    persist_football_side_tables(conn, writer, _match(payload), MATCH_ID)
+    rows = conn.execute(
+        "SELECT athlete_id, display_name FROM football_lineups WHERE match_id = ? "
+        "ORDER BY athlete_id",
+        (MATCH_ID,),
+    ).fetchall()
+    assert [tuple(r) for r in rows] == [("100", "Numeric Id"), ("1E2", "Exponent Id")], (
+        "exponent-form and numeric ids must remain two distinct rows"
+    )
+
+
+def test_repeated_bad_payload_warns_once_per_offending_row(db, caplog):
+    """Finding 9: the same static bad row must WARN once, not on every persist
+    for the lifetime of the match (the write-if-changed gate does not bound the
+    logging — rows are projected before the compare)."""
+    import logging
+
+    conn, writer = db
+    payload = {
+        "stats": [{"team": True, "shots": 3}],
+        "lineups": [
+            {
+                "team": "Canada",
+                "players": [{"athlete_id": True, "display_name": "Ghost Player"}],
+            }
+        ],
+    }
+    with caplog.at_level(logging.WARNING, logger="gamecollect_football.pack"):
+        for _ in range(3):
+            persist_football_side_tables(conn, writer, _match(payload), MATCH_ID)
+
+    stats_warns = [r for r in caplog.records if "football_stats" in r.getMessage()]
+    athlete_warns = [r for r in caplog.records if "invalid athlete_id" in r.getMessage()]
+    assert len(stats_warns) == 1, "the same bad stats row must warn exactly once"
+    assert len(athlete_warns) == 1, "the same bad player must warn exactly once"
+
+    # A DIFFERENT offending value still gets its own warning.
+    payload2 = {"stats": [{"team": float("nan"), "shots": 1}]}
+    with caplog.at_level(logging.WARNING, logger="gamecollect_football.pack"):
+        persist_football_side_tables(conn, writer, _match(payload2), MATCH_ID)
+    stats_warns_after = [r for r in caplog.records if "football_stats" in r.getMessage()]
+    assert len(stats_warns_after) == 2, "a new offending value must warn once too"

@@ -11,8 +11,9 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 import sqlite3
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 
 from gamecollect.db.writer import PartitionWriter
 from gamecollect.fold import fold
@@ -111,6 +112,11 @@ def _to_text(value: object) -> str | None:
     return None
 
 
+# A plain decimal float spelling: digits, one dot, digits (optional sign).
+# Deliberately EXCLUDES exponent forms — see _to_key_text.
+_PLAIN_DECIMAL_RE = re.compile(r"^[+-]?[0-9]+\.[0-9]+$")
+
+
 def _to_key_text(value: object) -> str | None:
     """Coerce an identifier scalar (PK component) to its canonical TEXT key.
 
@@ -118,12 +124,18 @@ def _to_key_text(value: object) -> str | None:
     is an ``int`` subclass, and ``str(True)`` would mint a bogus ``"True"``
     team/athlete key); non-finite floats are rejected too (a literal ``"nan"``
     or ``"inf"`` PK key is garbage). An integral float canonicalizes to its
-    int string, and so does an integral float-SPELLED string — a JSON payload
+    int string, and so does an integral PLAIN-decimal string — a JSON payload
     spelling the same athlete as ``760421.0``, ``"760421.0"``, and ``"760421"``
     must collapse to ONE primary-key row, not duplicate the player. Only
-    strings that look like float spellings (containing ``.`` or an exponent)
-    are reparsed: a plain digit string like ``"01"`` is an opaque id and must
-    keep its leading zero. Anything else follows :func:`_to_text`."""
+    strings matching ``^[+-]?[0-9]+\\.[0-9]+$`` are reparsed: a plain digit
+    string like ``"01"`` is an opaque id and must keep its leading zero, and
+    strings carrying an exponent marker (``"1E2"``, ``"1e999999999"``) pass
+    through VERBATIM — they are opaque ids too; reparsing them would collide
+    ``"1E2"`` with a genuine ``"100"`` (silent wrong-player attribution) and a
+    huge exponent would materialize an astronomical digit string (poll-loop
+    hang / MemoryError). Floats keep the ``is_integer()`` path — a finite
+    float cannot mint a pathological digit string. Anything else follows
+    :func:`_to_text`."""
     if isinstance(value, bool):
         return None
     if isinstance(value, float):
@@ -133,18 +145,38 @@ def _to_key_text(value: object) -> str | None:
             return str(int(value))
         return _to_text(value)
     if isinstance(value, str):
-        # Canonicalize float SPELLINGS only ('.'/exponent present). Decimal
-        # parses the string exactly (no float precision loss), so the int
-        # string it yields represents the same number the payload carried.
-        if any(ch in value for ch in ".eE"):
-            try:
-                dec = Decimal(value)
-            except InvalidOperation:
-                return value  # genuinely non-numeric (e.g. a team name)
-            if dec.is_finite() and dec == dec.to_integral_value():
+        # Canonicalize plain decimal float SPELLINGS only. Decimal parses the
+        # string exactly (no float precision loss), so the int string it
+        # yields represents the same number the payload carried; the regex
+        # guarantees a finite, exponent-free parse.
+        if _PLAIN_DECIMAL_RE.match(value):
+            dec = Decimal(value)
+            if dec == dec.to_integral_value():
                 return str(int(dec))
         return value
     return _to_text(value)
+
+
+# Skip-WARNING dedupe: the projection runs on EVERY persist (rows are
+# projected BEFORE the write-if-changed compare, so that gate does NOT bound
+# the logging) and a static bad row would otherwise re-WARN for the lifetime
+# of the match. Keyed (source, match_id, kind, repr(value)) so each offending
+# row warns exactly once; bounded — when full the set resets (a rare re-WARN
+# beats unbounded growth in a long-lived daemon).
+_WARNED_SKIPS: set[tuple[str, str, str, str]] = set()
+_WARNED_SKIPS_MAX = 4096
+
+
+def _warn_skip_once(
+    source: str, match_id: str, kind: str, value: object, msg: str, *args: object
+) -> None:
+    key = (source, match_id, kind, repr(value))
+    if key in _WARNED_SKIPS:
+        return
+    if len(_WARNED_SKIPS) >= _WARNED_SKIPS_MAX:
+        _WARNED_SKIPS.clear()
+    _WARNED_SKIPS.add(key)
+    log.warning(msg, *args)
 
 
 _STATS_COLUMNS = (
@@ -174,7 +206,11 @@ def _stats_rows(
             continue
         team = _to_key_text(row.get("team"))
         if not team:
-            log.warning(
+            _warn_skip_once(
+                source,
+                seeded_match_id,
+                "stats-team",
+                row.get("team"),
                 "football_stats: skipping stats row for match %s — invalid team key %r",
                 seeded_match_id,
                 row.get("team"),
@@ -212,7 +248,11 @@ def _lineup_rows(
             continue
         team = _to_key_text(lineup.get("team"))
         if not team:
-            log.warning(
+            _warn_skip_once(
+                source,
+                seeded_match_id,
+                "lineup-team",
+                lineup.get("team"),
                 "football_lineups: skipping entire lineup for match %s — invalid team key %r",
                 seeded_match_id,
                 lineup.get("team"),
@@ -227,7 +267,11 @@ def _lineup_rows(
             athlete_id = _to_key_text(player.get("athlete_id"))
             display_name = _to_text(player.get("display_name"))
             if not athlete_id:
-                log.warning(
+                _warn_skip_once(
+                    source,
+                    seeded_match_id,
+                    "lineup-athlete",
+                    player.get("athlete_id"),
                     "football_lineups: skipping player for match %s (team %s) — "
                     "invalid athlete_id %r",
                     seeded_match_id,
