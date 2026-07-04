@@ -55,7 +55,7 @@ from gamecollect.db.writer import (
 )
 from gamecollect.diffing import MatchDiff, diff_matches
 from gamecollect.fixture_io import fixture_stem, write_fixture
-from gamecollect.packs.spec import SportPack
+from gamecollect.packs.spec import SportPack, default_seed_match
 from gamecollect.provider import (
     LIVE_STATUS_VALUES,
     LIVE_STATUSES,
@@ -329,6 +329,12 @@ class CollectorEngine:
         self._record: dict[str, _RecordedMatch] = {}
         self._record_flush_failed = False
         self._backoff_multiplier = 1
+        # One-time restart scan latch: on the FIRST successful poll the stored
+        # matches table is scanned for rows this source left live at shutdown
+        # whose provider id never reappears on the slate, and trackers are
+        # seeded for them (see _seed_restart_trackers). Never re-run after it
+        # completes — steady-state polls must not pay a table scan.
+        self._restart_scan_done = False
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -681,6 +687,13 @@ class CollectorEngine:
         """
         matches = self._provider.fetch_live_matches()
         slate_ids = {m.match_id for m in matches}
+        if not self._restart_scan_done:
+            # First successful poll after (re)start: seed trackers for rows
+            # left live in storage whose provider id is off the slate. Runs
+            # AFTER fetch_live_matches so a provider outage at startup does
+            # not consume the one-shot scan on a slate we never saw.
+            self._seed_restart_trackers(slate_ids)
+            self._restart_scan_done = True
         hydrated: list[NormalizedMatch] = []
         for match in matches:
             previous = self._last.get(match.match_id)
@@ -796,10 +809,15 @@ class CollectorEngine:
         LOUDLY, persisting the best-known terminal state (the merged fallback
         when one exists, else the baseline/stored row force-closed to
         FINISHED) — the give-up ERROR states what was persisted and fires
-        only after the apply succeeds. Known limitation: after a daemon
-        restart ``self._last`` and the trackers are empty, so a match that
-        vanished across the restart (never reappearing on the slate) is not
-        tracked — same as pre-fix.
+        only after the apply succeeds. A match that vanished ACROSS a daemon
+        restart (stored row live, never reappearing on the slate, so both
+        ``self._last`` and the trackers start empty) is caught by the
+        one-time restart scan (:meth:`_seed_restart_trackers`), which seeds a
+        tracker for it on the first poll so this path hydrates it like any
+        other vanished match. Residual gap: a canonical/reconciled stored row
+        with no ``provider_match_map`` entry cannot be resolved back to a
+        provider id — the scan WARNs and leaves it alone (same as pre-fix)
+        rather than detail-fetching a non-provider id into a forced close.
         """
         tracked = {
             match_id
@@ -1106,6 +1124,94 @@ class CollectorEngine:
             ),
         ).fetchall()
         return any(status in LIVE_STATUS_VALUES for (status,) in rows)
+
+    def _seed_restart_trackers(self, slate_ids: set[str]) -> None:
+        """One-time restart scan: track stored-live matches gone from the slate.
+
+        After a daemon restart ``self._last`` and ``self._transitions`` are
+        empty, so a match that was live at shutdown and NEVER reappears on
+        the slate would be invisible to both hydration paths — its stored
+        row would stay in-play forever and final-only events would be lost.
+        On the first successful poll this scans the ``matches`` table for
+        rows under this source with a live status and seeds a
+        ``_TransitionTracker`` (keyed by PROVIDER id — the id
+        ``fetch_match_detail`` takes) for each row genuinely vanished; the
+        normal tracker machinery then hydrates it
+        (:meth:`_hydrate_vanished_matches`, this same poll).
+
+        Two guards keep the scan from doing harm:
+
+        * A stored row whose resolved provider id IS on the current slate is
+          skipped — the match is still being collected normally (or its
+          transition is on the slate for the regular paths); seeding a
+          tracker for it would be wrong.
+        * A row whose provider id cannot be resolved
+          (:meth:`_resolve_stored_provider_id` returned ``None``) is skipped
+          with the WARNING logged there — detail-fetching a non-provider id
+          would only fail to the cap and force-close a possibly-live match,
+          worse than leaving the row as-is.
+        """
+        placeholders = ", ".join("?" for _ in LIVE_STATUS_VALUES)
+        rows = self._conn.execute(
+            f"SELECT match_id FROM matches WHERE source = ? AND status IN ({placeholders})",
+            (self._source, *sorted(LIVE_STATUS_VALUES)),
+        ).fetchall()
+        for (stored_id,) in rows:
+            provider_id = self._resolve_stored_provider_id(stored_id)
+            if provider_id is None or provider_id in slate_ids:
+                continue
+            if provider_id in self._transitions:
+                continue
+            log.warning(
+                "match %s (stored id %s) on source %s was live at the last "
+                "shutdown and is absent from the slate after restart: seeding "
+                "terminal-hydration tracking",
+                provider_id,
+                stored_id,
+                self._source,
+            )
+            self._tracker(provider_id)
+
+    def _resolve_stored_provider_id(self, stored_match_id: str) -> str | None:
+        """Map a stored ``matches.match_id`` back to its provider-native id.
+
+        ``matches.match_id`` comes in three shapes (schema comment;
+        :meth:`_stored_status_is_live`), while the slate and
+        ``fetch_match_detail`` speak PROVIDER ids only:
+
+        * source-qualified unreconciled stub ``f"{source}:{provider_id}"`` →
+          the suffix after the source prefix;
+        * bare provider id (the :func:`default_seed_match` shape — that hook
+          writes provider-native ids verbatim, so when the pack uses it every
+          stored id under this source IS a provider id) → itself;
+        * canonical/reconciled id (e.g. a schedule slug, written by a pack's
+          own seed hook) → looked up in ``provider_match_map``; with no map
+          entry the id is NOT a provider id and cannot be trusted as one, so
+          the caller must skip it (WARNING logged here) — the residual gap
+          the vanished-hydration docstring documents.
+        """
+        prefix = f"{self._source}:"
+        if stored_match_id.startswith(prefix):
+            return stored_match_id[len(prefix) :]
+        if self._pack.seed_match is default_seed_match:
+            return stored_match_id
+        row = self._conn.execute(
+            "SELECT provider_match_id FROM provider_match_map "
+            "WHERE source = ? AND match_id = ? "
+            "ORDER BY provider, provider_match_id LIMIT 1",
+            (self._source, stored_match_id),
+        ).fetchone()
+        if row is not None:
+            return row[0]
+        log.warning(
+            "stored match %s on source %s is live from before a restart and "
+            "absent from the slate, but has no provider_match_map entry to "
+            "resolve a provider id: cannot hydrate its terminal state — the "
+            "row is left as-is",
+            stored_match_id,
+            self._source,
+        )
+        return None
 
     def stop(self) -> None:
         """Signal the loop to finish its current iteration and shut down."""

@@ -45,7 +45,7 @@ import threading
 import pytest
 
 from gamecollect.db import reader
-from gamecollect.packs.spec import EventTypeDecl, SportPack
+from gamecollect.packs.spec import EventTypeDecl, SportPack, default_seed_match
 from gamecollect.provider import (
     MatchDataProvider,
     MatchStatus,
@@ -1191,7 +1191,6 @@ def test_restart_hydrates_final_when_stored_row_was_live(tmp_path, use_qualified
     stored-id forms core knows: the source-qualified unreconciled id and the
     bare provider id (``default_seed_match``)."""
     from gamecollect.engine import CollectorEngine
-    from gamecollect.packs.spec import default_seed_match
 
     db = tmp_path / "engine.db"
     seed = _seed_match if use_qualified_seed else default_seed_match
@@ -2063,7 +2062,6 @@ def test_engine_persists_display_clock_to_db(tmp_path):
     silently dropped. Drive one poll through the default seed hook and assert the
     stored row carries the clock."""
     from gamecollect.engine import CollectorEngine
-    from gamecollect.packs.spec import default_seed_match
 
     db = tmp_path / "clock.db"
     match = nm("m-clock", (ev(0, "goal"),), display_clock="45'+2")
@@ -2097,7 +2095,6 @@ def test_default_seed_persists_identity_and_payload_corrections(tmp_path):
     from dataclasses import replace
 
     from gamecollect.engine import CollectorEngine
-    from gamecollect.packs.spec import default_seed_match
 
     db = tmp_path / "identity.db"
     poll1 = replace(
@@ -2254,3 +2251,230 @@ def test_record_nested_not_yet_existing_dirs_allowed(tmp_path):
     engine.poll_once()
     engine.close()
     assert record.is_file()
+
+
+# --------------------------------------------------------------------------- #
+# One-time restart scan: matches live at shutdown that never reappear
+# --------------------------------------------------------------------------- #
+
+
+def _prepare_restart_db(db_path, stored_id: str, *, map_provider_id: str | None = None) -> None:
+    """Simulate a prior session's leftovers: a live ``matches`` row (and
+    optionally its ``provider_match_map`` entry) under this source."""
+    from gamecollect.db.connection import connect
+
+    conn = connect(str(db_path), side_table_ddl=FAKE_SIDE_TABLE_DDL)
+    try:
+        with conn:
+            conn.execute(
+                "INSERT INTO matches (match_id, source, kickoff_utc, status, minute, "
+                "score_home, score_away, payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    stored_id,
+                    SOURCE,
+                    "2026-06-18T18:00:00Z",
+                    MatchStatus.IN_PLAY.value,
+                    88,
+                    1,
+                    0,
+                    json.dumps({"home_team": "Canada", "away_team": "Qatar"}),
+                ),
+            )
+            if map_provider_id is not None:
+                conn.execute(
+                    "INSERT INTO provider_match_map "
+                    "(source, provider, provider_match_id, match_id) VALUES (?, ?, ?, ?)",
+                    (SOURCE, "espn", map_provider_id, stored_id),
+                )
+    finally:
+        conn.close()
+
+
+def _reconciling_seed(conn: sqlite3.Connection, writer, match: NormalizedMatch) -> str | None:
+    """Minimal reconciling seed hook (NOT default_seed_match): map-resolved
+    canonical id when one exists, else the source-qualified stub."""
+    row = conn.execute(
+        "SELECT match_id FROM provider_match_map WHERE source = ? AND provider_match_id = ?",
+        (writer.source, match.match_id),
+    ).fetchone()
+    target = row[0] if row is not None else qualified(match.match_id, writer.source)
+    writer.upsert_match(
+        {
+            "match_id": target,
+            "kickoff_utc": match.kickoff_utc,
+            "status": match.status.value,
+            "minute": match.minute,
+            "score_home": match.score_home,
+            "score_away": match.score_away,
+        }
+    )
+    return target
+
+
+def _restart_ft_detail(match_id: str = "m1") -> NormalizedMatch:
+    return nm(
+        match_id,
+        (ev(0, "goal", minute=44), ev(1, "goal", minute=95, detail="Stoppage winner")),
+        status=MatchStatus.FINISHED,
+        minute=None,
+        score_home=2,
+        score_away=0,
+    )
+
+
+def test_restart_scan_hydrates_qualified_stub_row_vanished_across_restart(tmp_path):
+    """Codex adversarial finding: a source-qualified stub row left live at
+    shutdown whose match NEVER reappears on the slate must be picked up by the
+    one-time restart scan, tracker'd under the provider id, and terminally
+    hydrated — not left in-play forever."""
+    from gamecollect.engine import CollectorEngine
+
+    db = tmp_path / "engine.db"
+    _prepare_restart_db(db, qualified("m1"))
+
+    provider = ScriptedDetailProvider([([], {"m1": _restart_ft_detail()})])
+    engine = CollectorEngine(make_pack(provider), str(db), SOURCE, 0.01, provider=provider)
+    try:
+        engine.poll_once()
+    finally:
+        engine.close()
+
+    assert provider.detail_calls == ["m1"], "the scan must fetch detail by PROVIDER id"
+    state = reader.get_state(read_db(db), qualified("m1"))
+    assert state is not None and state["status"] == MatchStatus.FINISHED.value, (
+        "a stub row live across a restart and gone from the slate must be closed out"
+    )
+    assert state["score_home"] == 2
+    assert event_seqs(db, qualified("m1")) == [0, 1], "final-only events must land"
+
+
+def test_restart_scan_hydrates_bare_provider_id_row(tmp_path):
+    """Same restart gap for a default_seed_match pack: the stored id IS the
+    provider id, so the scan resolves it to itself and hydrates."""
+    from gamecollect.engine import CollectorEngine
+
+    db = tmp_path / "engine.db"
+    _prepare_restart_db(db, "m1")
+
+    provider = ScriptedDetailProvider([([], {"m1": _restart_ft_detail()})])
+    pack = make_pack(provider, seed_match=default_seed_match)
+    engine = CollectorEngine(pack, str(db), SOURCE, 0.01, provider=provider)
+    try:
+        engine.poll_once()
+    finally:
+        engine.close()
+
+    assert provider.detail_calls == ["m1"]
+    state = reader.get_state(read_db(db), "m1")
+    assert state is not None and state["status"] == MatchStatus.FINISHED.value
+    assert event_seqs(db, "m1") == [0, 1]
+
+
+def test_restart_scan_resolves_canonical_row_via_provider_match_map(tmp_path):
+    """A canonical (reconciled) stored id is not a provider id: the scan must
+    resolve the provider id through provider_match_map, fetch detail under it,
+    and the seed hook lands the terminal state back on the canonical row."""
+    from gamecollect.engine import CollectorEngine
+
+    db = tmp_path / "engine.db"
+    _prepare_restart_db(db, "canada-vs-qatar-2026-06-18", map_provider_id="m1")
+
+    provider = ScriptedDetailProvider([([], {"m1": _restart_ft_detail()})])
+    pack = make_pack(provider, seed_match=_reconciling_seed)
+    engine = CollectorEngine(pack, str(db), SOURCE, 0.01, provider=provider)
+    try:
+        engine.poll_once()
+    finally:
+        engine.close()
+
+    assert provider.detail_calls == ["m1"], "detail must be fetched by the MAPPED provider id"
+    state = reader.get_state(read_db(db), "canada-vs-qatar-2026-06-18")
+    assert state is not None and state["status"] == MatchStatus.FINISHED.value, (
+        "the canonical row must be closed via the map-resolved provider id"
+    )
+    assert event_seqs(db, "canada-vs-qatar-2026-06-18") == [0, 1]
+
+
+def test_restart_scan_skips_canonical_row_whose_provider_id_is_on_slate(tmp_path):
+    """Still-live protection: a canonical live row whose mapped provider id IS
+    on the current slate is being collected normally — the scan must NOT seed
+    a tracker (which would wrongly treat it as vanished)."""
+    from gamecollect.engine import CollectorEngine
+
+    db = tmp_path / "engine.db"
+    _prepare_restart_db(db, "canada-vs-qatar-2026-06-18", map_provider_id="m1")
+
+    live = nm("m1", (ev(0, "goal", minute=44),), status=MatchStatus.IN_PLAY, minute=89)
+    provider = ScriptedDetailProvider([([live], {"m1": live})])
+    pack = make_pack(provider, seed_match=_reconciling_seed)
+    engine = CollectorEngine(pack, str(db), SOURCE, 0.01, provider=provider)
+    try:
+        engine.poll_once()
+        assert engine._transitions == {}, (
+            "a stored-live row whose provider id is on the slate must not be tracker'd"
+        )
+    finally:
+        engine.close()
+
+    state = reader.get_state(read_db(db), "canada-vs-qatar-2026-06-18")
+    assert state is not None and state["status"] == MatchStatus.IN_PLAY.value, (
+        "normal live collection must continue on the canonical row, never a forced close"
+    )
+
+
+def test_restart_scan_canonical_row_without_map_entry_warns_and_does_not_seed(tmp_path, caplog):
+    """A canonical row with NO provider_match_map entry cannot be resolved to a
+    provider id: seeding a tracker would detail-fetch a slug, fail to the cap,
+    and force-close a possibly-live match. The scan must WARN and leave it."""
+    from gamecollect.engine import CollectorEngine
+
+    db = tmp_path / "engine.db"
+    _prepare_restart_db(db, "canada-vs-qatar-2026-06-18")
+
+    provider = ScriptedDetailProvider([([], {})])
+    pack = make_pack(provider, seed_match=_reconciling_seed)
+    engine = CollectorEngine(pack, str(db), SOURCE, 0.01, provider=provider)
+    try:
+        with caplog.at_level(logging.WARNING, logger="gamecollect.engine"):
+            engine.poll_once()
+        assert engine._transitions == {}, "an unresolvable stored id must not be tracker'd"
+    finally:
+        engine.close()
+
+    assert provider.detail_calls == [], "no detail fetch may be attempted on a non-provider id"
+    assert any(
+        "no provider_match_map entry" in rec.message and rec.levelno == logging.WARNING
+        for rec in caplog.records
+    ), "the unresolvable live row must be WARNed about"
+    state = reader.get_state(read_db(db), "canada-vs-qatar-2026-06-18")
+    assert state is not None and state["status"] == MatchStatus.IN_PLAY.value, (
+        "the row must be left as-is (status quo beats a wrong forced close)"
+    )
+
+
+def test_restart_scan_runs_exactly_once(tmp_path):
+    """The restart scan is a one-shot: the second poll must not re-scan the
+    matches table for live leftovers (asserted via the sqlite statement trace)."""
+    from gamecollect.engine import CollectorEngine
+
+    db = tmp_path / "engine.db"
+    _prepare_restart_db(db, qualified("m1"))
+
+    provider = ScriptedDetailProvider([([], {"m1": _restart_ft_detail()}), ([], {}), ([], {})])
+    engine = CollectorEngine(make_pack(provider), str(db), SOURCE, 0.01, provider=provider)
+    scan_sql = "SELECT match_id FROM matches"
+    try:
+        statements: list[str] = []
+        engine._conn.set_trace_callback(statements.append)
+        engine.poll_once()
+        first_poll_scans = [s for s in statements if scan_sql in s]
+        assert len(first_poll_scans) == 1, "the first poll must scan stored live rows exactly once"
+        statements.clear()
+        engine.poll_once()
+        engine.poll_once()
+        assert [s for s in statements if scan_sql in s] == [], (
+            "subsequent polls must never re-run the restart scan"
+        )
+    finally:
+        engine._conn.set_trace_callback(None)
+        engine.close()
