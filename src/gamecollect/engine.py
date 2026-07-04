@@ -17,10 +17,13 @@ Loop posture (the contract the tests pin):
   :class:`~gamecollect.provider.ShapeDriftError` backs off *and* logs loudly
   with payload context. Both are non-fatal — the loop survives.
 * **Per-match drift isolation** — a re-sent seq whose fingerprint mutated
-  raises :class:`~gamecollect.db.writer.SequenceError`; the engine falls back
-  to per-event appends, skipping ONLY the conflicted seq(s) (loud ERROR, stored
-  rows never mutated) while genuinely new events land and the match keeps
-  collecting — other matches and the daemon are unaffected.
+  raises :class:`~gamecollect.db.writer.SequenceError`; the engine reconciles
+  against the ACTUALLY-STORED rows: events strictly beyond the stored head
+  still land (no wedge), conflicted or retroactively-inserted seqs at-or-below
+  the head are never written (loud ERROR on every poll they persist — stored
+  rows never mutated), and the diff baseline is rebuilt from the stored rows
+  so persistent drift keeps re-surfacing instead of being silently baselined
+  away. Other matches and the daemon are unaffected.
 * **Seed-before-child-write** — the engine never calls ``append_events``
   before the match row exists; it seeds through the pack's ``seed_match`` hook
   (core never imports a pack) and skips child writes when the hook returns
@@ -32,6 +35,7 @@ Loop posture (the contract the tests pin):
 
 from __future__ import annotations
 
+import json
 import logging
 import random
 import signal
@@ -95,6 +99,41 @@ def _event_to_row(event: NormalizedEvent) -> dict[str, Any]:
     if payload:
         row["payload"] = payload
     return row
+
+
+# NormalizedMatch top-level fields where ``None`` means "not provided" (identity
+# and timing/state fields optional on partial snapshots). A detail endpoint that
+# omits one must not wipe the scoreboard's value: detail wins where it has a
+# value; the scoreboard fills detail's Nones. ``status`` is a non-optional enum
+# and ``events``/``payload`` merge separately, so they are not listed.
+_MERGE_FILL_FIELDS = (
+    "home_team",
+    "away_team",
+    "kickoff_utc",
+    "minute",
+    "score_home",
+    "score_away",
+    "display_clock",
+)
+
+
+def _merge_detail(scoreboard: NormalizedMatch, detail: NormalizedMatch) -> NormalizedMatch:
+    """Merge a detail snapshot over its scoreboard snapshot, field by field.
+
+    Payload keys merge with detail winning; top-level fields take the detail
+    value unless it is ``None``, in which case the scoreboard value fills it —
+    a detail endpoint omitting ``kickoff_utc``/``home_team``/``away_team``
+    must not wipe stored identity/timing to NULL (or make ``seed_match``
+    return ``None`` and drop the poll's events).
+    """
+    payload = dict(scoreboard.payload)
+    payload.update(detail.payload)
+    fills = {
+        name: getattr(scoreboard, name)
+        for name in _MERGE_FILL_FIELDS
+        if getattr(detail, name) is None
+    }
+    return replace(detail, payload=payload, **fills)
 
 
 class CollectorEngine:
@@ -231,7 +270,12 @@ class CollectorEngine:
         returned ``None`` (missing identity, child writes skipped) or whose
         write raised leaves the baseline untouched, so a later poll re-diffs
         the FULL event list and catches up rather than baking the skipped
-        events into the baseline and losing them forever.
+        events into the baseline and losing them forever. ``_apply`` returns
+        the baseline snapshot to store — normally the incoming snapshot, but
+        after a sequence-drift reconciliation one whose event list is rebuilt
+        from the ACTUALLY-STORED rows, so unresolved drift (a conflicted or
+        retroactively-inserted seq) keeps re-diffing and re-logging instead of
+        being silently baselined away.
         """
         matches = self._fetch_poll_snapshots()
         if self._record_path is not None:
@@ -240,11 +284,11 @@ class CollectorEngine:
             if not diff.has_changes:
                 continue
             try:
-                applied = self._apply(diff)
+                baseline = self._apply(diff)
             except SequenceError as exc:
-                # Defensive net: _apply resolves fingerprint drift itself via
-                # the per-event fallback, so this only fires for a batch that
-                # failed pre-insert validation in a way the fallback also
+                # Defensive net: _apply reconciles fingerprint drift itself
+                # against the stored rows, so this only fires for a batch that
+                # failed pre-insert validation in a way the reconciliation also
                 # could not absorb. Leave self._last unchanged so a corrected
                 # list re-syncs.
                 log.error(
@@ -266,17 +310,19 @@ class CollectorEngine:
                     exc,
                 )
                 continue
-            if applied:
-                self._last[diff.match.match_id] = diff.match
+            if baseline is not None:
+                self._last[diff.match.match_id] = baseline
 
-    def _apply(self, diff: MatchDiff) -> bool:
+    def _apply(self, diff: MatchDiff) -> NormalizedMatch | None:
         """Seed the match through the pack hook, then append its new events.
 
-        Returns ``True`` when the match was seeded and its events (if any)
-        written, ``False`` when ``seed_match`` returned ``None`` and child
-        writes were skipped. The caller uses this to decide whether to advance
-        the diff baseline — a skipped match must NOT be baselined, or its
-        events would be treated as already-written on the next seedable poll.
+        Returns the snapshot the caller should advance the diff baseline to:
+        the incoming snapshot on a clean write, a snapshot whose event list is
+        rebuilt from the ACTUALLY-STORED rows after a sequence-drift
+        reconciliation (so unresolved drift keeps re-surfacing), or ``None``
+        when ``seed_match`` returned ``None`` and child writes were skipped —
+        a skipped match must NOT be baselined, or its events would be treated
+        as already-written on the next seedable poll.
         """
         match = diff.match
         seeded_id = self._pack.seed_match(self._conn, self._writer, match)
@@ -289,51 +335,127 @@ class CollectorEngine:
                 match.match_id,
                 self._source,
             )
-            return False
+            return None
+        baseline = match
         if diff.new_events:
             rows = [_event_to_row(e) for e in diff.new_events]
             try:
                 self._writer.append_events(seeded_id, rows)
             except SequenceError:
-                # At least one re-sent seq's fingerprint mutated (an in-place
-                # provider correction, e.g. a fixed scorer name). append_events
-                # is all-or-nothing, so a single conflicted seq would otherwise
-                # block every genuinely NEW event in the batch — forever, since
-                # diffing re-forwards the mutated seq on every poll. Fall back
-                # to per-event appends: skip only the conflicted seq(s) (loud,
-                # stored row kept — append-only discipline), insert the rest,
-                # and let the caller advance the baseline so the match keeps
-                # collecting.
-                self._append_events_individually(seeded_id, match.match_id, rows)
+                # At least one incoming seq conflicts with the stored stream
+                # (an in-place correction, a retroactive insert below the
+                # stored head, or a positional shift). append_events is
+                # all-or-nothing, so the whole batch — including genuinely NEW
+                # events — was rejected. Reconcile against the stored rows:
+                # only seqs strictly beyond the stored head are written, the
+                # conflicts stay loud, and the baseline is rebuilt from what
+                # is ACTUALLY stored so persistent drift re-diffs (and
+                # re-logs) every poll instead of being silently accepted.
+                stored_events = self._reconcile_sequence_conflict(seeded_id, match.match_id, rows)
+                baseline = replace(match, events=stored_events)
         self._pack.persist_side_tables(self._conn, self._writer, match, seeded_id)
-        return True
+        return baseline
 
-    def _append_events_individually(
+    def _reconcile_sequence_conflict(
         self, seeded_id: str, provider_match_id: str, rows: list[dict[str, Any]]
-    ) -> None:
-        """Append ``rows`` one seq at a time, skipping only the drifted ones.
+    ) -> list[NormalizedEvent]:
+        """Resolve a rejected batch against the stored rows; return what is stored.
 
-        Each row is its own single-element batch, in ascending seq order, so
-        the writer's strictly-increasing invariant holds for every insert it
-        actually performs. A row that raises
-        :class:`~gamecollect.db.writer.SequenceError` (fingerprint conflict
-        with the stored row, or non-monotonic seq) is logged at ERROR and
-        skipped — the stored row is never mutated; other writer rejections
-        stay fatal to the poll for this match (they propagate to
-        ``poll_once``'s per-match isolation).
+        The stored seq set is read from the database (not guessed from engine
+        memory). Policy, per seq in ascending order:
+
+        * seq at-or-below the stored head and STORED — attempt a
+          single-row append: an identical fingerprint is the writer's
+          idempotent no-op; a mutated fingerprint (in-place provider
+          correction) raises :class:`~gamecollect.db.writer.SequenceError`,
+          logged at ERROR — the stored row is never mutated (append-only).
+        * seq at-or-below the stored head and NOT stored — a retroactive
+          insertion (e.g. a VAR-restored event): never written (it would
+          violate the writer's monotonic invariant and could interleave two
+          timelines), logged at ERROR. Because the returned baseline excludes
+          it, it re-diffs and re-logs on every poll it persists —
+          loud-but-alive, not silently swallowed.
+        * seq strictly beyond the stored head — appended one row at a time in
+          ascending order, so the writer's strictly-increasing invariant holds
+          for every insert it performs.
+
+        Other writer rejections stay fatal to the poll for this match (they
+        propagate to ``poll_once``'s per-match isolation). Returns the events
+        stored AFTER reconciliation, for the caller to baseline from.
         """
+        stored_seqs = {event.seq for event in self._stored_events(seeded_id)}
+        head = max(stored_seqs) if stored_seqs else None
         for row in rows:
+            seq = row.get("seq")
+            if head is not None and isinstance(seq, int) and seq <= head:
+                if seq in stored_seqs:
+                    try:
+                        self._writer.append_events(seeded_id, [row])
+                    except SequenceError as exc:
+                        log.error(
+                            "event drift for match %s seq %s on source %s: %s "
+                            "(keeping stored row, skipping this event)",
+                            provider_match_id,
+                            seq,
+                            self._source,
+                            exc,
+                        )
+                else:
+                    log.error(
+                        "event drift for match %s seq %s on source %s: retroactive "
+                        "event insertion below stored head %s; event NOT written "
+                        "(re-logged every poll it persists)",
+                        provider_match_id,
+                        seq,
+                        self._source,
+                        head,
+                    )
+                continue
             try:
                 self._writer.append_events(seeded_id, [row])
             except SequenceError as exc:
+                # Defensive: a malformed seq (non-int, duplicate) the head
+                # check above could not classify.
                 log.error(
-                    "event drift for match %s seq %s on source %s: %s "
-                    "(keeping stored row, skipping this event)",
+                    "event drift for match %s seq %s on source %s: %s (skipping this event)",
                     provider_match_id,
-                    row.get("seq"),
+                    seq,
                     self._source,
                     exc,
                 )
+                continue
+            if isinstance(seq, int):
+                head = seq if head is None else max(head, seq)
+        return self._stored_events(seeded_id)
+
+    def _stored_events(self, seeded_id: str) -> list[NormalizedEvent]:
+        """Read the ACTUALLY-STORED event rows back as :class:`NormalizedEvent`s.
+
+        The inverse of :func:`_event_to_row` (``team``/``player``/``assist``
+        ride in the JSON payload), so a reconstructed baseline compares equal
+        to an unchanged incoming event under the diffing fingerprint.
+        """
+        rows = self._conn.execute(
+            "SELECT seq, type, minute, importance, detail, payload FROM events "
+            "WHERE source = ? AND match_id = ? ORDER BY seq",
+            (self._source, seeded_id),
+        ).fetchall()
+        events: list[NormalizedEvent] = []
+        for seq, event_type, minute, importance, detail, payload in rows:
+            extras = json.loads(payload) if payload else {}
+            events.append(
+                NormalizedEvent(
+                    seq=seq,
+                    minute=minute,
+                    event_type=event_type,
+                    importance=importance,
+                    team=extras.get("team"),
+                    player=extras.get("player"),
+                    assist=extras.get("assist"),
+                    detail=detail,
+                )
+            )
+        return events
 
     def _fetch_poll_snapshots(self) -> list[NormalizedMatch]:
         """Fetch the live slate, replacing in-progress rows with full detail.
@@ -345,19 +467,50 @@ class CollectorEngine:
         per-match summary endpoint. ``fetch_match_detail`` is a pure current-state
         read for replay/fakes, so this does not advance replay beyond the single
         ``fetch_live_matches`` call that defines a poll.
+
+        A match whose PREVIOUS baseline was live is also hydrated even when the
+        fresh status is not: the transition poll's final scoreboard snapshot
+        carries ``events=[]`` (the documented ESPN shape), so skipping detail
+        there would permanently lose stoppage-time events.
+
+        One match's failed detail fetch must not abort the slate: it is logged
+        (WARNING for unavailability, ERROR for shape drift) and that match
+        falls back to its scoreboard snapshot while the others proceed —
+        per-match isolation. Slate-level errors from ``fetch_live_matches``
+        still propagate to the loop's backoff.
         """
         matches = self._provider.fetch_live_matches()
         hydrated: list[NormalizedMatch] = []
         for match in matches:
-            if match.status in LIVE_STATUSES:
-                detail = self._provider.fetch_match_detail(match.match_id)
-                # Preserve scoreboard-level payload keys that a detail endpoint
-                # does not repeat, while letting detail-owned keys win.
-                payload = dict(match.payload)
-                payload.update(detail.payload)
-                hydrated.append(replace(detail, payload=payload))
-            else:
+            previous = self._last.get(match.match_id)
+            was_live = previous is not None and previous.status in LIVE_STATUSES
+            if match.status not in LIVE_STATUSES and not was_live:
                 hydrated.append(match)
+                continue
+            try:
+                detail = self._provider.fetch_match_detail(match.match_id)
+            except ProviderUnavailableError as exc:
+                log.warning(
+                    "detail fetch unavailable for match %s on source %s: %s "
+                    "(falling back to scoreboard snapshot; other matches proceed)",
+                    match.match_id,
+                    self._source,
+                    exc,
+                )
+                hydrated.append(match)
+                continue
+            except ShapeDriftError as exc:
+                log.error(
+                    "detail shape drift for match %s on source %s: %s "
+                    "(falling back to scoreboard snapshot; other matches proceed)",
+                    match.match_id,
+                    self._source,
+                    exc,
+                    exc_info=True,
+                )
+                hydrated.append(match)
+                continue
+            hydrated.append(_merge_detail(match, detail))
         return hydrated
 
     def stop(self) -> None:

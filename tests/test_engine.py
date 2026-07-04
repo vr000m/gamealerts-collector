@@ -202,6 +202,37 @@ class DetailProvider(MatchDataProvider):
         return self._details[match_id]
 
 
+class ScriptedDetailProvider(MatchDataProvider):
+    """Scripted scoreboard polls, each with its own per-match detail map.
+
+    ``polls`` is a list of ``(live_matches, details)`` pairs consumed one per
+    ``fetch_live_matches`` call; an exhausted script returns ``[]``. A detail
+    value that is an exception instance is RAISED by ``fetch_match_detail``
+    (per-match detail failure), otherwise returned as the detail snapshot.
+    """
+
+    def __init__(self, polls: list[tuple[list[NormalizedMatch], dict]]) -> None:
+        self._polls = list(polls)
+        self._i = 0
+        self._details: dict = {}
+        self.detail_calls: list[str] = []
+
+    def fetch_live_matches(self) -> list[NormalizedMatch]:
+        if self._i < len(self._polls):
+            live, details = self._polls[self._i]
+            self._i += 1
+            self._details = details
+            return list(live)
+        return []
+
+    def fetch_match_detail(self, match_id: str) -> NormalizedMatch:
+        self.detail_calls.append(match_id)
+        value = self._details[match_id]
+        if isinstance(value, BaseException):
+            raise value
+        return value
+
+
 def _seed_match(conn: sqlite3.Connection, writer, match: NormalizedMatch) -> str | None:
     """Fake ``SportPack.seed_match`` hook.
 
@@ -671,7 +702,11 @@ def test_sequence_drift_skips_match_but_others_keep_collecting(tmp_path, caplog)
         (ev(0, "yellow", detail="Booking"), ev(1, "goal", detail="Opener"), ev(2, "sub")),
     )
     p2_b = nm("B", (ev(0, "goal", detail="Opener"), ev(1, "goal", minute=40, detail="Second")))
-    provider = ScriptedProvider([[p1_a, p1_b], [p2_a, p2_b]])
+    # Poll 3: the provider re-sends the same SHIFTED snapshot for A. Because the
+    # baseline is rebuilt from the stored rows (not the incoming snapshot), the
+    # mismatch at seq 0 must re-diff and re-log — persistent shift corruption
+    # stays loud instead of being silently baselined away.
+    provider = ScriptedProvider([[p1_a, p1_b], [p2_a, p2_b], [p2_a, p2_b]])
 
     with caplog.at_level(logging.DEBUG):
         run_engine(_engine(make_pack(provider), db), provider)
@@ -679,12 +714,18 @@ def test_sequence_drift_skips_match_but_others_keep_collecting(tmp_path, caplog)
     # Match B was unaffected and kept collecting.
     assert event_seqs(db, qualified("B")) == [0, 1]
     # Match A's original seq 0 is intact — drift was skipped, not silently
-    # applied over the stored stream.
+    # applied over the stored stream, and NO event was ever inserted at or
+    # below the stored head (no duplicate seq-0 row, strictly monotonic tail).
     assert event_types(db, qualified("A"))[0] == "goal"
-    # The drift was logged loudly (WARNING or higher).
-    assert any(r.levelno >= logging.WARNING for r in caplog.records), (
-        "SequenceError drift must be logged loudly"
-    )
+    assert event_seqs(db, qualified("A")) == sorted(set(event_seqs(db, qualified("A"))))
+    # The drift was logged loudly (WARNING or higher) — and on EVERY poll the
+    # shifted snapshot persisted, not just the first.
+    drift_logs = [
+        r
+        for r in caplog.records
+        if r.levelno >= logging.WARNING and "drift" in r.getMessage() and "seq 0" in r.getMessage()
+    ]
+    assert len(drift_logs) >= 2, "persistent shift drift must be re-logged on every poll"
 
 
 def test_inplace_correction_skips_conflicted_seq_but_new_events_keep_landing(tmp_path, caplog):
@@ -692,10 +733,12 @@ def test_inplace_correction_skips_conflicted_seq_but_new_events_keep_landing(tmp
     fixed scorer name) must not wedge the match forever. Pre-fix, the batched
     ``append_events`` raised ``SequenceError`` before inserting anything, the
     baseline never advanced, and the identical failure repeated every poll —
-    genuinely NEW later events were never written. Post-fix the engine falls
-    back to per-event appends: the conflicted seq is skipped loudly (stored row
-    kept — append-only), the new seqs land, the baseline advances, and later
-    polls keep collecting. A sibling match in the same poll is unaffected."""
+    genuinely NEW later events were never written. Post-fix the engine
+    reconciles against the stored rows: the conflicted seq is skipped loudly
+    (stored row kept — append-only), the new seqs beyond the stored head land,
+    and the baseline is rebuilt from the STORED rows, so the still-mutated seq
+    keeps re-logging on later polls (loud-but-alive) while collection
+    continues. A sibling match in the same poll is unaffected."""
     db = tmp_path / "engine.db"
     # Poll 1: match A has seqs 0-1; match B has seq 0.
     p1_a = nm("A", (ev(0, "goal", detail="Opener"), ev(1, "goal", minute=20, detail="Second")))
@@ -713,7 +756,8 @@ def test_inplace_correction_skips_conflicted_seq_but_new_events_keep_landing(tmp
     )
     p2_b = nm("B", (ev(0, "goal", detail="Opener"), ev(1, "goal", minute=40, detail="Second")))
     # Poll 3: A gains one more event on top of the (still mutated) seq 1 — the
-    # match must still be collecting, and the drift must not re-fire.
+    # match must still be collecting, and the persistent seq-1 conflict must
+    # re-log (the baseline is rebuilt from stored rows, never the raw snapshot).
     p3_a = nm("A", (*p2_a.events, ev(4, "red", minute=70, detail="Sent off")))
     provider = ScriptedProvider([[p1_a, p1_b], [p2_a, p2_b], [p3_a, p2_b]])
 
@@ -737,15 +781,187 @@ def test_inplace_correction_skips_conflicted_seq_but_new_events_keep_landing(tmp
     finally:
         conn.close()
     assert players[1] == "Jonathan David", "stored event must NOT be mutated by the correction"
-    # The skip was loud: an ERROR record naming the conflicted seq.
+    # The skip was loud: an ERROR record naming the conflicted seq — on BOTH
+    # polls where the mutated seq 1 persisted (baseline from stored rows means
+    # unresolved drift keeps re-surfacing rather than being baselined away).
     drift_errors = [
         r
         for r in caplog.records
         if r.levelno >= logging.ERROR and "drift" in r.getMessage() and "seq 1" in r.getMessage()
     ]
-    assert drift_errors, "the skipped conflicted seq must be logged at ERROR level"
+    assert len(drift_errors) >= 2, (
+        "the conflicted seq must be logged at ERROR level on every poll it persists"
+    )
     # The sibling match kept collecting in the same polls.
     assert event_seqs(db, qualified("B")) == [0, 1]
+
+
+def test_retroactive_insert_below_head_is_never_written_and_stays_loud(tmp_path, caplog):
+    """A retroactively-inserted event (new seq BELOW the stored head, e.g. a
+    VAR-restored goal) must never be written — inserting under the head would
+    violate the writer's monotonic invariant and could interleave two
+    timelines — but it must NOT be silently baselined away either: it is
+    logged at ERROR on every poll it persists (loud-but-alive), while
+    genuinely new events beyond the head keep landing."""
+    db = tmp_path / "engine.db"
+    # Poll 1: seqs 0, 1, 3 stored (head = 3; the gap at 2 is legal).
+    p1 = nm("m1", (ev(0, "goal"), ev(1, "yellow", detail="Booking"), ev(3, "sub", minute=46)))
+    # Poll 2: the provider retroactively inserts seq 2 below the head AND adds
+    # a genuinely new seq 4 beyond it.
+    p2 = nm(
+        "m1",
+        (
+            ev(0, "goal"),
+            ev(1, "yellow", detail="Booking"),
+            ev(2, "goal", minute=25, detail="VAR-restored"),
+            ev(3, "sub", minute=46),
+            ev(4, "red", minute=70, detail="Sent off"),
+        ),
+    )
+    # Poll 3: the same snapshot again — the retro insert persists.
+    provider = ScriptedProvider([[p1], [p2], [p2]])
+    with caplog.at_level(logging.DEBUG):
+        run_engine(_engine(make_pack(provider), db), provider)
+
+    # Seq 4 landed (no wedge); seq 2 was never written (no insert below head).
+    assert event_seqs(db, qualified("m1")) == [0, 1, 3, 4]
+    # The retro insert was logged at ERROR on BOTH polls it persisted — it was
+    # not baked into the baseline and swallowed after the first poll.
+    retro_errors = [
+        r
+        for r in caplog.records
+        if r.levelno >= logging.ERROR
+        and "seq 2" in r.getMessage()
+        and "retroactive" in r.getMessage()
+    ]
+    assert len(retro_errors) >= 2, (
+        "a retroactively-inserted seq must be re-logged at ERROR on every poll it persists"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Detail hydration: live→final transition, per-match failure isolation, merge
+# --------------------------------------------------------------------------- #
+
+
+def test_live_to_finished_transition_hydrates_final_detail(tmp_path):
+    """When a match transitions live→FINISHED between polls, the transition
+    poll's scoreboard snapshot carries ``events=[]`` (the documented ESPN
+    shape). The engine must still hydrate it — the previous baseline was live —
+    or stoppage-time events are permanently lost. Once the FINAL baseline is
+    stored, later final polls need no detail fetch."""
+    from gamecollect.engine import CollectorEngine
+
+    db = tmp_path / "engine.db"
+    live_board = nm("m1", (), status=MatchStatus.IN_PLAY, minute=44)
+    live_detail = nm("m1", (ev(0, "goal", minute=44),), status=MatchStatus.IN_PLAY, minute=44)
+    ft_board = nm("m1", (), status=MatchStatus.FINISHED, minute=90, score_home=2)
+    ft_detail = nm(
+        "m1",
+        (ev(0, "goal", minute=44), ev(1, "goal", minute=95, detail="Stoppage winner")),
+        status=MatchStatus.FINISHED,
+        minute=90,
+        score_home=2,
+    )
+    provider = ScriptedDetailProvider(
+        [
+            ([live_board], {"m1": live_detail}),
+            ([ft_board], {"m1": ft_detail}),
+            # Already-final poll: previous baseline is FINISHED → no hydration.
+            ([ft_board], {"m1": ft_detail}),
+        ]
+    )
+    engine = CollectorEngine(make_pack(provider), str(db), SOURCE, 0.01, provider=provider)
+    try:
+        engine.poll_once()
+        engine.poll_once()
+        engine.poll_once()
+    finally:
+        engine.close()
+
+    # The stoppage-time event from the transition poll's detail landed.
+    assert event_seqs(db, qualified("m1")) == [0, 1]
+    state = reader.get_state(read_db(db), qualified("m1"))
+    assert state is not None and state["status"] == MatchStatus.FINISHED.value
+    # Hydrated on the live poll and the transition poll; NOT on the
+    # already-final third poll.
+    assert provider.detail_calls == ["m1", "m1"]
+
+
+@pytest.mark.parametrize(
+    ("error", "min_level"),
+    [
+        (ProviderUnavailableError("summary endpoint 503"), logging.WARNING),
+        (ShapeDriftError("unexpected summary payload shape"), logging.ERROR),
+    ],
+    ids=["unavailable", "shape-drift"],
+)
+def test_one_match_detail_failure_does_not_stop_siblings(tmp_path, caplog, error, min_level):
+    """One match's failing ``fetch_match_detail`` must not abort the slate:
+    the failed match falls back to its scoreboard snapshot (logged — WARNING
+    for unavailability, ERROR for shape drift) and every other match keeps
+    collecting in the same poll."""
+    from gamecollect.engine import CollectorEngine
+
+    db = tmp_path / "engine.db"
+    # A's scoreboard snapshot carries one event, so the fallback write is
+    # observable; B hydrates normally with two detail events.
+    a_board = nm("A", (ev(0, "goal"),), status=MatchStatus.IN_PLAY)
+    b_board = nm("B", (), status=MatchStatus.IN_PLAY)
+    b_detail = nm("B", (ev(0, "goal"), ev(1, "yellow", detail="Booking")))
+    provider = ScriptedDetailProvider([([a_board, b_board], {"A": error, "B": b_detail})])
+    engine = CollectorEngine(make_pack(provider), str(db), SOURCE, 0.01, provider=provider)
+    with caplog.at_level(logging.DEBUG):
+        try:
+            engine.poll_once()
+        finally:
+            engine.close()
+
+    # The sibling was hydrated and written — the slate was not aborted.
+    assert event_seqs(db, qualified("B")) == [0, 1]
+    # The failed match fell back to its scoreboard snapshot instead of dying.
+    assert event_seqs(db, qualified("A")) == [0]
+    failure_logs = [r for r in caplog.records if r.levelno >= min_level and "A" in r.getMessage()]
+    assert failure_logs, "a failed detail fetch must be logged at the documented level"
+
+
+def test_detail_none_top_level_fields_fall_back_to_scoreboard(tmp_path):
+    """A detail endpoint omitting top-level fields (``None``) must not wipe the
+    scoreboard's values: identity fields (home/away/kickoff) missing from the
+    detail would otherwise make ``seed_match`` return ``None`` (events dropped)
+    or NULL out stored kickoff/score/minute every poll."""
+    from gamecollect.engine import CollectorEngine
+
+    db = tmp_path / "engine.db"
+    board = nm("m1", (), status=MatchStatus.IN_PLAY)  # full identity + state
+    detail = nm(
+        "m1",
+        (ev(0, "goal"),),
+        status=MatchStatus.IN_PLAY,
+        minute=None,
+        score_home=None,
+        score_away=None,
+        display_clock=None,
+        home_team=None,
+        away_team=None,
+        kickoff_utc=None,
+    )
+    provider = ScriptedDetailProvider([([board], {"m1": detail})])
+    engine = CollectorEngine(make_pack(provider), str(db), SOURCE, 0.01, provider=provider)
+    try:
+        engine.poll_once()
+    finally:
+        engine.close()
+
+    # Identity survived the merge → the match seeded and its events landed.
+    assert event_seqs(db, qualified("m1")) == [0]
+    state = reader.get_state(read_db(db), qualified("m1"))
+    assert state is not None, "identity-less detail must not prevent seeding"
+    assert state["kickoff_utc"] == "2026-06-18T18:00:00Z", (
+        "detail None must not wipe scoreboard kickoff_utc"
+    )
+    assert state["score_home"] == 1 and state["score_away"] == 0
+    assert state["minute"] == 10
 
 
 # --------------------------------------------------------------------------- #
