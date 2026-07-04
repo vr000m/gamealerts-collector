@@ -80,108 +80,193 @@ def _to_int(value: object) -> int | None:
         return None
 
 
+def _to_float(value: object) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return float(value)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _to_text(value: object) -> str | None:
+    """Coerce a scalar to TEXT; a non-scalar (dict/list) becomes ``None``.
+
+    Provider payloads are untrusted JSON — binding a nested dict/list into a
+    TEXT column raises ``sqlite3.InterfaceError``, which must never crash the
+    hook (finding: side-table failures killed the daemon)."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (int, float)):
+        return str(value)
+    return None
+
+
+_STATS_COLUMNS = (
+    "source, match_id, team, possession, shots, shots_on_target, "
+    "corners, fouls, yellow_cards, red_cards, offsides"
+)
+_LINEUP_COLUMNS = (
+    "source, match_id, team, athlete_id, display_name, name_folded, "
+    "jersey, position, starter, subbed_in, subbed_out, "
+    "formation_place, home_away, formation"
+)
+
+
+def _stats_rows(
+    source: str, seeded_match_id: str, stats: list
+) -> dict[tuple[str, str, str], tuple]:
+    """Project the payload ``stats`` section onto football_stats row tuples.
+
+    Keyed by the table's PRIMARY KEY so a duplicate team entry within one
+    payload collapses last-wins (the old ON CONFLICT semantics). Non-scalar
+    values are coerced to ``None`` rather than passed to sqlite."""
+    rows: dict[tuple[str, str, str], tuple] = {}
+    for row in stats:
+        if not isinstance(row, dict):
+            continue
+        team = row.get("team")
+        if not isinstance(team, str) or not team:
+            continue
+        rows[(source, seeded_match_id, team)] = (
+            source,
+            seeded_match_id,
+            team,
+            _to_float(row.get("possession")),
+            _to_int(row.get("shots")),
+            _to_int(row.get("shots_on_target")),
+            _to_int(row.get("corners")),
+            _to_int(row.get("fouls")),
+            _to_int(row.get("yellow_cards")),
+            _to_int(row.get("red_cards")),
+            _to_int(row.get("offsides")),
+        )
+    return rows
+
+
+def _lineup_rows(
+    source: str, seeded_match_id: str, lineups: list
+) -> dict[tuple[str, str, str, str], tuple]:
+    """Project the payload ``lineups`` section onto football_lineups row tuples.
+
+    Keyed by the table's PRIMARY KEY (last-wins on duplicates, mirroring the
+    old ON CONFLICT semantics); non-scalar values coerce to ``None``."""
+    rows: dict[tuple[str, str, str, str], tuple] = {}
+    for lineup in lineups:
+        if not isinstance(lineup, dict):
+            continue
+        team = lineup.get("team")
+        if not isinstance(team, str) or not team:
+            continue
+        players = lineup.get("players") or []
+        if not isinstance(players, list):
+            continue
+        for player in players:
+            if not isinstance(player, dict):
+                continue
+            athlete_id = player.get("athlete_id")
+            display_name = player.get("display_name")
+            if athlete_id is None or not isinstance(athlete_id, (str, int)):
+                continue
+            if not display_name or not isinstance(display_name, str):
+                continue
+            key = (source, seeded_match_id, team, str(athlete_id))
+            rows[key] = (
+                source,
+                seeded_match_id,
+                team,
+                str(athlete_id),
+                display_name,
+                fold(display_name),
+                _to_text(player.get("jersey")),
+                _to_text(player.get("position")),
+                int(bool(player.get("starter"))),
+                int(bool(player.get("subbed_in"))),
+                int(bool(player.get("subbed_out"))),
+                _to_int(player.get("formation_place")),
+                _to_text(lineup.get("home_away")),
+                _to_text(lineup.get("formation")),
+            )
+    return rows
+
+
+def _replace_if_changed(
+    conn: sqlite3.Connection,
+    table: str,
+    columns: str,
+    source: str,
+    seeded_match_id: str,
+    desired: dict[tuple, tuple],
+) -> None:
+    """DELETE+reinsert the match's rows only when they actually changed.
+
+    The engine calls the side-table hook on EVERY applied diff (every clock
+    tick), but stats/lineups change far less often — a stateless
+    query-and-compare against the currently-stored rows skips the rewrite
+    when the incoming section is identical, instead of churning the WAL with
+    a full DELETE + reinsert per poll. DELETE+reinsert stays the write
+    mechanism because it is the correct semantics for removals."""
+    current = {
+        tuple(row)  # normalize: the engine's connection uses sqlite3.Row
+        for row in conn.execute(
+            f"SELECT {columns} FROM {table} WHERE source = ? AND match_id = ?",  # noqa: S608
+            (source, seeded_match_id),
+        )
+    }
+    if current == set(desired.values()):
+        return
+    conn.execute(
+        f"DELETE FROM {table} WHERE source = ? AND match_id = ?",  # noqa: S608
+        (source, seeded_match_id),
+    )
+    if desired:
+        placeholders = ", ".join("?" for _ in columns.split(","))
+        conn.executemany(
+            f"INSERT INTO {table} ({columns}) VALUES ({placeholders})",  # noqa: S608
+            list(desired.values()),
+        )
+
+
 def persist_football_side_tables(
     conn: sqlite3.Connection,
     writer: PartitionWriter,
     match: NormalizedMatch,
     seeded_match_id: str,
 ) -> None:
-    """Persist football detail payload extras into football-owned side tables."""
+    """Persist football detail payload extras into football-owned side tables.
+
+    Idempotent and cheap under re-polls: each section is projected onto row
+    tuples first (non-scalar payload values coerced to ``None``/skipped — a
+    provider glitch must not raise out of the hook), compared against the
+    stored rows, and rewritten (DELETE + reinsert, correct for removals) only
+    when it actually changed."""
     payload = match.payload or {}
     stats = payload.get("stats")
     lineups = payload.get("lineups")
 
     with conn:
         if isinstance(stats, list):
-            conn.execute(
-                "DELETE FROM football_stats WHERE source = ? AND match_id = ?",
-                (writer.source, seeded_match_id),
+            _replace_if_changed(
+                conn,
+                "football_stats",
+                _STATS_COLUMNS,
+                writer.source,
+                seeded_match_id,
+                _stats_rows(writer.source, seeded_match_id, stats),
             )
-            for row in stats:
-                if not isinstance(row, dict) or not row.get("team"):
-                    continue
-                conn.execute(
-                    "INSERT INTO football_stats "
-                    "(source, match_id, team, possession, shots, shots_on_target, "
-                    "corners, fouls, yellow_cards, red_cards, offsides) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
-                    "ON CONFLICT(source, match_id, team) DO UPDATE SET "
-                    "possession = excluded.possession, "
-                    "shots = excluded.shots, "
-                    "shots_on_target = excluded.shots_on_target, "
-                    "corners = excluded.corners, "
-                    "fouls = excluded.fouls, "
-                    "yellow_cards = excluded.yellow_cards, "
-                    "red_cards = excluded.red_cards, "
-                    "offsides = excluded.offsides",
-                    (
-                        writer.source,
-                        seeded_match_id,
-                        row["team"],
-                        row.get("possession"),
-                        _to_int(row.get("shots")),
-                        _to_int(row.get("shots_on_target")),
-                        _to_int(row.get("corners")),
-                        _to_int(row.get("fouls")),
-                        _to_int(row.get("yellow_cards")),
-                        _to_int(row.get("red_cards")),
-                        _to_int(row.get("offsides")),
-                    ),
-                )
-
         if isinstance(lineups, list):
-            conn.execute(
-                "DELETE FROM football_lineups WHERE source = ? AND match_id = ?",
-                (writer.source, seeded_match_id),
+            _replace_if_changed(
+                conn,
+                "football_lineups",
+                _LINEUP_COLUMNS,
+                writer.source,
+                seeded_match_id,
+                _lineup_rows(writer.source, seeded_match_id, lineups),
             )
-            for lineup in lineups:
-                if not isinstance(lineup, dict) or not lineup.get("team"):
-                    continue
-                team = lineup["team"]
-                players = lineup.get("players") or []
-                if not isinstance(players, list):
-                    continue
-                for player in players:
-                    if not isinstance(player, dict):
-                        continue
-                    athlete_id = player.get("athlete_id")
-                    display_name = player.get("display_name")
-                    if athlete_id is None or not display_name:
-                        continue
-                    conn.execute(
-                        "INSERT INTO football_lineups "
-                        "(source, match_id, team, athlete_id, display_name, name_folded, "
-                        "jersey, position, starter, subbed_in, subbed_out, "
-                        "formation_place, home_away, formation) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
-                        "ON CONFLICT(source, match_id, team, athlete_id) DO UPDATE SET "
-                        "display_name = excluded.display_name, "
-                        "name_folded = excluded.name_folded, "
-                        "jersey = excluded.jersey, "
-                        "position = excluded.position, "
-                        "starter = excluded.starter, "
-                        "subbed_in = excluded.subbed_in, "
-                        "subbed_out = excluded.subbed_out, "
-                        "formation_place = excluded.formation_place, "
-                        "home_away = excluded.home_away, "
-                        "formation = excluded.formation",
-                        (
-                            writer.source,
-                            seeded_match_id,
-                            team,
-                            str(athlete_id),
-                            display_name,
-                            fold(display_name),
-                            player.get("jersey"),
-                            player.get("position"),
-                            int(bool(player.get("starter"))),
-                            int(bool(player.get("subbed_in"))),
-                            int(bool(player.get("subbed_out"))),
-                            _to_int(player.get("formation_place")),
-                            lineup.get("home_away"),
-                            lineup.get("formation"),
-                        ),
-                    )
 
 
 def pack() -> SportPack:

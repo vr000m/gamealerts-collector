@@ -384,10 +384,14 @@ def register_unreconciled_match(
 
     # Merge the snapshot's sport extras (round_name, venue, HT scores, lineups,
     # stats — the adapter pins them to matches.payload; the engine merges
-    # scoreboard+detail payloads before seeding). Merged BEFORE the canonical
-    # team names below so canonical names still win over any raw provider
+    # scoreboard+detail payloads before seeding). Preserve-richer semantics:
+    # this re-runs every poll, and a sparser post-FT scoreboard snapshot must
+    # not clobber richer detail-derived stored values with None/empty — an
+    # incoming value only lands when it is non-empty (fresher data wins) or
+    # the key is missing entirely. Merged BEFORE the canonical team names
+    # below so canonical names still win over any raw provider
     # home_team/away_team keys a payload might carry.
-    payload.update(match.payload)
+    _merge_preserving_richer(payload, match.payload)
 
     # Fold provider names to the canonical DISPLAY name at the write seam
     # (the single authority): the unreconciled row carries `Turkey`, not
@@ -409,6 +413,127 @@ def register_unreconciled_match(
         }
     )
     return qualified_id
+
+
+def _is_empty_value(value: Any) -> bool:
+    """True for the "carries no information" payload values: None/""/[]/{}.
+
+    ``0``/``0.0``/``False`` are real data (a nil score, an unset flag) and are
+    NOT empty."""
+    if value is None:
+        return True
+    if isinstance(value, (str, list, dict, tuple)) and len(value) == 0:
+        return True
+    return False
+
+
+def _merge_preserving_richer(stored: dict[str, Any], incoming: dict[str, Any]) -> None:
+    """Merge *incoming* payload keys into *stored*, never losing richer data.
+
+    A non-empty incoming value always wins (fresher data replaces older,
+    non-empty-over-non-empty included). An EMPTY incoming value (None/""/
+    []/{}) only lands when the key is missing from *stored* — it never
+    replaces a stored non-empty value, so a sparse post-FT scoreboard
+    snapshot cannot clobber detail-derived stats/lineups the strip row
+    already carries."""
+    for key, value in incoming.items():
+        if key not in stored or not _is_empty_value(value):
+            stored[key] = value
+
+
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
+    ).fetchone()
+    return row is not None
+
+
+# Pack-owned side tables keyed by match_id that must follow a stub row when it
+# is adopted onto a late-appearing canonical schedule row.
+_MIGRATABLE_SIDE_TABLES = ("football_stats", "football_lineups")
+
+
+def _adopt_stub_rows(
+    conn: sqlite3.Connection, source: str, stub_id: str, canonical_id: str
+) -> bool:
+    """Migrate a source-qualified stub's child rows onto the canonical id.
+
+    When early polls collected on a ``<source>:<provider_id>`` stub (schedule
+    row absent) and the canonical schedule row appears later, the stub's
+    events, provider-id mappings, and football side-table rows would
+    otherwise be stranded — readers of the canonical match would silently
+    miss the early history. Migrates everything in ONE transaction (seqs
+    preserved) and deletes the stub ``matches`` row.
+
+    Safety policy on seq collisions: migration only proceeds when the
+    canonical row has NO events of its own (the common case — it was just
+    seeded from the schedule). If BOTH rows carry events, interleaving two
+    timelines could corrupt both, so nothing is migrated, an ERROR is logged
+    (re-logged every poll it persists), and the caller keeps collecting on
+    the stub. Partition discipline: only rows under *source* are touched.
+
+    Returns ``True`` when the stub is gone (migrated or never existed),
+    ``False`` on the both-have-events conflict.
+    """
+    stub_exists = (
+        conn.execute(
+            "SELECT 1 FROM matches WHERE source = ? AND match_id = ?", (source, stub_id)
+        ).fetchone()
+        is not None
+    )
+    if not stub_exists:
+        return True
+    (stub_events,) = conn.execute(
+        "SELECT COUNT(*) FROM events WHERE source = ? AND match_id = ?", (source, stub_id)
+    ).fetchone()
+    (canonical_events,) = conn.execute(
+        "SELECT COUNT(*) FROM events WHERE source = ? AND match_id = ?", (source, canonical_id)
+    ).fetchone()
+    if stub_events and canonical_events:
+        log.error(
+            "stub %s and canonical %s (source %s) BOTH carry events (%d stub, %d canonical); "
+            "refusing to interleave two timelines — keeping collection on the stub "
+            "(re-logged every poll this persists)",
+            stub_id,
+            canonical_id,
+            source,
+            stub_events,
+            canonical_events,
+        )
+        return False
+    with conn:
+        conn.execute(
+            "UPDATE events SET match_id = ? WHERE source = ? AND match_id = ?",
+            (canonical_id, source, stub_id),
+        )
+        conn.execute(
+            "UPDATE provider_match_map SET match_id = ? WHERE source = ? AND match_id = ?",
+            (canonical_id, source, stub_id),
+        )
+        for table in _MIGRATABLE_SIDE_TABLES:
+            if not _table_exists(conn, table):
+                continue
+            # UPDATE OR IGNORE skips any row whose PK already exists under the
+            # canonical id (canonical was just seeded, so normally none); the
+            # DELETE clears any such leftovers so no stub-keyed orphans remain.
+            conn.execute(
+                f"UPDATE OR IGNORE {table} SET match_id = ? "  # noqa: S608
+                f"WHERE source = ? AND match_id = ?",
+                (canonical_id, source, stub_id),
+            )
+            conn.execute(
+                f"DELETE FROM {table} WHERE source = ? AND match_id = ?",  # noqa: S608
+                (source, stub_id),
+            )
+        conn.execute("DELETE FROM matches WHERE source = ? AND match_id = ?", (source, stub_id))
+    log.info(
+        "adopted stub %s onto canonical %s (source %s): %d event(s) migrated, stub row deleted",
+        stub_id,
+        canonical_id,
+        source,
+        stub_events,
+    )
+    return True
 
 
 def seed_or_reconcile_match(
@@ -441,6 +566,16 @@ def seed_or_reconcile_match(
     """
     canonical_id = resolve_canonical_match_id(conn, writer, match, provider)
     if canonical_id is None:
+        return register_unreconciled_match(conn, writer, match)
+
+    # Late canonical reconciliation: if early polls collected on a
+    # source-qualified stub (schedule row absent then) and the canonical row
+    # appeared later, adopt the stub's events/mappings/side-table rows onto
+    # the canonical id so the early history is not stranded. On the unsafe
+    # both-have-events conflict, _adopt_stub_rows logs ERROR and we keep
+    # collecting on the stub (never corrupt two timelines).
+    stub_id = f"{writer.source}:{match.match_id}"
+    if canonical_id != stub_id and not _adopt_stub_rows(conn, writer.source, stub_id, canonical_id):
         return register_unreconciled_match(conn, writer, match)
 
     payload = _stored_payload(conn, canonical_id)

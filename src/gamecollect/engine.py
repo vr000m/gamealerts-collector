@@ -322,7 +322,10 @@ class CollectorEngine:
         reconciliation (so unresolved drift keeps re-surfacing), or ``None``
         when ``seed_match`` returned ``None`` and child writes were skipped —
         a skipped match must NOT be baselined, or its events would be treated
-        as already-written on the next seedable poll.
+        as already-written on the next seedable poll. ``None`` is also
+        returned when the pack's ``persist_side_tables`` hook raises: the
+        failure is logged (never fatal to the daemon) and the un-advanced
+        baseline gives side-table persistence a retry on the next poll.
         """
         match = diff.match
         seeded_id = self._pack.seed_match(self._conn, self._writer, match)
@@ -353,7 +356,27 @@ class CollectorEngine:
                 # re-logs) every poll instead of being silently accepted.
                 stored_events = self._reconcile_sequence_conflict(seeded_id, match.match_id, rows)
                 baseline = replace(match, events=stored_events)
-        self._pack.persist_side_tables(self._conn, self._writer, match, seeded_id)
+        try:
+            self._pack.persist_side_tables(self._conn, self._writer, match, seeded_id)
+        except Exception as exc:
+            # A pack hook must never kill the daemon (a malformed payload
+            # value binding into sqlite raises InterfaceError, for example).
+            # Core writes above already committed in their own transactions,
+            # so failing here would otherwise leave durable core state with
+            # missing/stale side tables and NO retry path. Returning None
+            # keeps the baseline un-advanced: the next poll re-diffs the full
+            # match, the idempotent core appends no-op, and the side-table
+            # hook gets a natural retry.
+            log.error(
+                "persist_side_tables failed for match %s (seeded id %s) on source %s: %s "
+                "(baseline not advanced; side tables retried next poll)",
+                match.match_id,
+                seeded_id,
+                self._source,
+                exc,
+                exc_info=True,
+            )
+            return None
         return baseline
 
     def _reconcile_sequence_conflict(

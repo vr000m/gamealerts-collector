@@ -624,6 +624,158 @@ def test_unseeded_poll_does_not_baseline_skipped_events(tmp_path):
     assert event_seqs(db, qualified("m1")) == [0, 1, 2]
 
 
+def test_side_table_hook_failure_survives_logs_and_retries_next_poll(tmp_path, caplog):
+    """A pack persist_side_tables hook raising (e.g. sqlite3.InterfaceError on
+    a malformed payload value) must NOT kill the daemon: the failure is logged
+    at ERROR, the match's diff baseline is NOT advanced, and the next poll
+    re-diffs the full match — idempotent core appends no-op while the
+    side-table write gets a natural retry and heals."""
+    from gamecollect.engine import CollectorEngine
+
+    db = tmp_path / "engine.db"
+    match = nm("m1", (ev(0, "goal"),))
+    provider = ScriptedProvider([[match], [match]])
+    pack = make_pack(provider)
+
+    calls: list[str] = []
+
+    def flaky_persist(conn, writer, m, seeded_id):
+        calls.append(seeded_id)
+        if len(calls) == 1:
+            raise sqlite3.InterfaceError("Error binding parameter 4: type 'dict'")
+        with conn:  # commit like the real pack hooks do
+            conn.execute(
+                "INSERT OR REPLACE INTO fake_side (source, match_id) VALUES (?, ?)",
+                (writer.source, seeded_id),
+            )
+
+    pack.persist_side_tables = flaky_persist
+
+    engine = CollectorEngine(pack, str(db), SOURCE, 0.01, provider=provider)
+    try:
+        with caplog.at_level(logging.DEBUG):
+            engine.poll_once()  # hook raises — daemon must survive
+            assert engine._last == {}, (
+                "a failed side-table write must not advance the diff baseline"
+            )
+            engine.poll_once()  # identical snapshot: re-diffs, retries, heals
+    finally:
+        engine.close()
+
+    assert calls == [qualified("m1"), qualified("m1")], (
+        "the hook must be retried on the next poll after a failure"
+    )
+    assert any(
+        r.levelno == logging.ERROR and "persist_side_tables failed" in r.getMessage()
+        for r in caplog.records
+    )
+    # Core events landed on poll 1 and were not duplicated by the retry.
+    assert event_seqs(db, qualified("m1")) == [0]
+    # The retry healed the side table.
+    conn = read_db(db)
+    try:
+        rows = conn.execute("SELECT source, match_id FROM fake_side").fetchall()
+    finally:
+        conn.close()
+    assert [tuple(r) for r in rows] == [(SOURCE, qualified("m1"))]
+
+
+def test_malformed_nested_payload_value_does_not_crash_football_hook(tmp_path):
+    """The ESPN shape drift that motivated the fix: a stats value arriving as a
+    nested dict ({"possession": {"pct": 55}}) must be coerced/skipped by the
+    football hook, not raise sqlite3.InterfaceError out of the poll."""
+    from gamecollect.engine import CollectorEngine
+    from gamecollect_football.pack import pack as football_pack
+
+    db = tmp_path / "football.db"
+    scoreboard = nm("760421", (), status=MatchStatus.IN_PLAY)
+    detail = nm("760421", (ev(0, "goal", team="Morocco"),), status=MatchStatus.IN_PLAY)
+    detail.payload = {
+        "stats": [
+            {"team": "Morocco", "possession": {"pct": 55}, "shots": "7", "corners": [3]},
+            {"team": {"name": "Haiti"}},  # non-scalar team key: row skipped
+        ],
+        "lineups": [
+            {
+                "team": "Morocco",
+                "home_away": {"side": "home"},  # non-scalar → None
+                "players": [
+                    {"athlete_id": "a1", "display_name": "Achraf Hakimi", "jersey": {"n": 2}},
+                    {"athlete_id": {"id": 9}, "display_name": "Skipped"},  # skipped
+                ],
+            }
+        ],
+    }
+    provider = DetailProvider([scoreboard], {"760421": detail})
+
+    engine = CollectorEngine(football_pack(), str(db), SOURCE, 0.01, provider=provider)
+    try:
+        engine.poll_once()  # must not raise
+    finally:
+        engine.close()
+
+    conn = read_db(db)
+    try:
+        stats = conn.execute(
+            "SELECT team, possession, shots, corners FROM football_stats ORDER BY team"
+        ).fetchall()
+        lineup = conn.execute(
+            "SELECT display_name, jersey, home_away FROM football_lineups"
+        ).fetchall()
+    finally:
+        conn.close()
+    assert [tuple(r) for r in stats] == [("Morocco", None, 7, None)]
+    assert [tuple(r) for r in lineup] == [("Achraf Hakimi", None, None)]
+    assert event_seqs(db, qualified("760421")) == [0]
+
+
+def test_late_canonical_schedule_row_adopts_stub_events(tmp_path):
+    """Review finding D, end-to-end through the engine: events collected on a
+    source-qualified stub while the schedule row was absent must migrate onto
+    the canonical id once it appears — new events keep appending after the
+    migrated head, the stub matches row is gone, nothing is stranded."""
+    from gamecollect.db.writer import PartitionWriter
+    from gamecollect.engine import CollectorEngine
+    from gamecollect_football.pack import pack as football_pack
+
+    db = tmp_path / "football.db"
+    poll1 = nm("760421", (ev(0, "goal"),), minute=10)
+    poll2 = nm("760421", (ev(0, "goal"), ev(1, "yellow", detail="Booking")), minute=30)
+    provider = ScriptedProvider([[poll1], [poll2]])
+
+    engine = CollectorEngine(football_pack(), str(db), SOURCE, 0.01, provider=provider)
+    try:
+        engine.poll_once()  # schedule row absent → stub collects
+        assert event_seqs(db, qualified("760421")) == [0]
+
+        # The canonical schedule row lands between polls.
+        PartitionWriter(engine._conn, SOURCE).upsert_match(
+            {
+                "match_id": "wc2026_md05_m01",
+                "status": "SCHEDULED",
+                "kickoff_utc": "2026-06-18T18:00:00Z",
+                "payload": {"home_team": "Canada", "away_team": "Qatar"},
+            }
+        )
+        engine.poll_once()  # adopts the stub, appends the new event
+    finally:
+        engine.close()
+
+    assert event_seqs(db, "wc2026_md05_m01") == [0, 1], (
+        "stub history plus the new event must all live under the canonical id"
+    )
+    conn = read_db(db)
+    try:
+        stub = reader.get_state(conn, qualified("760421"))
+        (stranded,) = conn.execute(
+            "SELECT COUNT(*) FROM events WHERE match_id = ?", (qualified("760421"),)
+        ).fetchone()
+    finally:
+        conn.close()
+    assert stub is None, "the orphaned stub matches row must be deleted"
+    assert stranded == 0
+
+
 def test_writer_taxonomy_error_skips_match_but_others_keep_collecting(tmp_path, caplog):
     db = tmp_path / "engine.db"
     # "bad" carries an undeclared event type → the writer raises TaxonomyError
