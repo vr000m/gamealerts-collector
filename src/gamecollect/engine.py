@@ -17,9 +17,10 @@ Loop posture (the contract the tests pin):
   :class:`~gamecollect.provider.ShapeDriftError` backs off *and* logs loudly
   with payload context. Both are non-fatal — the loop survives.
 * **Per-match drift isolation** — a re-sent seq whose fingerprint mutated
-  raises :class:`~gamecollect.db.writer.SequenceError`; the engine logs it and
-  skips that match for the poll, leaving other matches collecting and the
-  daemon up.
+  raises :class:`~gamecollect.db.writer.SequenceError`; the engine falls back
+  to per-event appends, skipping ONLY the conflicted seq(s) (loud ERROR, stored
+  rows never mutated) while genuinely new events land and the match keeps
+  collecting — other matches and the daemon are unaffected.
 * **Seed-before-child-write** — the engine never calls ``append_events``
   before the match row exists; it seeds through the pack's ``seed_match`` hook
   (core never imports a pack) and skips child writes when the hook returns
@@ -148,6 +149,11 @@ class CollectorEngine:
         self._poll_interval = float(poll_interval)
         self._provider = provider if provider is not None else pack.provider_factory()
         self._record_path = Path(record_path) if record_path is not None else None
+        if self._record_path is not None:
+            # Fail fast on an unusable --record target BEFORE any polling: a
+            # bad path discovered only at shutdown would lose the whole
+            # recorded session (close() flushes at most once).
+            self._validate_record_target(self._record_path)
         self._rng = rng if rng is not None else random.Random()
         self._stop_event = threading.Event()
         self._sleep = sleep if sleep is not None else self._stop_event.wait
@@ -159,6 +165,7 @@ class CollectorEngine:
         # baseline) and, when recording, the merged fixture accumulator.
         self._last: dict[str, NormalizedMatch] = {}
         self._record: dict[str, _RecordedMatch] = {}
+        self._record_flush_failed = False
         self._backoff_multiplier = 1
 
     # ------------------------------------------------------------------
@@ -235,9 +242,11 @@ class CollectorEngine:
             try:
                 applied = self._apply(diff)
             except SequenceError as exc:
-                # A re-sent seq's fingerprint shifted under the provider's
-                # positional list: loud per-match drift, not a daemon fault.
-                # Leave self._last unchanged so a corrected list re-syncs.
+                # Defensive net: _apply resolves fingerprint drift itself via
+                # the per-event fallback, so this only fires for a batch that
+                # failed pre-insert validation in a way the fallback also
+                # could not absorb. Leave self._last unchanged so a corrected
+                # list re-syncs.
                 log.error(
                     "event drift for match %s on source %s: %s (skipping match this poll)",
                     diff.match.match_id,
@@ -282,9 +291,49 @@ class CollectorEngine:
             )
             return False
         if diff.new_events:
-            self._writer.append_events(seeded_id, [_event_to_row(e) for e in diff.new_events])
+            rows = [_event_to_row(e) for e in diff.new_events]
+            try:
+                self._writer.append_events(seeded_id, rows)
+            except SequenceError:
+                # At least one re-sent seq's fingerprint mutated (an in-place
+                # provider correction, e.g. a fixed scorer name). append_events
+                # is all-or-nothing, so a single conflicted seq would otherwise
+                # block every genuinely NEW event in the batch — forever, since
+                # diffing re-forwards the mutated seq on every poll. Fall back
+                # to per-event appends: skip only the conflicted seq(s) (loud,
+                # stored row kept — append-only discipline), insert the rest,
+                # and let the caller advance the baseline so the match keeps
+                # collecting.
+                self._append_events_individually(seeded_id, match.match_id, rows)
         self._pack.persist_side_tables(self._conn, self._writer, match, seeded_id)
         return True
+
+    def _append_events_individually(
+        self, seeded_id: str, provider_match_id: str, rows: list[dict[str, Any]]
+    ) -> None:
+        """Append ``rows`` one seq at a time, skipping only the drifted ones.
+
+        Each row is its own single-element batch, in ascending seq order, so
+        the writer's strictly-increasing invariant holds for every insert it
+        actually performs. A row that raises
+        :class:`~gamecollect.db.writer.SequenceError` (fingerprint conflict
+        with the stored row, or non-monotonic seq) is logged at ERROR and
+        skipped — the stored row is never mutated; other writer rejections
+        stay fatal to the poll for this match (they propagate to
+        ``poll_once``'s per-match isolation).
+        """
+        for row in rows:
+            try:
+                self._writer.append_events(seeded_id, [row])
+            except SequenceError as exc:
+                log.error(
+                    "event drift for match %s seq %s on source %s: %s "
+                    "(keeping stored row, skipping this event)",
+                    provider_match_id,
+                    row.get("seq"),
+                    self._source,
+                    exc,
+                )
 
     def _fetch_poll_snapshots(self) -> list[NormalizedMatch]:
         """Fetch the live slate, replacing in-progress rows with full detail.
@@ -318,17 +367,22 @@ class CollectorEngine:
     def close(self) -> None:
         """Flush any recorded fixture and close the database connection (idempotent).
 
-        The flush is attempted at most once (``_record`` is cleared before the
-        write so a second ``close()`` after a failed flush does not re-raise) and
+        The flush is attempted at most once (a failure sets
+        ``_record_flush_failed`` so a second ``close()`` does not re-raise) and
         the connection is closed unconditionally in a ``finally`` — a
         ``write_fixture`` failure must not leak the WAL connection, and the CLI's
         redundant second ``close()`` must be a no-op that re-raises nothing.
+        ``_record`` is cleared only AFTER a successful flush: a failed flush
+        preserves the accumulated session in memory instead of destroying it.
         """
         try:
-            if self._record_path is not None and self._record:
-                recorded = self._record
+            if self._record_path is not None and self._record and not self._record_flush_failed:
+                try:
+                    self._flush_record(self._record)
+                except BaseException:
+                    self._record_flush_failed = True
+                    raise
                 self._record = {}
-                self._flush_record(recorded)
         finally:
             conn = getattr(self, "_conn", None)
             if conn is not None:
@@ -351,6 +405,30 @@ class CollectorEngine:
     # ------------------------------------------------------------------
     # Recording (--record)
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _validate_record_target(target: Path) -> None:
+        """Reject an unusable ``--record`` target at construction time.
+
+        A non-``.json`` path is treated as a directory by ``_flush_record``;
+        if it already exists as a regular file, every fixture write would fail
+        at shutdown — after a whole session was collected. A ``.json`` path
+        that exists as a directory is equally unwritable. Both fail fast here,
+        before any polling starts.
+        """
+        if target.suffix == ".json":
+            if target.is_dir():
+                raise ValueError(
+                    f"--record path {target} names a .json fixture file but is an "
+                    f"existing directory; pass a file path or a directory without "
+                    f"a .json suffix"
+                )
+        elif target.exists() and not target.is_dir():
+            raise ValueError(
+                f"--record path {target} is an existing file without a .json "
+                f"suffix and would be treated as a directory; pass a .json "
+                f"fixture path or a directory"
+            )
 
     def _accumulate_record(self, matches: list[NormalizedMatch]) -> None:
         for match in matches:

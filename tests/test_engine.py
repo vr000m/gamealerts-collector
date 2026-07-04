@@ -687,6 +687,67 @@ def test_sequence_drift_skips_match_but_others_keep_collecting(tmp_path, caplog)
     )
 
 
+def test_inplace_correction_skips_conflicted_seq_but_new_events_keep_landing(tmp_path, caplog):
+    """An in-place provider correction (same seq, changed fingerprint — e.g. a
+    fixed scorer name) must not wedge the match forever. Pre-fix, the batched
+    ``append_events`` raised ``SequenceError`` before inserting anything, the
+    baseline never advanced, and the identical failure repeated every poll —
+    genuinely NEW later events were never written. Post-fix the engine falls
+    back to per-event appends: the conflicted seq is skipped loudly (stored row
+    kept — append-only), the new seqs land, the baseline advances, and later
+    polls keep collecting. A sibling match in the same poll is unaffected."""
+    db = tmp_path / "engine.db"
+    # Poll 1: match A has seqs 0-1; match B has seq 0.
+    p1_a = nm("A", (ev(0, "goal", detail="Opener"), ev(1, "goal", minute=20, detail="Second")))
+    p1_b = nm("B", (ev(0, "goal", detail="Opener"),))
+    # Poll 2: A re-sends seq 1 with a CORRECTED scorer name (mutated
+    # fingerprint) plus genuinely new seqs 2 and 3; B gains a clean new event.
+    p2_a = nm(
+        "A",
+        (
+            ev(0, "goal", detail="Opener"),
+            ev(1, "goal", minute=20, player="Corrected Name", detail="Second"),
+            ev(2, "yellow", minute=55, detail="Booking"),
+            ev(3, "sub", minute=60, detail="Substitution"),
+        ),
+    )
+    p2_b = nm("B", (ev(0, "goal", detail="Opener"), ev(1, "goal", minute=40, detail="Second")))
+    # Poll 3: A gains one more event on top of the (still mutated) seq 1 — the
+    # match must still be collecting, and the drift must not re-fire.
+    p3_a = nm("A", (*p2_a.events, ev(4, "red", minute=70, detail="Sent off")))
+    provider = ScriptedProvider([[p1_a, p1_b], [p2_a, p2_b], [p3_a, p2_b]])
+
+    with caplog.at_level(logging.DEBUG):
+        run_engine(_engine(make_pack(provider), db), provider)
+
+    qid_a = qualified("A")
+    # New events (2, 3) landed despite the seq-1 conflict, and poll 3's seq 4
+    # landed too — the match kept collecting instead of wedging.
+    assert event_seqs(db, qid_a) == [0, 1, 2, 3, 4]
+    # The stored seq 1 keeps its ORIGINAL fingerprint — append-only discipline;
+    # the correction was skipped, not applied over the stored row.
+    conn = read_db(db)
+    try:
+        players = {
+            r["seq"]: json.loads(r["payload"])["player"]
+            for r in conn.execute(
+                "SELECT seq, payload FROM events WHERE match_id = ? ORDER BY seq", (qid_a,)
+            )
+        }
+    finally:
+        conn.close()
+    assert players[1] == "Jonathan David", "stored event must NOT be mutated by the correction"
+    # The skip was loud: an ERROR record naming the conflicted seq.
+    drift_errors = [
+        r
+        for r in caplog.records
+        if r.levelno >= logging.ERROR and "drift" in r.getMessage() and "seq 1" in r.getMessage()
+    ]
+    assert drift_errors, "the skipped conflicted seq must be logged at ERROR level"
+    # The sibling match kept collecting in the same polls.
+    assert event_seqs(db, qualified("B")) == [0, 1]
+
+
 # --------------------------------------------------------------------------- #
 # Clean shutdown
 # --------------------------------------------------------------------------- #
@@ -868,7 +929,7 @@ def test_close_flush_failure_closes_conn_and_is_idempotent(tmp_path):
     on a second ``close()``. The record path points through a regular file (so
     ``write_fixture``'s ``mkdir`` raises): the first ``close()`` surfaces the
     error once but still closes the connection; the second ``close()`` is a
-    no-op (the record was cleared before the flush was attempted)."""
+    no-op (a failed flush is not re-attempted)."""
     from gamecollect.engine import CollectorEngine
 
     db = tmp_path / "close.db"
@@ -887,6 +948,39 @@ def test_close_flush_failure_closes_conn_and_is_idempotent(tmp_path):
     with pytest.raises(OSError):
         engine.close()
     assert engine._conn is None, "connection must be closed even when the flush fails"
+    # The recorded session survives the failed flush — it is NOT destroyed.
+    assert engine._record, "a failed flush must preserve the record buffer, not clear it"
 
     # A second close() must not re-run the failing flush.
     engine.close()
+    assert engine._record, "the preserved record buffer must survive the idempotent re-close"
+
+
+def test_record_existing_non_json_file_fails_fast_at_construction(tmp_path):
+    """A ``--record`` path without a ``.json`` suffix is treated as a directory
+    by the flush writer. If it already exists as a regular FILE, every fixture
+    write would fail — at shutdown, after the whole session was collected. The
+    engine must reject it at construction time, before any polling starts."""
+    from gamecollect.engine import CollectorEngine
+
+    db = tmp_path / "engine.db"
+    blocker = tmp_path / "already-a-file"
+    blocker.write_text("not a directory")
+
+    provider = ScriptedProvider([])
+    with pytest.raises(ValueError, match="record"):
+        CollectorEngine(make_pack(provider), str(db), SOURCE, 0.01, record_path=str(blocker))
+    # Fail-fast must not have created the database either (no polling started).
+    assert not db.exists()
+
+
+def test_record_json_path_that_is_a_directory_fails_fast_at_construction(tmp_path):
+    from gamecollect.engine import CollectorEngine
+
+    db = tmp_path / "engine.db"
+    dir_named_json = tmp_path / "session.json"
+    dir_named_json.mkdir()
+
+    provider = ScriptedProvider([])
+    with pytest.raises(ValueError, match="record"):
+        CollectorEngine(make_pack(provider), str(db), SOURCE, 0.01, record_path=str(dir_named_json))
