@@ -380,7 +380,7 @@ def register_unreconciled_match(
     # function re-runs on every poll while the match stays unreconciled — a
     # bare {home_team, away_team} write would erase richer keys (stats,
     # lineups, schedule metadata) another path put on the row.
-    payload = _stored_payload(conn, qualified_id)
+    payload = reader.get_stored_payload(conn, qualified_id)
 
     # Merge the snapshot's sport extras (round_name, venue, HT scores, lineups,
     # stats — the adapter pins them to matches.payload; the engine merges
@@ -578,7 +578,7 @@ def seed_or_reconcile_match(
     if canonical_id != stub_id and not _adopt_stub_rows(conn, writer.source, stub_id, canonical_id):
         return register_unreconciled_match(conn, writer, match)
 
-    payload = _stored_payload(conn, canonical_id)
+    payload = reader.get_stored_payload(conn, canonical_id)
     schedule_home = payload.get("home_team")
     schedule_away = payload.get("away_team")
     payload.update(match.payload)
@@ -606,22 +606,6 @@ def seed_or_reconcile_match(
         }
     )
     return canonical_id
-
-
-def _stored_payload(conn: sqlite3.Connection, match_id: str) -> dict[str, Any]:
-    """Decode the stored ``matches.payload`` JSON for *match_id* (``{}`` when
-    absent/unparseable). Write paths must read-merge-write because
-    ``upsert_match`` replaces ``payload`` wholesale."""
-    existing = reader.get_state(conn, match_id)
-    payload: dict[str, Any] = {}
-    if existing is not None and existing.get("payload"):
-        try:
-            decoded = json.loads(existing["payload"])
-        except (TypeError, ValueError):
-            decoded = None
-        if isinstance(decoded, dict):
-            payload = decoded
-    return payload
 
 
 def _parse_instant(kickoff_iso: str | None) -> datetime | None:

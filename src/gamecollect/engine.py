@@ -589,8 +589,11 @@ class CollectorEngine:
         A non-``.json`` path is treated as a directory by ``_flush_record``;
         if it already exists as a regular file, every fixture write would fail
         at shutdown — after a whole session was collected. A ``.json`` path
-        that exists as a directory is equally unwritable. Both fail fast here,
-        before any polling starts.
+        that exists as a directory is equally unwritable. The same applies to
+        any *existing* component along the target's ancestry (e.g.
+        ``out/session.json`` where ``out`` is an existing regular file):
+        ``write_fixture``'s ``mkdir(parents=True)`` would raise at ``close()``.
+        All fail fast here, before any polling starts.
         """
         if target.suffix == ".json":
             if target.is_dir():
@@ -599,12 +602,27 @@ class CollectorEngine:
                     f"existing directory; pass a file path or a directory without "
                     f"a .json suffix"
                 )
-        elif target.exists() and not target.is_dir():
-            raise ValueError(
-                f"--record path {target} is an existing file without a .json "
-                f"suffix and would be treated as a directory; pass a .json "
-                f"fixture path or a directory"
-            )
+            ancestry_root = target.parent
+        else:
+            if target.exists() and not target.is_dir():
+                raise ValueError(
+                    f"--record path {target} is an existing file without a .json "
+                    f"suffix and would be treated as a directory; pass a .json "
+                    f"fixture path or a directory"
+                )
+            ancestry_root = target
+        # Walk to the nearest EXISTING ancestor (components below it do not
+        # exist yet and will be created by mkdir(parents=True) at flush time);
+        # if that ancestor is not a directory, the flush is doomed.
+        for ancestor in (ancestry_root, *ancestry_root.parents):
+            if ancestor.exists():
+                if not ancestor.is_dir():
+                    raise ValueError(
+                        f"--record path {target} requires {ancestor} to be a "
+                        f"directory, but it is an existing file; fixture writes "
+                        f"would fail at shutdown"
+                    )
+                break
 
     def _accumulate_record(self, matches: list[NormalizedMatch]) -> None:
         for match in matches:

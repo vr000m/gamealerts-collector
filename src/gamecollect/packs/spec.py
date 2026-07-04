@@ -8,11 +8,10 @@ below and are validated by :mod:`gamecollect.packs.registry` at load time.
 
 from __future__ import annotations
 
-import json
 import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from gamecollect.provider import MatchDataProvider, NormalizedMatch
 
@@ -59,15 +58,7 @@ def default_seed_match(
     """
     from gamecollect.db import reader  # runtime import: keep module import light
 
-    payload: dict[str, Any] = {}
-    existing = reader.get_state(conn, match.match_id)
-    if existing is not None and existing.get("payload"):
-        try:
-            decoded = json.loads(existing["payload"])
-        except (TypeError, ValueError):
-            decoded = None
-        if isinstance(decoded, dict):
-            payload = decoded
+    payload = reader.get_stored_payload(conn, match.match_id)
     payload.update(match.payload)
     if match.home_team is not None:
         payload["home_team"] = match.home_team

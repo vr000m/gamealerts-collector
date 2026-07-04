@@ -50,7 +50,11 @@ log = logging.getLogger(__name__)
 # The single-source-of-truth test subtracts these from the parser's subcommand
 # set to compare the remainder against the registry op names.
 HAND_WIRED_COMMANDS: tuple[str, ...] = ("collect", "tools")
-RESERVED_READ_OPTION_NAMES: frozenset[str] = frozenset({"db", "json"})
+# Option names a read subcommand's parser already takes: the CLI's own --db
+# and --json (added by _add_read_arguments) plus argparse's automatic --help.
+# A pack param with one of these names would make sub.add_argument raise
+# ArgumentError and kill the whole CLI, so such ops are skipped up front.
+RESERVED_READ_OPTION_NAMES: frozenset[str] = frozenset({"db", "json", "help"})
 
 
 def _copy_pack_with_operations(pack: Any, operations: tuple[Operation, ...]) -> Any:

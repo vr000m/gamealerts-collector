@@ -21,6 +21,7 @@ typed views belong to the client library layered on top (interfaces plan).
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import urllib.parse
 from pathlib import Path
@@ -36,6 +37,7 @@ __all__ = [
     "open_reader",
     "list_matches",
     "get_state",
+    "get_stored_payload",
     "get_events_since",
     "get_standings",
     "get_entity",
@@ -117,6 +119,27 @@ def get_state(conn: sqlite3.Connection, match_id: str) -> dict[str, Any] | None:
     """Return the current matches row for ``match_id``, or None if unknown."""
     rows = _query(conn, "SELECT * FROM matches WHERE match_id = ?", (match_id,))
     return rows[0] if rows else None
+
+
+def get_stored_payload(conn: sqlite3.Connection, match_id: str) -> dict[str, Any]:
+    """Decode the stored ``matches.payload`` JSON for ``match_id`` (``{}`` when
+    the row is absent or the payload is empty/unparseable/not an object).
+
+    The one deliberate exception to this module's raw-JSON-text rule: write
+    paths (core ``default_seed_match``, pack reconcilers) must read-merge-write
+    because ``upsert_match`` replaces ``payload`` wholesale, and they all need
+    the identical decode-or-empty-dict semantics.
+    """
+    existing = get_state(conn, match_id)
+    payload: dict[str, Any] = {}
+    if existing is not None and existing.get("payload"):
+        try:
+            decoded = json.loads(existing["payload"])
+        except (TypeError, ValueError):
+            decoded = None
+        if isinstance(decoded, dict):
+            payload = decoded
+    return payload
 
 
 def get_events_since(

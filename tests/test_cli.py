@@ -566,6 +566,7 @@ def test_pack_op_reserved_cli_option_collision_is_skipped(caplog):
         operations = (
             _test_operation("bad-db", "db"),
             _test_operation("bad-json", "json"),
+            _test_operation("bad-help", "help"),
             _test_operation("ok-pack-op", "team"),
         )
 
@@ -576,10 +577,16 @@ def test_pack_op_reserved_cli_option_collision_is_skipped(caplog):
 
     assert "bad-db" not in registry.names
     assert "bad-json" not in registry.names
+    # argparse auto-adds --help to every subparser; an op with a param named
+    # "help" would raise ArgumentError at sub.add_argument and kill the CLI.
+    assert "bad-help" not in registry.names
     assert "ok-pack-op" in registry.names
     assert any("bad-db" in rec.getMessage() and "db" in rec.getMessage() for rec in caplog.records)
     assert any(
         "bad-json" in rec.getMessage() and "json" in rec.getMessage() for rec in caplog.records
+    )
+    assert any(
+        "bad-help" in rec.getMessage() and "help" in rec.getMessage() for rec in caplog.records
     )
     cli.build_parser(registry)
 

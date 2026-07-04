@@ -1349,9 +1349,11 @@ def test_close_flush_failure_closes_conn_and_is_idempotent(tmp_path):
 
     db = tmp_path / "close.db"
     # A regular file where write_fixture needs a parent directory forces mkdir
-    # (and thus the flush) to raise.
+    # (and thus the flush) to raise. It is created AFTER construction —
+    # construction-time validation now rejects an existing-file ancestor, so
+    # the blocker must appear between poll and close to exercise the flush
+    # failure path.
     blocker = tmp_path / "blocker"
-    blocker.write_text("x")
     record = blocker / "session.json"
 
     match = nm("m1", (ev(0, "goal"),))
@@ -1359,6 +1361,7 @@ def test_close_flush_failure_closes_conn_and_is_idempotent(tmp_path):
     engine = CollectorEngine(make_pack(provider), str(db), SOURCE, 0.01, record_path=str(record))
     # One poll populates the record accumulator without run_engine's own close().
     engine.poll_once()
+    blocker.write_text("x")
 
     with pytest.raises(OSError):
         engine.close()
@@ -1399,3 +1402,60 @@ def test_record_json_path_that_is_a_directory_fails_fast_at_construction(tmp_pat
     provider = ScriptedProvider([])
     with pytest.raises(ValueError, match="record"):
         CollectorEngine(make_pack(provider), str(db), SOURCE, 0.01, record_path=str(dir_named_json))
+
+
+def test_record_json_path_with_existing_file_parent_fails_fast_at_construction(tmp_path):
+    """``--record out/session.json`` where ``out`` is an existing regular FILE:
+    the suffix is ``.json`` and the target is not a directory, but the flush's
+    ``mkdir(parents=True)`` would raise at close() — after a whole session was
+    collected. Construction must reject the existing-file ancestor."""
+    from gamecollect.engine import CollectorEngine
+
+    db = tmp_path / "engine.db"
+    out = tmp_path / "out"
+    out.write_text("not a directory")
+
+    provider = ScriptedProvider([])
+    with pytest.raises(ValueError, match="record"):
+        CollectorEngine(
+            make_pack(provider), str(db), SOURCE, 0.01, record_path=str(out / "session.json")
+        )
+    assert not db.exists()
+
+
+def test_record_deep_path_with_file_mid_ancestry_fails_fast_at_construction(tmp_path):
+    """A regular file anywhere along the not-yet-existing ancestry (here
+    ``a`` under a deep ``a/b/c/session.json`` target) is caught too — the
+    nearest EXISTING ancestor must be a directory."""
+    from gamecollect.engine import CollectorEngine
+
+    db = tmp_path / "engine.db"
+    mid = tmp_path / "a"
+    mid.write_text("file, not dir")
+
+    provider = ScriptedProvider([])
+    with pytest.raises(ValueError, match="record"):
+        CollectorEngine(
+            make_pack(provider),
+            str(db),
+            SOURCE,
+            0.01,
+            record_path=str(mid / "b" / "c" / "session.json"),
+        )
+    assert not db.exists()
+
+
+def test_record_nested_not_yet_existing_dirs_allowed(tmp_path):
+    """A nested target whose ancestry does not exist yet is fine — the flush
+    creates it with ``mkdir(parents=True)``. Validation must not reject it."""
+    from gamecollect.engine import CollectorEngine
+
+    db = tmp_path / "engine.db"
+    record = tmp_path / "new" / "dirs" / "session.json"
+
+    match = nm("m1", (ev(0, "goal"),))
+    provider = ScriptedProvider([[match]])
+    engine = CollectorEngine(make_pack(provider), str(db), SOURCE, 0.01, record_path=str(record))
+    engine.poll_once()
+    engine.close()
+    assert record.is_file()
