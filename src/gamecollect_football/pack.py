@@ -129,8 +129,8 @@ def _stats_rows(
     for row in stats:
         if not isinstance(row, dict):
             continue
-        team = row.get("team")
-        if not isinstance(team, str) or not team:
+        team = _to_text(row.get("team"))
+        if not team:
             continue
         rows[(source, seeded_match_id, team)] = (
             source,
@@ -159,8 +159,8 @@ def _lineup_rows(
     for lineup in lineups:
         if not isinstance(lineup, dict):
             continue
-        team = lineup.get("team")
-        if not isinstance(team, str) or not team:
+        team = _to_text(lineup.get("team"))
+        if not team:
             continue
         players = lineup.get("players") or []
         if not isinstance(players, list):
@@ -168,18 +168,16 @@ def _lineup_rows(
         for player in players:
             if not isinstance(player, dict):
                 continue
-            athlete_id = player.get("athlete_id")
-            display_name = player.get("display_name")
-            if athlete_id is None or not isinstance(athlete_id, (str, int)):
+            athlete_id = _to_text(player.get("athlete_id"))
+            display_name = _to_text(player.get("display_name"))
+            if not athlete_id or not display_name:
                 continue
-            if not display_name or not isinstance(display_name, str):
-                continue
-            key = (source, seeded_match_id, team, str(athlete_id))
+            key = (source, seeded_match_id, team, athlete_id)
             rows[key] = (
                 source,
                 seeded_match_id,
                 team,
-                str(athlete_id),
+                athlete_id,
                 display_name,
                 fold(display_name),
                 _to_text(player.get("jersey")),

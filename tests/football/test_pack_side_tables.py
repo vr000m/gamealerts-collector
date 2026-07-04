@@ -193,3 +193,34 @@ def test_helper_replace_uses_partition_and_match_scope(db):
     )
     assert counts.get("eur2028") == 2
     assert counts.get(SOURCE) is None
+
+
+def test_numeric_athlete_id_and_team_are_coerced_not_dropped(db):
+    """Scalar-but-not-str identifiers coerce to TEXT (review: narrowed filters
+    silently dropped rows the old hook stored)."""
+    conn, writer = db
+    payload = {
+        "lineups": [
+            {
+                "team": "Canada",
+                "players": [
+                    {"athlete_id": 12345.0, "display_name": "F. Point"},
+                    {"athlete_id": 67890, "display_name": "I. Nteger"},
+                ],
+            }
+        ],
+        "stats": [{"team": 42, "shots": 3}],
+    }
+    persist_football_side_tables(conn, writer, _match(payload), MATCH_ID)
+    ids = {
+        row[0]
+        for row in conn.execute(
+            "SELECT athlete_id FROM football_lineups WHERE match_id = ?", (MATCH_ID,)
+        )
+    }
+    assert ids == {"12345.0", "67890"}
+    teams = {
+        row[0]
+        for row in conn.execute("SELECT team FROM football_stats WHERE match_id = ?", (MATCH_ID,))
+    }
+    assert teams == {"42"}
