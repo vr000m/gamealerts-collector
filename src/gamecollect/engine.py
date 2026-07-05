@@ -93,6 +93,14 @@ _MAX_TRANSITION_TOTAL_ATTEMPTS = 10
 # re-emit forever. After this many emissions whose apply never landed, ONE
 # final ERROR is logged and the tracker is dropped.
 _MAX_GIVE_UP_EMISSIONS = 3
+# Abandonment COOLDOWN (see :class:`_Cooldown` and the ``_TransitionTracker``
+# docstring): after a match is abandoned it may be re-tracked only once this
+# many polls have elapsed, doubling per successive abandonment epoch (8, 16,
+# 32 … capped) so a match whose apply persistently fails retries at
+# exponentially spaced intervals instead of hot-looping a fresh give-up every
+# poll. The cooldown clears ONLY on a genuinely durable apply for the match.
+_COOLDOWN_BASE_POLLS = 8
+_COOLDOWN_MAX_POLLS = 256
 
 
 def _event_to_row(event: NormalizedEvent) -> dict[str, Any]:
@@ -231,6 +239,22 @@ def _merge_over_base(base: NormalizedMatch, snapshot: NormalizedMatch) -> Normal
 
 
 @dataclass
+class _Cooldown:
+    """Per-match abandonment cooldown (see ``_TransitionTracker`` docstring).
+
+    ``remaining`` is the number of polls left before the id may be re-tracked;
+    it is decremented once per poll and floors at 0 (the entry lingers at 0,
+    remembering ``epoch``, so the NEXT abandonment doubles the interval rather
+    than restarting at the base). ``epoch`` counts successive abandonments and
+    drives both the exponential ``remaining`` and the ERROR→WARN log downgrade.
+    The whole entry is popped only on a genuinely durable apply for the match.
+    """
+
+    remaining: int
+    epoch: int
+
+
+@dataclass
 class _TransitionTracker:
     """Per-match bookkeeping for a live→terminal transition in flight.
 
@@ -282,20 +306,43 @@ class _TransitionTracker:
       ``give_up_emissions`` bounds the re-emission: an UNPERSISTABLE snapshot
       (identity missing, ``seed_match`` → ``None`` forever) is abandoned with
       one final ERROR after ``_MAX_GIVE_UP_EMISSIONS`` emissions.
-    * **Abandonment is a per-run latch**: when a give-up snapshot's apply never
-      lands (``_MAX_GIVE_UP_EMISSIONS`` exhausted, or nothing was ever known to
-      persist) the tracker is popped AND the match id is recorded in
-      ``CollectorEngine._abandoned``. The latch gates ONLY the off-slate
-      vanished-match re-tracking path
-      (``CollectorEngine._hydrate_vanished_matches``) so the bounded give-up
-      cannot hot-loop forever on a match whose apply persistently fails. It does
-      NOT gate on-slate processing: any slate appearance — live or terminal — is
-      fetched/merged/applied normally, so a recoverable FINISHED board can still
-      close the row and a live board resume it. The latch clears ONLY on the
-      next DURABLE apply for the match (``_reconcile_live_apply`` for a live
-      board, ``_resolve_tracker`` for a terminal one) — never on mere slate
-      appearance, so a transient live flicker whose recovery write fails cannot
-      prematurely re-arm vanished re-tracking.
+    * **Abandonment enters a capped-exponential COOLDOWN, not a permanent
+      boolean latch** (round-9 redesign — a boolean could not satisfy the
+      behaviour matrix below). When a give-up snapshot's apply never lands
+      (``_MAX_GIVE_UP_EMISSIONS`` exhausted, or nothing was ever known to
+      persist) the tracker is popped AND a :class:`_Cooldown` is entered for the
+      id in ``CollectorEngine._cooldowns``. While the cooldown's ``remaining``
+      poll count is > 0 the id is NOT re-tracked — neither the off-slate
+      vanished path (``_hydrate_vanished_matches``) nor the on-slate transition
+      path builds a fresh tracker or re-emits a give-up for it — so a match
+      whose apply persistently fails cannot hot-loop a give-up every poll. Each
+      successive abandonment DOUBLES the cooldown (``epoch`` drives 8, 16, 32 …
+      capped at ``_COOLDOWN_MAX_POLLS``) and downgrades the abandonment log from
+      ERROR (first epoch) to a single WARN (later epochs). The cooldown does NOT
+      gate a genuinely recoverable board: an on-slate board whose detail fetch
+      SUCCEEDS is merged/applied normally even while cooling (a live board
+      resumes it, a FINISHED board closes it); only the give-up machinery
+      (fetch-failure/non-terminal tracker accrual + re-emission) is suppressed.
+      The cooldown is CLEARED (``_cooldowns.pop``) ONLY on a genuinely durable
+      apply for the match — one that actually wrote (``_reconcile_live_apply``
+      for a live board, ``_resolve_tracker`` for a terminal one). A no-change
+      snapshot (``diff.has_changes`` False) advanced nothing, so it is NOT
+      routed through the cooldown-clearing path (see
+      ``CollectorEngine._on_durable_snapshot``'s ``state_advanced`` gate) —
+      a live flicker that writes nothing must not re-arm re-tracking. The
+      behaviour matrix this design must satisfy (all hold):
+
+        a. persistent outage, on-slate terminal board whose apply keeps failing
+           → retry cycles exist but exponentially spaced; bounded log noise.
+        b. abandoned → live-during-outage (apply fails) → vanishes → outage
+           lifts → a later cooldown epoch re-tracks and persists the final
+           state (no permanent loss).
+        c. no-changes live flicker → cooldown state untouched.
+        d. recoverable FINISHED board after outage lifts → applied, persisted,
+           cooldown cleared (immediately when its detail fetch succeeds).
+        e. durable live recovery → normal collection, cooldown cleared.
+        f. transient live flicker with failing apply → no immediate re-track
+           (cooldown holds).
     * ``last_reported_status`` dedupes the non-terminal WARN: once per detail
       status change, not once per poll.
     """
@@ -380,19 +427,16 @@ class CollectorEngine:
         # invariants). Popped ONLY by _resolve_tracker after a non-live
         # snapshot for the match was durably applied.
         self._transitions: dict[str, _TransitionTracker] = {}
-        # Match ids whose give-up snapshot could never be durably applied and
-        # were abandoned this run (see _emit_give_up). Gates ONLY the off-slate
-        # vanished re-tracking path so a persistently-unapplyable match does not
-        # hot-loop a fresh bounded give-up every poll; on-slate appearances are
-        # processed normally. Cleared only on the next durable apply for the
-        # match (see _reconcile_live_apply / _resolve_tracker).
-        self._abandoned: set[str] = set()
-        # Provider ids that appeared LIVE on the slate this poll (repopulated
-        # each _fetch_poll_snapshots). Only these are treated as resumptions
-        # when their apply lands durably (budget/fallback reconciliation); a
-        # still-live vanished-match progress snapshot flows through the same
-        # apply path but must NOT reset its tracker (see _on_durable_snapshot).
-        self._live_resumptions: set[str] = set()
+        # Match ids in an abandonment COOLDOWN (see _Cooldown / _emit_give_up):
+        # a match whose give-up snapshot could not be durably applied is
+        # re-tracked only after its cooldown lapses, the interval doubling per
+        # successive abandonment. Gates BOTH the off-slate vanished re-tracking
+        # path and the on-slate give-up machinery so a persistently-unapplyable
+        # match retries at exponentially spaced intervals instead of hot-looping
+        # a fresh give-up every poll; a board whose detail fetch SUCCEEDS is
+        # still applied normally while cooling. Cleared only on the next durable
+        # apply for the match (see _reconcile_live_apply / _resolve_tracker).
+        self._cooldowns: dict[str, _Cooldown] = {}
         self._record: dict[str, _RecordedMatch] = {}
         self._record_flush_failed = False
         self._backoff_multiplier = 1
@@ -473,16 +517,25 @@ class CollectorEngine:
         retroactively-inserted seq) keeps re-diffing and re-logging instead of
         being silently baselined away.
         """
-        matches = self._fetch_poll_snapshots()
+        matches, live_resumptions = self._fetch_poll_snapshots()
         if self._record_path is not None:
             self._accumulate_record(matches)
         for diff in diff_matches(matches, self._last):
             if not diff.has_changes:
-                # Stored state already durably matches this snapshot: treat it
-                # as a durable apply — a pending terminal tracker is resolved
-                # (its state IS persisted) and any abandonment latch cleared,
-                # or a live resumption's fallback is reconciled.
-                self._on_durable_snapshot(diff.match.match_id, diff.match)
+                # Stored state already durably matches this snapshot. For a
+                # non-live snapshot this is a genuine durable state (the row IS
+                # persisted terminal), so a pending terminal tracker resolves
+                # and its cooldown clears. But a no-change LIVE snapshot
+                # advanced NOTHING (snapshot == baseline, zero writes): it must
+                # NOT clear a cooldown or drop a resumption's tracker, so it is
+                # routed with ``state_advanced=False`` (its live branch is a
+                # no-op) — see _on_durable_snapshot.
+                self._on_durable_snapshot(
+                    diff.match.match_id,
+                    diff.match,
+                    live_resumptions=live_resumptions,
+                    state_advanced=False,
+                )
                 continue
             try:
                 baseline = self._apply(diff)
@@ -514,12 +567,18 @@ class CollectorEngine:
             if baseline is not None:
                 self._last[diff.match.match_id] = baseline
                 # CONSUME point of the transition state machine: a DURABLE apply
-                # resolves a pending terminal tracker (and clears any
-                # abandonment latch), or reconciles a live resumption's fallback
-                # against the applied state. An apply failure above (baseline
-                # None / exception) retains the tracker so the captured terminal
-                # state is retried next poll.
-                self._on_durable_snapshot(diff.match.match_id, baseline)
+                # (a real write landed, ``state_advanced=True``) resolves a
+                # pending terminal tracker (and clears any abandonment cooldown),
+                # or reconciles a live resumption's fallback against the applied
+                # state. An apply failure above (baseline None / exception)
+                # retains the tracker so the captured terminal state is retried
+                # next poll.
+                self._on_durable_snapshot(
+                    diff.match.match_id,
+                    baseline,
+                    live_resumptions=live_resumptions,
+                    state_advanced=True,
+                )
 
     def _apply(self, diff: MatchDiff) -> NormalizedMatch | None:
         """Seed the match through the pack hook, then append its new events.
@@ -708,7 +767,27 @@ class CollectorEngine:
             )
         return events
 
-    def _fetch_poll_snapshots(self) -> list[NormalizedMatch]:
+    def _log_detail_fetch_failure(
+        self, match_id: str, exc: ProviderUnavailableError | ShapeDriftError
+    ) -> None:
+        """Log a detail-fetch failure: ERROR for shape drift, WARN for outage."""
+        if isinstance(exc, ShapeDriftError):
+            log.error(
+                "detail shape drift for match %s on source %s: %s",
+                match_id,
+                self._source,
+                exc,
+                exc_info=True,
+            )
+        else:
+            log.warning(
+                "detail fetch unavailable for match %s on source %s: %s",
+                match_id,
+                self._source,
+                exc,
+            )
+
+    def _fetch_poll_snapshots(self) -> tuple[list[NormalizedMatch], set[str]]:
         """Fetch the live slate, replacing in-progress rows with full detail.
 
         The provider contract allows ``fetch_live_matches`` to return a
@@ -757,7 +836,16 @@ class CollectorEngine:
         """
         matches = self._provider.fetch_live_matches()
         slate_ids = {m.match_id for m in matches}
-        self._live_resumptions = set()
+        # Provider ids that appeared LIVE on the slate this poll. Poll-scoped
+        # (returned to poll_once, never held as instance state) so a fetch
+        # exception cannot leak the previous poll's ids into this one's apply
+        # reconciliation. Only these are treated as resumptions when their apply
+        # lands durably; a still-live vanished-match progress snapshot flows
+        # through the same apply path but must NOT reset its tracker.
+        live_resumptions: set[str] = set()
+        # One poll elapsed: age every active abandonment cooldown before this
+        # poll's re-track gating reads it (an expired cooldown re-tracks now).
+        self._age_cooldowns()
         if not self._restart_scan_done:
             # First successful poll after (re)start: seed trackers for rows
             # left live in storage whose provider id is off the slate. Runs
@@ -772,12 +860,12 @@ class CollectorEngine:
                 # unconditionally, so an exhausted episode can never inherit into
                 # — and force-close — a genuinely live match, even if this poll's
                 # apply later fails. The fallback-supersession decision and the
-                # abandonment-latch clear both wait for the DURABLY APPLIED state
+                # abandonment-cooldown clear both wait for the DURABLY APPLIED state
                 # (:meth:`_reconcile_live_apply`, from ``poll_once``): the raw
                 # slate board's scores are often NULL (they arrive only from
                 # ``fetch_match_detail``, merged below), so neither can be judged
                 # here.
-                self._live_resumptions.add(match.match_id)
+                live_resumptions.add(match.match_id)
                 self._reset_resumption_budget(match.match_id)
             previous = self._last.get(match.match_id)
             was_live = (
@@ -793,15 +881,22 @@ class CollectorEngine:
                 hydrated.append(match)
                 continue
             in_transition = was_live and match.status not in LIVE_STATUSES
-            # NOTE: the abandonment latch (``self._abandoned``) is NOT consulted
-            # here. ANY slate appearance — live or terminal — is processed
-            # normally (fetch/merge/apply attempted): a recoverable FINISHED
-            # board must be able to close out an abandoned row, and a live board
-            # to resume it. The latch gates ONLY the off-slate vanished
-            # re-tracking path (:meth:`_hydrate_vanished_matches`) and clears on
-            # the next durable apply for the match.
+            # A recoverable board is ALWAYS processed (fetch/merge/apply): a
+            # FINISHED board closes an abandoned row, a live board resumes it,
+            # and either clears the cooldown on its durable apply. The cooldown
+            # gates only the give-up MACHINERY (tracker accrual + re-emission)
+            # for a transition whose detail fetch/apply keeps failing — while
+            # cooling we do not rebuild a tracker or re-emit a give-up, so an
+            # unapplyable match cannot hot-loop; the next retry waits for the
+            # cooldown to lapse (:meth:`_cooling_down`).
+            cooling = self._cooling_down(match.match_id)
             tracker = self._transitions.get(match.match_id)
             if in_transition and tracker is not None and self._tracker_at_cap(tracker):
+                if cooling:
+                    # A leftover at-cap tracker while cooling would only re-emit
+                    # a give-up: suppress it (abandonment already popped the
+                    # tracker, so this is defensive).
+                    continue
                 # A give-up is already due (typically re-emitted because its
                 # apply did not land last poll): skip the fetch, retry the
                 # durable write.
@@ -810,21 +905,14 @@ class CollectorEngine:
             try:
                 detail = self._provider.fetch_match_detail(match.match_id)
             except (ProviderUnavailableError, ShapeDriftError) as exc:
-                if isinstance(exc, ShapeDriftError):
-                    log.error(
-                        "detail shape drift for match %s on source %s: %s",
-                        match.match_id,
-                        self._source,
-                        exc,
-                        exc_info=True,
-                    )
-                else:
-                    log.warning(
-                        "detail fetch unavailable for match %s on source %s: %s",
-                        match.match_id,
-                        self._source,
-                        exc,
-                    )
+                if in_transition and cooling:
+                    # In cooldown: the fetch is STILL attempted (so a recovered
+                    # board applies immediately — matrix (d)), but a persistent
+                    # failure neither logs nor advances a tracker/give-up, so an
+                    # unresolvable board makes bounded noise — matrix (a). The
+                    # retry cycle resumes when the cooldown lapses.
+                    continue
+                self._log_detail_fetch_failure(match.match_id, exc)
                 if not in_transition:
                     # Live match, per-match isolation: fall back to the
                     # scoreboard snapshot; the others proceed.
@@ -855,9 +943,17 @@ class CollectorEngine:
                 # The transition hydration succeeded but did NOT yield a
                 # terminal snapshot: either the detail still says live over a
                 # non-live board, or both report a SCHEDULED/UNKNOWN provider
-                # reset. Count the attempt (bounded by the total cap) and keep
-                # the richest fallback either way; persist live progress, but
-                # never a non-live non-terminal reset.
+                # reset. Persist live progress, but never a non-live
+                # non-terminal reset.
+                if cooling:
+                    # In cooldown: persist live progress (a durable live apply
+                    # will clear the cooldown) but do NOT advance a tracker or
+                    # emit a give-up off a non-terminal reset.
+                    if merged.status in LIVE_STATUSES:
+                        hydrated.append(merged)
+                    continue
+                # Count the attempt (bounded by the total cap) and keep the
+                # richest fallback either way.
                 tracker = self._tracker(match.match_id)
                 tracker.fallback = self._richest_fallback(tracker.fallback, match)
                 tracker.total_attempts += 1
@@ -870,7 +966,7 @@ class CollectorEngine:
                 continue
             hydrated.append(merged)
         hydrated.extend(self._hydrate_vanished_matches(slate_ids))
-        return hydrated
+        return hydrated, live_resumptions
 
     def _hydrate_vanished_matches(self, slate_ids: set[str]) -> list[NormalizedMatch]:
         """Hydrate previously-live matches that dropped off the slate.
@@ -917,9 +1013,12 @@ class CollectorEngine:
         # A pending tracker also marks an unresolved transition (restart-gap
         # or mid-retry): never dropped by slate absence alone.
         tracked.update(m for m in self._transitions if m not in slate_ids)
-        # Abandoned ids must not be re-tracked off a stale live baseline that
-        # the failed give-up never advanced — that is the give-up hot-loop.
-        tracked -= self._abandoned
+        # Cooling-down ids must not be re-tracked off a stale live baseline that
+        # the failed give-up never advanced — that is the give-up hot-loop. The
+        # cooldown lapses after N polls (:meth:`_cooling_down`), so a genuinely
+        # unresolved vanished match is retried, just at exponentially spaced
+        # intervals rather than every poll.
+        tracked -= {m for m in tracked if self._cooling_down(m)}
         snapshots: list[NormalizedMatch] = []
         for match_id in sorted(tracked):
             tracker = self._tracker(match_id)
@@ -993,19 +1092,68 @@ class CollectorEngine:
             or tracker.total_attempts >= _MAX_TRANSITION_TOTAL_ATTEMPTS
         )
 
-    def _on_durable_snapshot(self, match_id: str, snapshot: NormalizedMatch) -> None:
+    def _age_cooldowns(self) -> None:
+        """Decrement every active abandonment cooldown by one poll (floor 0).
+
+        Run once per poll BEFORE the re-track gating reads the cooldowns, so an
+        entry that reaches 0 permits a re-track this poll. Expired entries
+        linger at 0 (they are popped only by a durable apply) so the ``epoch``
+        of the NEXT abandonment keeps growing the interval.
+        """
+        for cooldown in self._cooldowns.values():
+            if cooldown.remaining > 0:
+                cooldown.remaining -= 1
+
+    def _cooling_down(self, match_id: str) -> bool:
+        """True while ``match_id`` is within an unexpired abandonment cooldown."""
+        cooldown = self._cooldowns.get(match_id)
+        return cooldown is not None and cooldown.remaining > 0
+
+    def _enter_cooldown(self, match_id: str) -> int:
+        """Abandon ``match_id`` into a fresh cooldown; return the new epoch.
+
+        Each successive abandonment increments the epoch and DOUBLES the poll
+        interval (``_COOLDOWN_BASE_POLLS`` × 2^(epoch-1), capped at
+        ``_COOLDOWN_MAX_POLLS``), so a match whose apply persistently fails is
+        retried at exponentially spaced intervals. A prior (possibly expired)
+        entry supplies the epoch to grow from; a durable apply pops the entry
+        and resets the sequence.
+        """
+        previous = self._cooldowns.get(match_id)
+        epoch = previous.epoch + 1 if previous is not None else 1
+        remaining = min(_COOLDOWN_BASE_POLLS * (2 ** (epoch - 1)), _COOLDOWN_MAX_POLLS)
+        self._cooldowns[match_id] = _Cooldown(remaining=remaining, epoch=epoch)
+        return epoch
+
+    def _on_durable_snapshot(
+        self,
+        match_id: str,
+        snapshot: NormalizedMatch,
+        *,
+        live_resumptions: set[str],
+        state_advanced: bool,
+    ) -> None:
         """Route a durably-applied snapshot to the right tracker handler.
 
-        A durable non-live apply resolves a pending terminal tracker (and
-        clears any abandonment latch). A durable LIVE apply is reconciled as a
-        resumption ONLY when the match actually appeared live on the slate this
-        poll (``self._live_resumptions``): a still-live vanished-match progress
-        snapshot flows through this same apply path but is NOT a resumption —
-        resetting its tracker would stop the total-attempts cap from ever
-        force-closing a match whose detail never turns terminal.
+        A non-live apply resolves a pending terminal tracker (and clears any
+        abandonment cooldown) — a stored row already matching the terminal
+        snapshot (no-change) IS durably terminal, so this runs regardless of
+        ``state_advanced``.
+
+        A LIVE apply is reconciled as a resumption ONLY when a REAL write
+        landed (``state_advanced``) AND the match actually appeared live on the
+        slate this poll (``live_resumptions``). The ``state_advanced`` guard is
+        load-bearing: a no-change live flicker (snapshot == baseline, zero
+        writes) must NOT clear a cooldown or drop the resumption's tracker —
+        without proof the state advanced, a bogus flicker would re-arm
+        re-tracking on a match that never actually recovered. A still-live
+        vanished-match progress snapshot is likewise NOT a resumption (absent
+        from ``live_resumptions``) — resetting its tracker would stop the
+        total-attempts cap from ever force-closing a match whose detail never
+        turns terminal.
         """
         if snapshot.status in LIVE_STATUSES:
-            if match_id in self._live_resumptions:
+            if state_advanced and match_id in live_resumptions:
                 self._reconcile_live_apply(match_id, snapshot)
             return
         self._resolve_tracker(match_id, snapshot)
@@ -1035,16 +1183,17 @@ class CollectorEngine:
         """Reconcile a tracked match after a DURABLE live apply.
 
         A durable live apply proves normal collection has resumed, so the
-        abandonment latch (which only gates off-slate vanished re-tracking) is
-        cleared. The retained ``fallback`` is then judged against the APPLIED
-        state — not the raw slate board, whose scores are often NULL until the
-        detail merge lands: a fallback too sparse to persist, or one the applied
-        live score has already climbed past, is stale, so its tracker is
-        dropped; a rich fallback the live score has NOT surpassed is kept
-        (with the freshly reset budget) across a one-poll flicker until the
-        match vanishes again — a genuine fresh transition rebuilds the tracker.
+        abandonment cooldown is cleared (only reached with ``state_advanced`` —
+        a no-change flicker never gets here). The retained ``fallback`` is then
+        judged against the APPLIED state — not the raw slate board, whose scores
+        are often NULL until the detail merge lands: a fallback too sparse to
+        persist, or one the applied live score has already climbed past, is
+        stale, so its tracker is dropped; a rich fallback the live score has NOT
+        surpassed is kept (with the freshly reset budget) across a one-poll
+        flicker until the match vanishes again — a genuine fresh transition
+        rebuilds the tracker.
         """
-        self._abandoned.discard(match_id)
+        self._cooldowns.pop(match_id, None)
         tracker = self._transitions.get(match_id)
         if tracker is None:
             return
@@ -1160,15 +1309,19 @@ class CollectorEngine:
         ``give_up_pending`` stays set until :meth:`_resolve_tracker` observes
         the durable apply, so a failed write re-emits the SAME snapshot next
         poll instead of losing the captured terminal state. When nothing at
-        all is known to persist the tracker is dropped with an ERROR (there
-        is no write that could ever succeed). Re-emission is BOUNDED
+        all is known to persist the tracker is abandoned (there is no write
+        that could ever succeed). Re-emission is BOUNDED
         (``_MAX_GIVE_UP_EMISSIONS``): a snapshot whose apply never lands
         (e.g. missing identity — ``seed_match`` returns ``None`` every poll)
-        is abandoned with one final ERROR instead of re-emitting forever.
+        is abandoned instead of re-emitting forever. Abandonment pops the
+        tracker and enters a capped-exponential cooldown (:meth:`_enter_cooldown`)
+        so the give-up cannot hot-loop every poll; the abandonment log is ERROR
+        on the first epoch, a single WARN on later epochs.
         """
         snapshot = self._build_give_up_snapshot(match_id, tracker, fresh)
         if snapshot is None:
-            log.error(
+            self._abandon(
+                match_id,
                 "giving up on terminal detail hydration for match %s on source %s "
                 "after %d consecutive fetch failures / %d total attempts, and no "
                 "baseline, fallback, or stored row is known: nothing to persist",
@@ -1177,12 +1330,11 @@ class CollectorEngine:
                 tracker.consecutive_failures,
                 tracker.total_attempts,
             )
-            self._transitions.pop(match_id, None)
-            self._abandoned.add(match_id)
             return
         tracker.give_up_emissions += 1
         if tracker.give_up_emissions > _MAX_GIVE_UP_EMISSIONS:
-            log.error(
+            self._abandon(
+                match_id,
                 "could not persist terminal state for match %s on source %s: "
                 "the give-up snapshot's apply never landed after %d emissions "
                 "(e.g. identity missing, seed_match returns None every poll) — "
@@ -1191,11 +1343,21 @@ class CollectorEngine:
                 self._source,
                 _MAX_GIVE_UP_EMISSIONS,
             )
-            self._transitions.pop(match_id, None)
-            self._abandoned.add(match_id)
             return
         tracker.give_up_pending = True
         out.append(snapshot)
+
+    def _abandon(self, match_id: str, message: str, *log_args: Any) -> None:
+        """Pop the tracker, enter a cooldown, and log at the epoch-based level.
+
+        The FIRST abandonment (epoch 1) logs ERROR; each later epoch logs a
+        single WARN (one abandonment per epoch by construction), so a match
+        that keeps failing to persist does not spam ERROR every retry cycle
+        while still surfacing loudly the first time.
+        """
+        self._transitions.pop(match_id, None)
+        epoch = self._enter_cooldown(match_id)
+        log.log(logging.ERROR if epoch == 1 else logging.WARNING, message, *log_args)
 
     def _build_give_up_snapshot(
         self, match_id: str, tracker: _TransitionTracker, fresh: NormalizedMatch | None
@@ -1210,6 +1372,14 @@ class CollectorEngine:
         FINISHED when still live. The candidate is merged over the best base
         (baseline → fallback → stored row) so known identity and scores are
         never NULLed by a sparse snapshot.
+
+        INVARIANT 1 — MONOTONIC GIVE-UP: before returning, the result is guarded
+        against the DURABLY-STORED row (:meth:`_nonregress_over_stored`) so the
+        persisted give-up can never regress a higher already-stored score (a
+        stale fallback of 1-0 must not overwrite a durably-applied 2-0) nor a
+        higher stored status rank. This is the emission choke point that makes
+        ANY upstream retention policy safe by construction — the detection-time
+        and post-apply supersession checks remain only as best-effort hygiene.
         """
         baseline = self._last.get(match_id)
         stored: NormalizedMatch | None = None
@@ -1234,7 +1404,41 @@ class CollectorEngine:
         )
         if base is None and stored is None:
             base = self._stored_match_snapshot(match_id)
-        return _merge_over_base(base, snap) if base is not None else snap
+        result = _merge_over_base(base, snap) if base is not None else snap
+        return self._nonregress_over_stored(match_id, result)
+
+    def _nonregress_over_stored(self, match_id: str, snap: NormalizedMatch) -> NormalizedMatch:
+        """Guard a give-up snapshot against regressing the durably-stored row.
+
+        Scores are cumulative facts that never legitimately drop, so per side
+        the persisted value is the NON-regressing one: the stored score when the
+        candidate would null or lower it, else the candidate. Status likewise
+        never regresses below the stored row's lifecycle rank (a fallback's
+        SCHEDULED reset accepted as-is upstream must not overwrite a stored
+        FINISHED). With no stored row there is nothing to regress. This runs
+        at the single emission choke point so an apply failure that leaves a
+        stale fallback armed cannot beat a higher score already in the DB.
+        """
+        stored = self._stored_match_snapshot(match_id)
+        if stored is None:
+            return snap
+        overrides: dict[str, Any] = {}
+        for name in ("score_home", "score_away"):
+            guarded = self._non_regressing_score(getattr(snap, name), getattr(stored, name))
+            if guarded != getattr(snap, name):
+                overrides[name] = guarded
+        if _STATUS_RANK[stored.status] > _STATUS_RANK[snap.status]:
+            overrides["status"] = stored.status
+        return replace(snap, **overrides) if overrides else snap
+
+    @staticmethod
+    def _non_regressing_score(candidate: int | None, stored: int | None) -> int | None:
+        """The non-regressing score for one side: never below the stored value."""
+        if stored is None:
+            return candidate
+        if candidate is None:
+            return stored
+        return max(candidate, stored)
 
     def _resolve_tracker(self, match_id: str, snapshot: NormalizedMatch) -> None:
         """CONSUME point: pop the tracker after a DURABLE non-live apply.
@@ -1243,12 +1447,12 @@ class CollectorEngine:
         (or the snapshot produced no diff because stored state already
         matches). A pending give-up logs its ERROR here — persistence is
         claimed only after the write actually landed. A durable non-live apply
-        also clears the abandonment latch: the row has resolved, so the latch
-        is moot but must not linger and block later re-tracking.
+        also clears the abandonment cooldown: the row has resolved, so the
+        cooldown is moot but must not linger and block later re-tracking.
         """
         if snapshot.status in LIVE_STATUSES:
             return
-        self._abandoned.discard(match_id)
+        self._cooldowns.pop(match_id, None)
         tracker = self._transitions.pop(match_id, None)
         if tracker is None or not tracker.give_up_pending:
             return
@@ -1289,49 +1493,64 @@ class CollectorEngine:
         Gathers every stored row this source could hold for the match under
         all THREE id forms core knows — the bare provider id, the
         source-qualified ``f"{source}:{id}"`` stub, and the canonical
-        (reconciled) row reached through ``provider_match_map`` — as a single
-        deduplicated result. Shared by :meth:`_stored_match_snapshot` (which
-        takes ``rows[0]``) and :meth:`_stored_status_is_live` (which now also
-        reads only ``rows[0]``, not "any row"). The map join is skipped for
-        ``default_seed_match`` packs: that hook writes provider-native ids
-        verbatim, so no ``provider_match_map`` entry can exist and the join
-        would only cost a scan (mirrors :meth:`_resolve_stored_provider_id`'s
-        discrimination). This also means a source that switches from a
-        custom-seed pack to ``default_seed_match`` over an existing partition
-        will not see map-reachable canonical rows written under the old
-        strategy — accepted: the partition-per-writer contract does not
-        support switching seeding strategies over an existing source
-        partition.
+        (reconciled) row reached through ``provider_match_map`` — and returns
+        the single BEST row (``LIMIT 1``): both callers
+        (:meth:`_stored_match_snapshot`, :meth:`_stored_status_is_live`) read
+        only ``rows[0]``. The map join is skipped for ``default_seed_match``
+        packs: that hook writes provider-native ids verbatim, so no
+        ``provider_match_map`` entry can exist and the join would only cost a
+        scan (mirrors :meth:`_resolve_stored_provider_id`'s discrimination).
+        This also means a source that switches from a custom-seed pack to
+        ``default_seed_match`` over an existing partition will not see
+        map-reachable canonical rows written under the old strategy — accepted:
+        the partition-per-writer contract does not support switching seeding
+        strategies over an existing source partition.
 
-        Ordering is freshest-``updated_at``-first, with a deterministic
-        secondary key: on a TIED ``updated_at``, a row reached through the
-        canonical ``provider_match_map`` join (rank 0) is preferred over a
-        bare/qualified-id row (rank 1) — a sparse stale stub must not beat
-        the richer canonical row on a same-timestamp tie. A row reachable
-        through BOTH arms (its canonical id happens to equal the bare or
-        qualified id) is returned exactly ONCE, keeping its best (lowest)
-        rank — plain ``UNION ALL`` would otherwise duplicate it.
+        Ordering is AUTHORITY-FIRST — ``rank ASC, updated_at DESC`` — not
+        freshest-first. Rationale: after reconciliation every write lands on the
+        canonical (map-resolved) row, so it is AUTHORITATIVE whenever it exists;
+        a stub is meaningful only when no canonical row exists. Authority-first
+        means a still-LIVE canonical row is never masked by a fresher non-live
+        stub (transition hydration would wrongly be skipped and final events
+        lost), and an older live stub never overrides a fresher non-live
+        canonical row. Freshness (``updated_at DESC``) is the secondary key
+        WITHIN a rank tier. Rank tiers, fully deterministic so no tie is left to
+        arbitrary row order:
+
+        * custom-seed packs — canonical (map) 0, source-qualified stub 1, bare
+          provider-id stub 2 (writes land on the qualified/canonical form, so
+          the bare id is the least authoritative);
+        * ``default_seed_match`` packs — bare provider id 0, source-qualified
+          stub 1 (this hook writes bare ids verbatim, so the bare row is where
+          writes land).
+
+        A row reachable through BOTH the stub arm and the map arm (its canonical
+        id happens to equal the bare/qualified id) is returned exactly ONCE via
+        ``GROUP BY match_id`` picking ``MIN(rank)`` — plain ``UNION ALL`` would
+        otherwise duplicate it, and (per SQLite's single-``MIN`` bare-column
+        rule) the grouped row's columns come from that lowest-rank arm.
 
         ``columns`` selects the row shape: pass :data:`_STORED_MATCH_COLUMNS`
         (default) for the full row :meth:`_stored_match_snapshot` needs, or
         :data:`_STORED_LIVENESS_COLUMNS` for the narrow liveness probe that
         skips the payload JSON blob. Both column sets share this one query
         builder — the three-id-form SQL is never duplicated. ``columns`` MUST
-        include ``updated_at`` (the ordering key).
+        include ``updated_at`` (the secondary ordering key).
         """
         cols = ", ".join(columns)
         qualified = f"{self._source}:{provider_match_id}"
         if self._pack.seed_match is default_seed_match:
             return self._conn.execute(
-                f"SELECT {cols}, 1 AS rank FROM matches "
-                "WHERE source = ? AND match_id IN (?, ?) "
-                "ORDER BY updated_at DESC, rank ASC",
-                (self._source, provider_match_id, qualified),
+                f"SELECT {cols}, CASE WHEN match_id = ? THEN 0 ELSE 1 END AS rank "
+                "FROM matches WHERE source = ? AND match_id IN (?, ?) "
+                "ORDER BY rank ASC, updated_at DESC "
+                "LIMIT 1",
+                (provider_match_id, self._source, provider_match_id, qualified),
             ).fetchall()
         m_cols = ", ".join(f"m.{c}" for c in columns)
         return self._conn.execute(
             f"SELECT {cols}, MIN(rank) AS rank FROM ("
-            f"SELECT match_id, {cols}, 1 AS rank "
+            f"SELECT match_id, {cols}, CASE WHEN match_id = ? THEN 2 ELSE 1 END AS rank "
             "FROM matches WHERE source = ? AND match_id IN (?, ?) "
             "UNION ALL "
             f"SELECT m.match_id, {m_cols}, 0 AS rank "
@@ -1340,8 +1559,16 @@ class CollectorEngine:
             "WHERE pm.source = ? AND pm.provider_match_id = ?"
             ") candidates "
             "GROUP BY match_id "
-            "ORDER BY updated_at DESC, rank ASC",
-            (self._source, provider_match_id, qualified, self._source, provider_match_id),
+            "ORDER BY rank ASC, updated_at DESC "
+            "LIMIT 1",
+            (
+                provider_match_id,
+                self._source,
+                provider_match_id,
+                qualified,
+                self._source,
+                provider_match_id,
+            ),
         ).fetchall()
 
     def _stored_match_snapshot(self, provider_match_id: str) -> NormalizedMatch | None:
@@ -1360,11 +1587,11 @@ class CollectorEngine:
         find its canonical row here, or the give-up would have nothing to
         persist and the row would stay in-play forever. Whenever more than
         one id form has a row (e.g. a stale pre-reconciliation ``source:id``
-        stub alongside a fresher canonical row), the freshest
-        (``updated_at`` DESC) wins deterministically across ALL three forms
-        — never the first form queried; on a TIED ``updated_at`` the
-        canonical (map-resolved) row wins over a bare/qualified row (see
-        :meth:`_stored_rows_for_provider`'s rank tiebreak).
+        stub alongside a canonical row), the AUTHORITATIVE row wins — the
+        canonical (map-resolved) row when it exists, else the higher-ranked
+        stub — with freshness (``updated_at`` DESC) breaking ties only within
+        a rank tier (see :meth:`_stored_rows_for_provider`'s authority-first
+        order).
         """
         rows = self._stored_rows_for_provider(provider_match_id)
         if not rows:
@@ -1406,7 +1633,7 @@ class CollectorEngine:
         )
 
     def _stored_status_is_live(self, provider_match_id: str) -> bool:
-        """True when the FRESHEST stored ``matches`` row for this match is live.
+        """True when the AUTHORITATIVE stored ``matches`` row for this match is live.
 
         Consulted only for a non-live slate match with no in-memory diff
         baseline (a restart gap). The row is looked up under this source by
@@ -1422,12 +1649,13 @@ class CollectorEngine:
         non-baselined non-live slate match), which also skips the map join
         for ``default_seed_match`` packs, where no map entry can exist.
 
-        Evaluates ONLY the best (freshest, canonical-preferring) row's
-        status — consistent with :meth:`_stored_match_snapshot`, which merges
-        from that same row. Scanning "is ANY candidate row live" would let an
-        older live stub override a fresher non-live canonical row, wrongly
-        classifying a restart-gap match as a live→terminal transition when
-        the canonical row already recorded the terminal state.
+        Evaluates ONLY the best (authority-first, then freshest) row's status
+        — consistent with :meth:`_stored_match_snapshot`, which merges from that
+        same row. Scanning "is ANY candidate row live" would let an older live
+        stub override a fresher non-live canonical row, wrongly classifying a
+        restart-gap match as a live→terminal transition when the canonical row
+        already recorded the terminal state; freshest-first would inversely let
+        a fresher non-live stub mask a still-live canonical row.
         """
         rows = self._stored_rows_for_provider(
             provider_match_id, columns=self._STORED_LIVENESS_COLUMNS

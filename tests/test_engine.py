@@ -2706,12 +2706,14 @@ def test_score_advanced_resumption_drops_stale_fallback_at_give_up(tmp_path):
 
 
 def test_abandoned_tracker_does_not_hot_loop_and_recovers_on_live_reappearance(tmp_path, caplog):
-    """Round-7 finding B: once a give-up snapshot's apply is abandoned at the
-    emissions cap the tracker is popped, but the stale live baseline stays in
-    self._last — without the abandonment latch the vanished-match path
-    re-tracks a fresh tracker every poll and the bounded give-up hot-loops
-    forever. The latch must make abandonment terminal for the daemon's life,
-    while a genuine LIVE reappearance clears it so real resumption recovers."""
+    """Round-7 finding B, round-9 cooldown model: once a give-up snapshot's apply
+    is abandoned at the emissions cap the tracker is popped, but the stale live
+    baseline stays in self._last — without a re-track guard the vanished-match
+    path re-tracks a fresh tracker every poll and the bounded give-up hot-loops
+    forever. The abandonment cooldown must hold across the following polls (no
+    hot-loop), while a genuine LIVE reappearance clears it so real resumption
+    recovers. (Round-9: the guard is an exponential cooldown, not a permanent
+    boolean latch — but within this observed window it still holds unbroken.)"""
     from gamecollect.engine import (
         _MAX_GIVE_UP_EMISSIONS,
         _MAX_TRANSITION_DETAIL_FAILURES,
@@ -2745,13 +2747,15 @@ def test_abandoned_tracker_does_not_hot_loop_and_recovers_on_live_reappearance(t
             for _ in range(len(polls)):
                 engine.poll_once()
         abandon_errors = [r for r in caplog.records if "abandoning tracker" in r.getMessage()]
-        assert len(abandon_errors) == 1, "abandonment must latch — never re-fire the give-up cycle"
+        assert len(abandon_errors) == 1, (
+            "abandonment cooldown must hold — never re-fire the give-up cycle this window"
+        )
         assert engine._transitions == {}, (
             "an abandoned match must not be re-tracked off its stale live baseline (no hot-loop)"
         )
-        assert "m1" in engine._abandoned
+        assert engine._cooling_down("m1")
 
-        # Recovery: a genuine LIVE reappearance clears the latch; a clean FT
+        # Recovery: a genuine LIVE reappearance clears the cooldown; a clean FT
         # transition (outage lifted) then persists terminal state.
         outage["active"] = False
         live2 = nm("m1", (), status=MatchStatus.IN_PLAY, minute=70)
@@ -2764,15 +2768,15 @@ def test_abandoned_tracker_does_not_hot_loop_and_recovers_on_live_reappearance(t
             score_home=1,
         )
         provider._polls.extend([([live2], {"m1": live_detail2}), ([], {"m1": ft_detail})])
-        engine.poll_once()  # live reappearance clears the latch
-        assert "m1" not in engine._abandoned, "a genuine LIVE reappearance must clear the latch"
+        engine.poll_once()  # live reappearance clears the cooldown
+        assert "m1" not in engine._cooldowns, "a genuine LIVE reappearance must clear the cooldown"
         engine.poll_once()  # clean FT transition recovers
     finally:
         engine.close()
 
     state = reader.get_state(read_db(db), qualified("m1"))
     assert state is not None and state["status"] == MatchStatus.FINISHED.value, (
-        "after the latch clears, a genuine transition must persist terminal state"
+        "after the cooldown clears, a genuine transition must persist terminal state"
     )
 
 
@@ -2854,12 +2858,14 @@ def test_scoreboard_only_resumption_drops_stale_fallback_via_applied_score(tmp_p
 
 
 def test_finished_board_after_abandonment_persists_and_clears_latch(tmp_path, caplog):
-    """Round-8 finding B(1): the abandonment latch must NOT skip an on-slate
-    board. After a transient outage abandons a match, a later recoverable
-    FINISHED slate board must be fetched/merged/applied and persisted — a
-    finished match never goes live (the sole live-clear signal), so skipping it
-    would wedge the stored row stale until daemon restart. The durable terminal
-    apply also clears the latch."""
+    """Round-8 finding B(1) / round-9 matrix (d): the abandonment cooldown must
+    NOT skip an on-slate board whose detail fetch SUCCEEDS. After a transient
+    outage abandons a match, a later recoverable FINISHED slate board must be
+    fetched/merged/applied and persisted — a finished match never goes live (the
+    sole live-clear signal), so skipping it would wedge the stored row stale
+    until daemon restart. The cooldown gates only the give-up MACHINERY (a
+    failing fetch/apply), never a successful terminal apply; the durable terminal
+    apply also clears the cooldown."""
     from gamecollect.engine import (
         _MAX_GIVE_UP_EMISSIONS,
         _MAX_TRANSITION_DETAIL_FAILURES,
@@ -2888,7 +2894,7 @@ def test_finished_board_after_abandonment_persists_and_clears_latch(tmp_path, ca
         with caplog.at_level(logging.ERROR, logger="gamecollect.engine"):
             for _ in range(len(polls)):
                 engine.poll_once()
-        assert "m1" in engine._abandoned, "the failed give-up must latch abandonment"
+        assert engine._cooling_down("m1"), "the failed give-up must enter an abandonment cooldown"
 
         # A recoverable FINISHED board now appears ON the slate (outage lifted).
         outage["active"] = False
@@ -2902,11 +2908,11 @@ def test_finished_board_after_abandonment_persists_and_clears_latch(tmp_path, ca
             display_clock="FT",
         )
         provider._polls.append(([ft_board], {"m1": ft_board}))
-        engine.poll_once()  # on-slate terminal board must be processed despite the latch
+        engine.poll_once()  # on-slate terminal board must be processed despite the cooldown
     finally:
         engine.close()
 
-    assert "m1" not in engine._abandoned, "a durable terminal apply must clear the latch"
+    assert "m1" not in engine._cooldowns, "a durable terminal apply must clear the cooldown"
     state = reader.get_state(read_db(db), qualified("m1"))
     assert state is not None and state["status"] == MatchStatus.FINISHED.value, (
         "the recoverable FINISHED slate board must close the abandoned row"
@@ -2916,11 +2922,12 @@ def test_finished_board_after_abandonment_persists_and_clears_latch(tmp_path, ca
 
 
 def test_live_flicker_with_failing_apply_keeps_abandonment_latch(tmp_path, caplog):
-    """Round-8 finding B(2): the latch must clear ONLY on a DURABLE apply, never
-    on mere live slate appearance. An abandoned match's transient LIVE flicker
-    whose recovery write fails (here: missing identity → seed_match returns None)
-    must keep the latch, or it would re-arm off-slate vanished re-tracking and
-    burn the give-up cycle repeatedly on a match that never actually recovered."""
+    """Round-8 finding B(2) / round-9 matrix (f): the cooldown must clear ONLY on
+    a DURABLE apply, never on mere live slate appearance. An abandoned match's
+    transient LIVE flicker whose recovery write fails (here: missing identity →
+    seed_match returns None) must keep the cooldown, or it would re-arm off-slate
+    vanished re-tracking and burn the give-up cycle repeatedly on a match that
+    never actually recovered."""
     from gamecollect.engine import (
         _MAX_GIVE_UP_EMISSIONS,
         _MAX_TRANSITION_DETAIL_FAILURES,
@@ -2949,11 +2956,11 @@ def test_live_flicker_with_failing_apply_keeps_abandonment_latch(tmp_path, caplo
         with caplog.at_level(logging.ERROR, logger="gamecollect.engine"):
             for _ in range(len(polls)):
                 engine.poll_once()
-        assert "m1" in engine._abandoned
+        assert engine._cooling_down("m1")
 
         # A transient LIVE flicker appears, but its recovery apply FAILS: the
         # board is missing identity, so seed_match returns None and nothing is
-        # written. The latch must survive.
+        # written. The cooldown must survive.
         flicker = nm(
             "m1",
             (),
@@ -2965,19 +2972,19 @@ def test_live_flicker_with_failing_apply_keeps_abandonment_latch(tmp_path, caplo
         )
         provider._polls.append(([flicker], {"m1": flicker}))
         engine.poll_once()  # live flicker, apply fails
-        assert "m1" in engine._abandoned, (
-            "a live flicker whose recovery write fails must NOT clear the latch"
+        assert engine._cooling_down("m1"), (
+            "a live flicker whose recovery write fails must NOT clear the cooldown"
         )
         assert engine._transitions == {}, "the failed flicker must not re-arm a tracker"
 
-        # Prove no hot-loop: with the latch held, the off-slate vanished path
+        # Prove no hot-loop: with the cooldown held, the off-slate vanished path
         # stays gated across further empty polls — no fresh give-up ERROR.
         before = len(provider.detail_calls)
         provider._polls.extend([([], {}), ([], {})])
         engine.poll_once()
         engine.poll_once()
         assert provider.detail_calls[before:] == [], (
-            "the latched match must not be re-fetched off-slate (no hot-loop)"
+            "the cooling-down match must not be re-fetched off-slate (no hot-loop)"
         )
         # The give-up ERROR fired only during the pre-flicker abandonment (the
         # row was never durably closed); no give-up re-fired after the flicker.
@@ -3480,3 +3487,302 @@ def test_merge_over_base_non_empty_snapshot_value_still_wins():
 
     assert merged.payload["venue"] == "Lumen Field"
     assert merged.payload["possession"] == {"home": 55}
+
+
+# --------------------------------------------------------------------------- #
+# 2026-07 round-9 invariant redesign: monotonic give-up guard, authority-first
+# stored-row order, capped-exponential abandonment cooldown
+# --------------------------------------------------------------------------- #
+
+
+def test_give_up_never_regresses_durably_stored_score_with_stale_fallback_armed(tmp_path):
+    """INVARIANT 1 (monotonic give-up): a stale LOWER fallback armed on the
+    tracker must never overwrite a HIGHER already-durably-stored score at
+    give-up. The match reaches 2-0 durably, then a premature 1-0 FT board is
+    captured as the fallback while its detail fetch fails; the detail then keeps
+    failing to the cap. The give-up snapshot is built from the 1-0 fallback, but
+    the emission choke point guards it against the stored 2-0 and persists 2-0 —
+    without the guard the stored 2-0 would regress to 1-0."""
+    from gamecollect.engine import _MAX_TRANSITION_DETAIL_FAILURES, CollectorEngine
+
+    db = tmp_path / "engine.db"
+    live_2_0 = nm(
+        "m1", (ev(0, minute=30),), status=MatchStatus.IN_PLAY, minute=44, score_home=2, score_away=0
+    )
+    # A premature/buggy FT board reporting only 1-0 (stale) — captured as the
+    # fallback because its detail fetch fails on the transition poll.
+    ft_board_1_0 = nm(
+        "m1",
+        (ev(0, minute=30),),
+        status=MatchStatus.FINISHED,
+        minute=None,
+        score_home=1,
+        score_away=0,
+        display_clock="FT",
+    )
+    polls = [
+        ([live_2_0], {"m1": live_2_0}),  # durably store 2-0
+        ([ft_board_1_0], {"m1": ProviderUnavailableError("premature FT board")}),  # capture 1-0
+    ]
+    polls += [
+        ([], {"m1": ProviderUnavailableError(f"gone #{i}")})
+        for i in range(_MAX_TRANSITION_DETAIL_FAILURES)
+    ]
+    provider = ScriptedDetailProvider(polls)
+    engine = CollectorEngine(make_pack(provider), str(db), SOURCE, 0.01, provider=provider)
+    try:
+        for _ in range(len(polls)):
+            engine.poll_once()
+    finally:
+        engine.close()
+
+    state = reader.get_state(read_db(db), qualified("m1"))
+    assert state is not None and state["status"] == MatchStatus.FINISHED.value
+    assert state["score_home"] == 2 and state["score_away"] == 0, (
+        "the give-up must not regress the durably-stored 2-0 to the stale 1-0 fallback"
+    )
+
+
+def test_authority_first_live_canonical_beats_fresher_nonlive_stub(tmp_path):
+    """INVARIANT 2 (authority-first): a still-LIVE canonical (map-resolved) row
+    must be treated as live even when a FRESHER non-live source-qualified stub
+    exists. Authority (rank) leads, freshness only breaks ties within a tier —
+    so the fresher stub can never mask the live canonical row (which would skip
+    transition hydration and lose final events). Freshest-first ordering would
+    wrongly pick the stub and report NOT live."""
+    from gamecollect.db.connection import connect
+    from gamecollect.engine import CollectorEngine
+
+    db = tmp_path / "engine.db"
+    canonical_id = "canada-vs-qatar-2026-06-18"
+    conn = connect(str(db), side_table_ddl=FAKE_SIDE_TABLE_DDL)
+    try:
+        with conn:
+            # FRESHER non-live stub vs OLDER live canonical row.
+            _stored_row(
+                conn,
+                qualified("m1"),
+                status=MatchStatus.FINISHED,
+                score_home=2,
+                updated_at="2026-06-18T20:00:00Z",
+            )
+            _stored_row(
+                conn,
+                canonical_id,
+                status=MatchStatus.IN_PLAY,
+                score_home=1,
+                updated_at="2026-06-18T19:00:00Z",
+            )
+            conn.execute(
+                "INSERT INTO provider_match_map (source, provider, provider_match_id, match_id) "
+                "VALUES (?, ?, ?, ?)",
+                (SOURCE, "espn", "m1", canonical_id),
+            )
+    finally:
+        conn.close()
+
+    provider = ScriptedDetailProvider([])
+    engine = CollectorEngine(
+        make_pack(provider, seed_match=_reconciling_seed), str(db), SOURCE, 0.01, provider=provider
+    )
+    try:
+        is_live = engine._stored_status_is_live("m1")
+        snap = engine._stored_match_snapshot("m1")
+    finally:
+        engine.close()
+
+    assert is_live is True, "the live canonical row must win over the fresher non-live stub"
+    assert snap is not None and snap.status is MatchStatus.IN_PLAY and snap.score_home == 1
+
+
+def test_default_seed_bare_beats_qualified_stub_on_tied_updated_at(tmp_path):
+    """INVARIANT 2 (deterministic tie): under default_seed_match (writes land on
+    the BARE provider id) a bare row and a source-qualified stub TIED on
+    updated_at must resolve deterministically to the bare row — the old shared
+    rank left this to arbitrary row order."""
+    from gamecollect.db.connection import connect
+    from gamecollect.engine import CollectorEngine
+
+    db = tmp_path / "engine.db"
+    tied_at = "2026-06-18T20:00:00Z"
+    conn = connect(str(db), side_table_ddl=FAKE_SIDE_TABLE_DDL)
+    try:
+        with conn:
+            # Insert the qualified stub FIRST so rowid order would prefer it.
+            _stored_row(
+                conn, qualified("m1"), status=MatchStatus.IN_PLAY, score_home=9, updated_at=tied_at
+            )
+            _stored_row(conn, "m1", status=MatchStatus.IN_PLAY, score_home=5, updated_at=tied_at)
+    finally:
+        conn.close()
+
+    provider = ScriptedDetailProvider([])
+    engine = CollectorEngine(
+        make_pack(provider, seed_match=default_seed_match), str(db), SOURCE, 0.01, provider=provider
+    )
+    try:
+        snap = engine._stored_match_snapshot("m1")
+    finally:
+        engine.close()
+
+    assert snap is not None and snap.score_home == 5, (
+        "on a tied updated_at the bare (authoritative) row must win deterministically"
+    )
+
+
+def test_cooldown_untouched_by_no_change_live_flicker(tmp_path):
+    """INVARIANT 3 matrix (c): a no-changes LIVE flicker (snapshot == baseline,
+    diff.has_changes False, ZERO writes) must NOT clear or reset an abandonment
+    cooldown — the ~485 defect. Only a genuinely durable apply clears it."""
+    from gamecollect.engine import CollectorEngine, _Cooldown
+
+    db = tmp_path / "engine.db"
+    live = nm("m1", (ev(0, minute=20),), status=MatchStatus.IN_PLAY, minute=20)
+    provider = ScriptedDetailProvider([([live], {"m1": live})])
+    engine = CollectorEngine(make_pack(provider), str(db), SOURCE, 0.01, provider=provider)
+    engine._restart_scan_done = True
+    engine._last["m1"] = live  # baseline equals the incoming snapshot → no diff
+    engine._cooldowns["m1"] = _Cooldown(remaining=8, epoch=1)
+    try:
+        engine.poll_once()
+    finally:
+        engine.close()
+
+    assert engine._cooling_down("m1"), "a no-change live flicker must not clear the cooldown"
+    cooldown = engine._cooldowns["m1"]
+    assert cooldown.epoch == 1, "the cooldown epoch must not reset on a no-change flicker"
+    assert cooldown.remaining == 7, "the cooldown only ages one poll — it is not cleared/reset"
+
+
+def test_persistent_outage_on_slate_terminal_retries_are_exponentially_spaced(tmp_path, caplog):
+    """INVARIANT 3 matrix (a): an on-slate terminal board whose detail fetch AND
+    give-up apply persistently fail must retry at exponentially spaced intervals,
+    not hot-loop a fresh give-up every poll. The abandonment log is ERROR on the
+    first epoch then a single WARN per later epoch, and the per-poll
+    'detail fetch unavailable' noise is suppressed while cooling."""
+    from gamecollect.engine import CollectorEngine
+
+    db = tmp_path / "engine.db"
+    live1 = nm(
+        "m1", (ev(0, minute=20),), status=MatchStatus.IN_PLAY, minute=20, score_home=2, score_away=0
+    )
+    ft_board = nm(
+        "m1",
+        (ev(0, minute=20),),
+        status=MatchStatus.FINISHED,
+        minute=None,
+        score_home=2,
+        score_away=0,
+        display_clock="FT",
+    )
+    n = 60
+    polls = [([live1], {"m1": live1})]
+    polls += [([ft_board], {"m1": ProviderUnavailableError(f"detail down #{i}")}) for i in range(n)]
+    provider = ScriptedDetailProvider(polls)
+    pack = make_pack(provider)
+    original_persist = pack.persist_side_tables
+
+    def flaky_persist(conn, writer, match, seeded_id):
+        if match.status is MatchStatus.FINISHED:
+            raise RuntimeError("permanent side-table outage")
+        return original_persist(conn, writer, match, seeded_id)
+
+    pack.persist_side_tables = flaky_persist
+    engine = CollectorEngine(pack, str(db), SOURCE, 0.01, provider=provider)
+    try:
+        with caplog.at_level(logging.WARNING, logger="gamecollect.engine"):
+            for _ in range(len(polls)):
+                engine.poll_once()
+    finally:
+        engine.close()
+
+    abandons = [r for r in caplog.records if "abandoning tracker" in r.getMessage()]
+    error_abandons = [r for r in abandons if r.levelno == logging.ERROR]
+    warn_abandons = [r for r in abandons if r.levelno == logging.WARNING]
+    assert len(error_abandons) == 1, "only the FIRST abandonment epoch may log ERROR"
+    assert len(warn_abandons) >= 1, "later epochs must re-abandon (retries exist), at WARN"
+    assert len(abandons) <= 4, (
+        "retries must be exponentially spaced — a per-poll hot-loop would abandon ~10 times "
+        f"in {n} polls, got {len(abandons)}"
+    )
+    unavailable = [r for r in caplog.records if "detail fetch unavailable" in r.getMessage()]
+    assert len(unavailable) < 20, (
+        "per-poll fetch-failure noise must be suppressed while cooling (bounded, not ~60)"
+    )
+
+
+def test_abandoned_then_live_flicker_then_recovers_after_cooldown_no_permanent_loss(
+    tmp_path, caplog
+):
+    """INVARIANT 3 matrix (b): abandoned → live-during-outage (apply fails) →
+    vanishes → outage lifts → a later cooldown epoch re-tracks and persists the
+    final state. The final events must land — abandonment must never mean
+    permanent loss once the provider recovers."""
+    from gamecollect.engine import (
+        _MAX_GIVE_UP_EMISSIONS,
+        _MAX_TRANSITION_DETAIL_FAILURES,
+        CollectorEngine,
+    )
+
+    db = tmp_path / "engine.db"
+    live1 = nm(
+        "m1", (ev(0, minute=20),), status=MatchStatus.IN_PLAY, minute=20, score_home=2, score_away=0
+    )
+    # Live-during-outage flicker with MISSING identity → seed_match returns None,
+    # so its apply fails and cannot clear the cooldown.
+    flicker = nm(
+        "m1",
+        (),
+        status=MatchStatus.IN_PLAY,
+        minute=70,
+        home_team=None,
+        away_team=None,
+        kickoff_utc=None,
+    )
+    ft_detail = nm(
+        "m1",
+        (ev(0, minute=20), ev(1, minute=95, detail="Stoppage winner")),
+        status=MatchStatus.FINISHED,
+        minute=None,
+        score_home=2,
+        score_away=1,
+    )
+
+    n_abandon = _MAX_TRANSITION_DETAIL_FAILURES + _MAX_GIVE_UP_EMISSIONS  # reach abandonment
+    polls = [([live1], {"m1": live1})]
+    polls += [([], {"m1": ProviderUnavailableError(f"gone #{i}")}) for i in range(n_abandon)]
+    polls += [([flicker], {"m1": flicker})]  # live-during-outage, apply fails
+    # Plenty of empty polls with a recoverable FINISHED detail available: while
+    # cooling the vanished path never fetches it; once the cooldown lapses it does.
+    polls += [([], {"m1": ft_detail}) for _ in range(12)]
+
+    provider = ScriptedDetailProvider(polls)
+    pack = make_pack(provider)
+    original_persist = pack.persist_side_tables
+    outage = {"active": True}
+
+    def flaky_persist(conn, writer, match, seeded_id):
+        if match.status is MatchStatus.FINISHED and outage["active"]:
+            raise RuntimeError("side-table outage")
+        return original_persist(conn, writer, match, seeded_id)
+
+    pack.persist_side_tables = flaky_persist
+    engine = CollectorEngine(pack, str(db), SOURCE, 0.01, provider=provider)
+    try:
+        for i in range(len(polls)):
+            if i == 1 + n_abandon:
+                # After abandonment, before the live flicker: the outage lifts.
+                outage["active"] = False
+            engine.poll_once()
+            if i == 1 + n_abandon:
+                assert engine._cooling_down("m1"), "abandonment must have entered a cooldown"
+    finally:
+        engine.close()
+
+    assert "m1" not in engine._cooldowns, "recovery after the cooldown lapsed must clear it"
+    state = reader.get_state(read_db(db), qualified("m1"))
+    assert state is not None and state["status"] == MatchStatus.FINISHED.value
+    assert state["score_home"] == 2 and state["score_away"] == 1
+    assert event_seqs(db, qualified("m1")) == [0, 1], (
+        "the final stoppage event must land — no permanent loss after recovery"
+    )
