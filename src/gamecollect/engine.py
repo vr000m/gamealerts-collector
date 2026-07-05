@@ -247,11 +247,20 @@ class _Cooldown:
     remembering ``epoch``, so the NEXT abandonment doubles the interval rather
     than restarting at the base). ``epoch`` counts successive abandonments and
     drives both the exponential ``remaining`` and the ERROR→WARN log downgrade.
-    The whole entry is popped only on a genuinely durable apply for the match.
+    The entry is normally popped on a genuinely durable apply for the match; to
+    bound the dict when that apply never comes (a match that simply ended and
+    dropped off the slate), ``expired_unseen`` counts consecutive polls the entry
+    has been expired (``remaining == 0``) AND its match unseen (not on the slate,
+    not tracked). It resets to 0 whenever the match is seen or the cooldown is
+    still counting down, and once it reaches ``_COOLDOWN_MAX_POLLS`` the entry is
+    purged (:meth:`_age_cooldowns`) — the epoch/backoff memory is lost, which is
+    fine: a match reappearing after a full cap-length quiet window deserves a
+    fresh epoch.
     """
 
     remaining: int
     epoch: int
+    expired_unseen: int = 0
 
 
 @dataclass
@@ -323,14 +332,25 @@ class _TransitionTracker:
       SUCCEEDS is merged/applied normally even while cooling (a live board
       resumes it, a FINISHED board closes it); only the give-up machinery
       (fetch-failure/non-terminal tracker accrual + re-emission) is suppressed.
-      The cooldown is CLEARED (``_cooldowns.pop``) ONLY on a genuinely durable
-      apply for the match — one that actually wrote (``_reconcile_live_apply``
-      for a live board, ``_resolve_tracker`` for a terminal one). A no-change
-      snapshot (``diff.has_changes`` False) advanced nothing, so it is NOT
-      routed through the cooldown-clearing path (see
-      ``CollectorEngine._on_durable_snapshot``'s ``state_advanced`` gate) —
-      a live flicker that writes nothing must not re-arm re-tracking. The
-      behaviour matrix this design must satisfy (all hold):
+      The cooldown is CLEARED (``_cooldowns.pop``) on ANY genuinely durable
+      apply for the match — one that actually wrote: a terminal apply via
+      ``_resolve_tracker``, or ANY ``state_advanced`` live apply via
+      ``_on_durable_snapshot`` (``_reconcile_live_apply`` handles resumption
+      tracker semantics only for a match that was live on the slate this poll,
+      but the cooldown clear itself is unconditional on ``state_advanced`` — a
+      live DETAIL recovery reached through the cooling hydration path, absent
+      from ``live_resumptions``, clears it too). A no-change snapshot
+      (``diff.has_changes`` False) advanced nothing, so it is NOT routed through
+      the cooldown-clearing path (see ``_on_durable_snapshot``'s
+      ``state_advanced`` gate) — a live flicker that writes nothing must not
+      re-arm re-tracking. ACCEPTED judgment call: a live board whose state
+      literally never advances (a frozen provider cache emitting an identical
+      snapshot every poll) cannot clear its cooldown via this no-change path —
+      it is indistinguishable from a stale flicker. A genuinely live match
+      clears the cooldown on its next real state change (a minute tick, a score,
+      a status move); a truly frozen id simply ages out via the bounded
+      expired-and-unseen purge (:meth:`_age_cooldowns`) once it also leaves the
+      slate. The behaviour matrix this design must satisfy (all hold):
 
         a. persistent outage, on-slate terminal board whose apply keeps failing
            → retry cycles exist but exponentially spaced; bounded log noise.
@@ -844,8 +864,9 @@ class CollectorEngine:
         # through the same apply path but must NOT reset its tracker.
         live_resumptions: set[str] = set()
         # One poll elapsed: age every active abandonment cooldown before this
-        # poll's re-track gating reads it (an expired cooldown re-tracks now).
-        self._age_cooldowns()
+        # poll's re-track gating reads it (an expired cooldown re-tracks now),
+        # purging any long-expired entry whose match has vanished for good.
+        self._age_cooldowns(slate_ids)
         if not self._restart_scan_done:
             # First successful poll after (re)start: seed trackers for rows
             # left live in storage whose provider id is off the slate. Runs
@@ -908,9 +929,15 @@ class CollectorEngine:
                 if in_transition and cooling:
                     # In cooldown: the fetch is STILL attempted (so a recovered
                     # board applies immediately — matrix (d)), but a persistent
-                    # failure neither logs nor advances a tracker/give-up, so an
-                    # unresolvable board makes bounded noise — matrix (a). The
-                    # retry cycle resumes when the cooldown lapses.
+                    # ordinary unavailability neither logs nor advances a
+                    # tracker/give-up, so an unresolvable board makes bounded
+                    # noise — matrix (a). Schema drift is the exception: it is a
+                    # PROVIDER-level signal (not per-match flapping), so its ERROR
+                    # always fires — otherwise up to _COOLDOWN_MAX_POLLS of drift
+                    # would produce zero log lines. The retry cycle resumes when
+                    # the cooldown lapses.
+                    if isinstance(exc, ShapeDriftError):
+                        self._log_detail_fetch_failure(match.match_id, exc)
                     continue
                 self._log_detail_fetch_failure(match.match_id, exc)
                 if not in_transition:
@@ -946,9 +973,16 @@ class CollectorEngine:
                 # reset. Persist live progress, but never a non-live
                 # non-terminal reset.
                 if cooling:
-                    # In cooldown: persist live progress (a durable live apply
-                    # will clear the cooldown) but do NOT advance a tracker or
-                    # emit a give-up off a non-terminal reset.
+                    # In cooldown: still accrue the richest fallback (the
+                    # richest-fallback invariant) so a richer observation during
+                    # cooldown — e.g. a 2-0 detail over a 1-0 baseline — is not
+                    # dropped and the eventual post-cooldown give-up does not
+                    # close with a stale score. Persist live progress (a durable
+                    # live apply clears the cooldown) but do NOT advance the
+                    # tracker's attempt count or emit a give-up off a non-terminal
+                    # reset.
+                    tracker = self._tracker(match.match_id)
+                    tracker.fallback = self._richest_fallback(tracker.fallback, merged)
                     if merged.status in LIVE_STATUSES:
                         hydrated.append(merged)
                     continue
@@ -1092,17 +1126,36 @@ class CollectorEngine:
             or tracker.total_attempts >= _MAX_TRANSITION_TOTAL_ATTEMPTS
         )
 
-    def _age_cooldowns(self) -> None:
+    def _age_cooldowns(self, slate_ids: set[str]) -> None:
         """Decrement every active abandonment cooldown by one poll (floor 0).
 
         Run once per poll BEFORE the re-track gating reads the cooldowns, so an
-        entry that reaches 0 permits a re-track this poll. Expired entries
-        linger at 0 (they are popped only by a durable apply) so the ``epoch``
-        of the NEXT abandonment keeps growing the interval.
+        entry that reaches 0 permits a re-track this poll. Expired entries linger
+        at 0 (normally popped only by a durable apply) so the ``epoch`` of the
+        NEXT abandonment keeps growing the interval.
+
+        To keep ``_cooldowns`` bounded when that durable apply never comes — a
+        match that ended and dropped off the slate — an expired entry whose match
+        is UNSEEN (absent from ``slate_ids`` and untracked) for a full cap-length
+        window (``_COOLDOWN_MAX_POLLS`` consecutive polls) is purged. Losing its
+        epoch/backoff memory after so long a silence is acceptable: a match that
+        reappears after 256+ quiet polls deserves a fresh epoch. A still-counting
+        entry, or one whose match is seen again, resets the unseen streak.
         """
-        for cooldown in self._cooldowns.values():
+        purge: list[str] = []
+        for match_id, cooldown in self._cooldowns.items():
             if cooldown.remaining > 0:
                 cooldown.remaining -= 1
+                cooldown.expired_unseen = 0
+                continue
+            if match_id in slate_ids or match_id in self._transitions:
+                cooldown.expired_unseen = 0
+                continue
+            cooldown.expired_unseen += 1
+            if cooldown.expired_unseen >= _COOLDOWN_MAX_POLLS:
+                purge.append(match_id)
+        for match_id in purge:
+            del self._cooldowns[match_id]
 
     def _cooling_down(self, match_id: str) -> bool:
         """True while ``match_id`` is within an unexpired abandonment cooldown."""
@@ -1140,21 +1193,29 @@ class CollectorEngine:
         snapshot (no-change) IS durably terminal, so this runs regardless of
         ``state_advanced``.
 
-        A LIVE apply is reconciled as a resumption ONLY when a REAL write
-        landed (``state_advanced``) AND the match actually appeared live on the
-        slate this poll (``live_resumptions``). The ``state_advanced`` guard is
-        load-bearing: a no-change live flicker (snapshot == baseline, zero
-        writes) must NOT clear a cooldown or drop the resumption's tracker —
-        without proof the state advanced, a bogus flicker would re-arm
-        re-tracking on a match that never actually recovered. A still-live
-        vanished-match progress snapshot is likewise NOT a resumption (absent
+        ANY genuinely durable (``state_advanced``) live apply clears the
+        abandonment cooldown — normal collection has demonstrably resumed. This
+        includes a live DETAIL recovery reached via the cooling hydration path
+        (slate board SCHEDULED/UNKNOWN, detail returns IN_PLAY): such a match is
+        absent from ``live_resumptions`` (which is populated only from slate-LIVE
+        boards), so gating the cooldown clear on membership would leave it cooling
+        forever. The ``state_advanced`` guard is load-bearing: a no-change live
+        flicker (snapshot == baseline, zero writes) must NOT clear a cooldown —
+        without proof the state advanced, a bogus flicker would re-arm re-tracking
+        on a match that never actually recovered.
+
+        ``live_resumptions`` gates ONLY the resumption tracker semantics
+        (:meth:`_reconcile_live_apply`: budget reset / fallback retention): a
+        still-live vanished-match progress snapshot is NOT a resumption (absent
         from ``live_resumptions``) — resetting its tracker would stop the
         total-attempts cap from ever force-closing a match whose detail never
         turns terminal.
         """
         if snapshot.status in LIVE_STATUSES:
-            if state_advanced and match_id in live_resumptions:
-                self._reconcile_live_apply(match_id, snapshot)
+            if state_advanced:
+                self._cooldowns.pop(match_id, None)
+                if match_id in live_resumptions:
+                    self._reconcile_live_apply(match_id, snapshot)
             return
         self._resolve_tracker(match_id, snapshot)
 
@@ -1412,12 +1473,24 @@ class CollectorEngine:
 
         Scores are cumulative facts that never legitimately drop, so per side
         the persisted value is the NON-regressing one: the stored score when the
-        candidate would null or lower it, else the candidate. Status likewise
-        never regresses below the stored row's lifecycle rank (a fallback's
-        SCHEDULED reset accepted as-is upstream must not overwrite a stored
-        FINISHED). With no stored row there is nothing to regress. This runs
-        at the single emission choke point so an apply failure that leaves a
-        stale fallback armed cannot beat a higher score already in the DB.
+        candidate would null or lower it, else the candidate.
+
+        The status floor applies ONLY when the stored status is TERMINAL
+        (FINISHED). A stored terminal status may still override a lower-ranked
+        candidate (a fallback's SCHEDULED reset accepted as-is upstream must not
+        overwrite a stored FINISHED), but a stored LIVE status must NEVER elevate
+        the candidate: a give-up snapshot carrying a live status is short-
+        circuited by :meth:`_resolve_tracker` (the non-live consume point) and so
+        can never resolve — the tracker is never popped, the cooldown never
+        clears, and every epoch re-emits the same unresolvable snapshot forever.
+        A give-up emission must always remain resolvable, so it stays non-live.
+
+        When a terminal stored status wins OR ties the candidate's rank, its
+        clock (minute/display_clock) is likewise authoritative: a stale fallback
+        (80'/"80'") must not overwrite the stored terminal clock (90/'FT'). With
+        no stored row there is nothing to regress. This runs at the single
+        emission choke point so an apply failure that leaves a stale fallback
+        armed cannot beat a higher score already in the DB.
         """
         stored = self._stored_match_snapshot(match_id)
         if stored is None:
@@ -1427,8 +1500,14 @@ class CollectorEngine:
             guarded = self._non_regressing_score(getattr(snap, name), getattr(stored, name))
             if guarded != getattr(snap, name):
                 overrides[name] = guarded
-        if _STATUS_RANK[stored.status] > _STATUS_RANK[snap.status]:
-            overrides["status"] = stored.status
+        if stored.status is MatchStatus.FINISHED:
+            if _STATUS_RANK[stored.status] > _STATUS_RANK[snap.status]:
+                overrides["status"] = stored.status
+            if _STATUS_RANK[stored.status] >= _STATUS_RANK[snap.status]:
+                if stored.minute != snap.minute:
+                    overrides["minute"] = stored.minute
+                if stored.display_clock != snap.display_clock:
+                    overrides["display_clock"] = stored.display_clock
         return replace(snap, **overrides) if overrides else snap
 
     @staticmethod
@@ -1506,16 +1585,19 @@ class CollectorEngine:
         the partition-per-writer contract does not support switching seeding
         strategies over an existing source partition.
 
-        Ordering is AUTHORITY-FIRST — ``rank ASC, updated_at DESC`` — not
-        freshest-first. Rationale: after reconciliation every write lands on the
-        canonical (map-resolved) row, so it is AUTHORITATIVE whenever it exists;
-        a stub is meaningful only when no canonical row exists. Authority-first
-        means a still-LIVE canonical row is never masked by a fresher non-live
-        stub (transition hydration would wrongly be skipped and final events
-        lost), and an older live stub never overrides a fresher non-live
-        canonical row. Freshness (``updated_at DESC``) is the secondary key
-        WITHIN a rank tier. Rank tiers, fully deterministic so no tie is left to
-        arbitrary row order:
+        Ordering is AUTHORITY-FIRST — ``rank ASC, updated_at DESC, match_id
+        ASC`` — not freshest-first. Rationale: after reconciliation every write
+        lands on the canonical (map-resolved) row, so it is AUTHORITATIVE
+        whenever it exists; a stub is meaningful only when no canonical row
+        exists. Authority-first means a still-LIVE canonical row is never masked
+        by a fresher non-live stub (transition hydration would wrongly be skipped
+        and final events lost), and an older live stub never overrides a fresher
+        non-live canonical row. Freshness (``updated_at DESC``) is the secondary
+        key WITHIN a rank tier; ``match_id ASC`` is a final STABLE tiebreak so two
+        distinct canonical rows of the same rank that also tie on ``updated_at``
+        (e.g. two providers' rows reconciled under this source) resolve
+        deterministically rather than by arbitrary row order. Rank tiers, fully
+        deterministic so no tie is left to arbitrary row order:
 
         * custom-seed packs — canonical (map) 0, source-qualified stub 1, bare
           provider-id stub 2 (writes land on the qualified/canonical form, so
@@ -1543,7 +1625,7 @@ class CollectorEngine:
             return self._conn.execute(
                 f"SELECT {cols}, CASE WHEN match_id = ? THEN 0 ELSE 1 END AS rank "
                 "FROM matches WHERE source = ? AND match_id IN (?, ?) "
-                "ORDER BY rank ASC, updated_at DESC "
+                "ORDER BY rank ASC, updated_at DESC, match_id ASC "
                 "LIMIT 1",
                 (provider_match_id, self._source, provider_match_id, qualified),
             ).fetchall()
@@ -1559,7 +1641,7 @@ class CollectorEngine:
             "WHERE pm.source = ? AND pm.provider_match_id = ?"
             ") candidates "
             "GROUP BY match_id "
-            "ORDER BY rank ASC, updated_at DESC "
+            "ORDER BY rank ASC, updated_at DESC, match_id ASC "
             "LIMIT 1",
             (
                 provider_match_id,

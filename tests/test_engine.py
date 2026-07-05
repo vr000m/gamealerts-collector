@@ -3786,3 +3786,306 @@ def test_abandoned_then_live_flicker_then_recovers_after_cooldown_no_permanent_l
     assert event_seqs(db, qualified("m1")) == [0, 1], (
         "the final stoppage event must land — no permanent loss after recovery"
     )
+
+
+# --------------------------------------------------------------------------- #
+# Round-10 invariant-gap regressions (engine.py round-10 fixes)
+# --------------------------------------------------------------------------- #
+
+
+def _full_stored_row(
+    conn,
+    match_id,
+    *,
+    status,
+    minute=None,
+    score_home=None,
+    score_away=None,
+    display_clock=None,
+    updated_at="2026-06-18T20:00:00Z",
+    source=SOURCE,
+):
+    """Insert a fully-specified ``matches`` row (status/minute/clock control)."""
+    conn.execute(
+        "INSERT INTO matches (match_id, source, kickoff_utc, status, minute, "
+        "score_home, score_away, display_clock, payload, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            match_id,
+            source,
+            "2026-06-18T18:00:00Z",
+            status.value,
+            minute,
+            score_home,
+            score_away,
+            display_clock,
+            json.dumps({"home_team": "Canada", "away_team": "Qatar"}),
+            updated_at,
+        ),
+    )
+
+
+def test_give_up_nonregress_never_elevates_candidate_into_a_live_status(tmp_path):
+    """Round-10 F1: the status floor must apply ONLY when the stored status is
+    TERMINAL. A stored LIVE status (IN_PLAY) must NEVER elevate a lower-ranked
+    SCHEDULED give-up candidate — a give-up carrying a live status is short-
+    circuited by _resolve_tracker (the non-live consume point), so it would
+    never pop the tracker, never clear the cooldown, and re-emit forever. The
+    guarded snapshot must stay non-live (resolvable)."""
+    from gamecollect.db.connection import connect
+    from gamecollect.engine import CollectorEngine
+
+    db = tmp_path / "engine.db"
+    conn = connect(str(db), side_table_ddl=FAKE_SIDE_TABLE_DDL)
+    try:
+        with conn:
+            _full_stored_row(
+                conn, "m1", status=MatchStatus.IN_PLAY, minute=55, score_home=1, score_away=0
+            )
+    finally:
+        conn.close()
+
+    provider = ScriptedDetailProvider([])
+    engine = CollectorEngine(
+        make_pack(provider, seed_match=default_seed_match), str(db), SOURCE, 0.01, provider=provider
+    )
+    # A give-up candidate carrying a non-live provider reset (SCHEDULED), as
+    # _build_give_up_snapshot accepts a fallback's non-live status as-is.
+    candidate = nm("m1", (), status=MatchStatus.SCHEDULED, minute=None, score_home=1, score_away=0)
+    try:
+        guarded = engine._nonregress_over_stored("m1", candidate)
+    finally:
+        engine.close()
+
+    from gamecollect.provider import LIVE_STATUSES
+
+    assert guarded.status not in LIVE_STATUSES, (
+        "a stored live status must never elevate a give-up candidate into a live "
+        "status — the emission would be unresolvable"
+    )
+    assert guarded.status is MatchStatus.SCHEDULED
+
+
+def test_give_up_nonregress_preserves_stored_terminal_clock_over_stale_fallback(tmp_path):
+    """Round-10 F2: when a TERMINAL stored row wins or ties the candidate's
+    rank, its minute/display_clock are authoritative — a stale fallback's
+    80'/"80'" must not overwrite the stored 90/'FT'. The stored terminal status
+    also still floors a lower-ranked candidate."""
+    from gamecollect.db.connection import connect
+    from gamecollect.engine import CollectorEngine
+
+    db = tmp_path / "engine.db"
+    conn = connect(str(db), side_table_ddl=FAKE_SIDE_TABLE_DDL)
+    try:
+        with conn:
+            _full_stored_row(
+                conn,
+                "m1",
+                status=MatchStatus.FINISHED,
+                minute=90,
+                score_home=2,
+                score_away=1,
+                display_clock="FT",
+            )
+    finally:
+        conn.close()
+
+    provider = ScriptedDetailProvider([])
+    engine = CollectorEngine(
+        make_pack(provider, seed_match=default_seed_match), str(db), SOURCE, 0.01, provider=provider
+    )
+    # A stale FINISHED fallback still carrying an in-progress clock (80'/"80'").
+    candidate = nm(
+        "m1",
+        (),
+        status=MatchStatus.FINISHED,
+        minute=80,
+        score_home=2,
+        score_away=1,
+        display_clock="80'",
+    )
+    try:
+        guarded = engine._nonregress_over_stored("m1", candidate)
+    finally:
+        engine.close()
+
+    assert guarded.minute == 90, "the stored terminal minute must survive a stale fallback clock"
+    assert guarded.display_clock == "FT", "the stored terminal display_clock must survive"
+
+
+def test_richer_score_observed_while_cooling_accrues_into_fallback(tmp_path):
+    """Round-10 F3: a richer live observation during a cooldown (a 2-0 detail
+    over a 1-0 baseline) must still accrue into the tracker fallback (the
+    richest-fallback invariant), so the eventual post-cooldown give-up does not
+    close with a stale score. The tracker's attempt count must NOT advance while
+    cooling (no give-up machinery)."""
+    from gamecollect.engine import CollectorEngine, _Cooldown
+
+    db = tmp_path / "engine.db"
+    baseline_live = nm("m1", (), status=MatchStatus.IN_PLAY, minute=40, score_home=1, score_away=0)
+    # Slate board went non-live (a provider SCHEDULED reset), but the detail
+    # endpoint still reports the match live and richer (2-0).
+    slate_reset = nm("m1", (), status=MatchStatus.SCHEDULED, minute=None, score_home=None)
+    detail_2_0 = nm("m1", (), status=MatchStatus.IN_PLAY, minute=52, score_home=2, score_away=0)
+
+    provider = ScriptedDetailProvider([([slate_reset], {"m1": detail_2_0})])
+    engine = CollectorEngine(make_pack(provider), str(db), SOURCE, 0.01, provider=provider)
+    engine._restart_scan_done = True
+    engine._last["m1"] = baseline_live  # was_live → in_transition on the non-live board
+    engine._cooldowns["m1"] = _Cooldown(remaining=8, epoch=1)  # cooling
+    try:
+        engine._fetch_poll_snapshots()
+        tracker = engine._transitions.get("m1")
+        assert tracker is not None, "cooling must still accrue a fallback into the tracker"
+        assert tracker.fallback is not None and tracker.fallback.score_home == 2, (
+            "the richer 2-0 observed while cooling must not be dropped"
+        )
+        assert tracker.total_attempts == 0, "cooling must NOT advance the give-up attempt count"
+        give_up = engine._build_give_up_snapshot("m1", tracker, fresh=None)
+    finally:
+        engine.close()
+
+    assert give_up is not None and give_up.score_home == 2, (
+        "the post-cooldown give-up must close with the richest observed 2-0, not a stale score"
+    )
+
+
+def test_durable_live_apply_via_cooling_path_clears_cooldown_without_resumption(tmp_path):
+    """Round-10 F4: ANY genuinely durable (state_advanced) live apply clears the
+    abandonment cooldown, even a live DETAIL recovery reached via the cooling
+    hydration path that never appeared on the slate as live (absent from
+    live_resumptions). A no-change flicker (state_advanced False) must still NOT
+    clear it."""
+    from gamecollect.engine import CollectorEngine, _Cooldown
+
+    db = tmp_path / "engine.db"
+    provider = ScriptedDetailProvider([])
+    engine = CollectorEngine(make_pack(provider), str(db), SOURCE, 0.01, provider=provider)
+    live = nm("m1", (), status=MatchStatus.IN_PLAY, minute=60, score_home=1, score_away=0)
+    try:
+        # No-change flicker: must NOT clear the cooldown.
+        engine._cooldowns["m1"] = _Cooldown(remaining=8, epoch=1)
+        engine._on_durable_snapshot("m1", live, live_resumptions=set(), state_advanced=False)
+        assert "m1" in engine._cooldowns, "a no-change live flicker must not clear the cooldown"
+
+        # Durable live apply reached via the cooling path (NOT in live_resumptions):
+        # must clear the cooldown.
+        engine._on_durable_snapshot("m1", live, live_resumptions=set(), state_advanced=True)
+        assert "m1" not in engine._cooldowns, (
+            "a durable live detail recovery must clear the cooldown even when the "
+            "match never appeared live on the slate this poll"
+        )
+    finally:
+        engine.close()
+
+
+def test_shape_drift_while_cooling_is_always_logged(tmp_path, caplog):
+    """Round-10 F5: ShapeDriftError from fetch_match_detail must ALWAYS log its
+    ERROR, even while cooling — schema drift is a provider-level signal, not
+    per-match noise. Before the fix the cooling `continue` swallowed it for up to
+    _COOLDOWN_MAX_POLLS."""
+    from gamecollect.engine import CollectorEngine, _Cooldown
+
+    db = tmp_path / "engine.db"
+    baseline_live = nm("m1", (), status=MatchStatus.IN_PLAY, minute=40)
+    slate_nonlive = nm("m1", (), status=MatchStatus.SCHEDULED, minute=None, score_home=None)
+    provider = ScriptedDetailProvider(
+        [([slate_nonlive], {"m1": ShapeDriftError("detail schema drift")})]
+    )
+    engine = CollectorEngine(make_pack(provider), str(db), SOURCE, 0.01, provider=provider)
+    engine._restart_scan_done = True
+    engine._last["m1"] = baseline_live  # was_live → in_transition
+    engine._cooldowns["m1"] = _Cooldown(remaining=8, epoch=1)  # cooling
+    try:
+        with caplog.at_level(logging.ERROR, logger="gamecollect.engine"):
+            engine._fetch_poll_snapshots()
+    finally:
+        engine.close()
+
+    drift = [r for r in caplog.records if "detail shape drift" in r.getMessage()]
+    assert len(drift) == 1 and drift[0].levelno == logging.ERROR, (
+        "schema drift while cooling must still surface its ERROR"
+    )
+
+
+def test_expired_and_unseen_cooldown_entry_is_purged(tmp_path):
+    """Round-10 F6: an expired cooldown (remaining 0) whose match stays UNSEEN
+    (off the slate, untracked) for a full cap-length window must be purged so
+    _cooldowns cannot grow unboundedly. A seen match resets the unseen streak; a
+    still-counting entry is untouched."""
+    from gamecollect.engine import _COOLDOWN_MAX_POLLS, CollectorEngine, _Cooldown
+
+    db = tmp_path / "engine.db"
+    provider = ScriptedDetailProvider([])
+    engine = CollectorEngine(make_pack(provider), str(db), SOURCE, 0.01, provider=provider)
+    try:
+        # One poll short of the purge window: not yet purged, then crosses it.
+        engine._cooldowns["gone"] = _Cooldown(
+            remaining=0, epoch=3, expired_unseen=_COOLDOWN_MAX_POLLS - 1
+        )
+        # Expired but the match is on the slate this poll → streak resets, kept.
+        engine._cooldowns["seen"] = _Cooldown(
+            remaining=0, epoch=2, expired_unseen=_COOLDOWN_MAX_POLLS - 1
+        )
+        # Still counting down → untouched by the purge.
+        engine._cooldowns["active"] = _Cooldown(remaining=5, epoch=1)
+
+        engine._age_cooldowns({"seen"})
+
+        assert "gone" not in engine._cooldowns, (
+            "an expired-and-unseen entry must be purged once it crosses the cap window"
+        )
+        assert "seen" in engine._cooldowns and engine._cooldowns["seen"].expired_unseen == 0, (
+            "a match seen on the slate must reset its unseen streak, not be purged"
+        )
+        assert "active" in engine._cooldowns and engine._cooldowns["active"].remaining == 4, (
+            "a still-counting cooldown must only age one poll, never be purged"
+        )
+    finally:
+        engine.close()
+
+
+def test_two_canonical_rank_zero_rows_tied_on_updated_at_resolve_by_match_id(tmp_path):
+    """Round-10 F7: two distinct canonical (map-resolved, rank 0) rows for the
+    same provider id under different providers, tied on updated_at, must resolve
+    deterministically by match_id ASC — not by arbitrary row order."""
+    from gamecollect.db.connection import connect
+    from gamecollect.engine import CollectorEngine
+
+    db = tmp_path / "engine.db"
+    tied_at = "2026-06-18T20:00:00Z"
+    conn = connect(str(db), side_table_ddl=FAKE_SIDE_TABLE_DDL)
+    try:
+        with conn:
+            # Insert the higher match_id FIRST so rowid order would prefer it.
+            _full_stored_row(
+                conn, "zzz-canonical", status=MatchStatus.IN_PLAY, score_home=9, updated_at=tied_at
+            )
+            _full_stored_row(
+                conn, "aaa-canonical", status=MatchStatus.IN_PLAY, score_home=5, updated_at=tied_at
+            )
+            conn.execute(
+                "INSERT INTO provider_match_map (source, provider, provider_match_id, match_id) "
+                "VALUES (?, ?, ?, ?)",
+                (SOURCE, "espn", "m1", "zzz-canonical"),
+            )
+            conn.execute(
+                "INSERT INTO provider_match_map (source, provider, provider_match_id, match_id) "
+                "VALUES (?, ?, ?, ?)",
+                (SOURCE, "opta", "m1", "aaa-canonical"),
+            )
+    finally:
+        conn.close()
+
+    provider = ScriptedDetailProvider([])
+    engine = CollectorEngine(
+        make_pack(provider, seed_match=_reconciling_seed), str(db), SOURCE, 0.01, provider=provider
+    )
+    try:
+        snap = engine._stored_match_snapshot("m1")
+    finally:
+        engine.close()
+
+    assert snap is not None and snap.score_home == 5, (
+        "a rank-0 tie on updated_at must resolve to the lower match_id deterministically"
+    )
