@@ -2937,3 +2937,114 @@ def test_stored_snapshot_prefers_freshest_when_bare_and_qualified_rows_exist(tmp
         engine.close()
     assert snap is not None
     assert snap.score_home == 2, "the freshest (updated_at) row must win deterministically"
+
+
+# --------------------------------------------------------------------------- #
+# 2026-07 round-7 lookup cluster: all-ids restart slate guard, freshest-row
+# three-form lookup via the shared _stored_rows_for_provider helper
+# --------------------------------------------------------------------------- #
+
+
+def test_restart_scan_skips_when_canonical_rows_second_mapped_id_is_on_slate(tmp_path, caplog):
+    """Round-7 (Codex) finding: a canonical row mapped to MULTIPLE provider ids
+    whose live id is NOT the ordered first pick must not be treated as vanished.
+    The scan checks the WHOLE mapped set against the slate, so it never seeds a
+    tracker keyed to the wrong (non-slate) id — a key the live-resumption pop
+    could never clear, which would wedge the row toward a wrongful force-close
+    of an actively-live match."""
+    from gamecollect.engine import CollectorEngine
+
+    db = tmp_path / "engine.db"
+    _prepare_restart_db(db, "canada-vs-qatar-2026-06-18", map_provider_id="m1")
+    conn = sqlite3.connect(str(db))
+    try:
+        # espn:m1 sorts before zprov:x9, so "m1" is the ordered first pick while
+        # the id actually live on the slate is the sibling "x9".
+        conn.execute(
+            "INSERT INTO provider_match_map (source, provider, provider_match_id, match_id) "
+            "VALUES (?, ?, ?, ?)",
+            (SOURCE, "zprov", "x9", "canada-vs-qatar-2026-06-18"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    live = nm("x9", (ev(0, "goal", minute=44),), status=MatchStatus.IN_PLAY, minute=89)
+    provider = ScriptedDetailProvider([([live], {"x9": live})])
+    pack = make_pack(provider, seed_match=_reconciling_seed)
+    engine = CollectorEngine(pack, str(db), SOURCE, 0.01, provider=provider)
+    try:
+        with caplog.at_level(logging.WARNING, logger="gamecollect.engine"):
+            engine.poll_once()
+        assert engine._transitions == {}, (
+            "a canonical row whose SECOND mapped id is on the slate must not be tracker'd"
+        )
+        assert "m1" not in engine._transitions, (
+            "no tracker may be keyed to the non-slate first pick"
+        )
+    finally:
+        engine.close()
+
+    assert not any("terminal-hydration tracking" in r.getMessage() for r in caplog.records), (
+        "the still-live row must never be logged as vanished"
+    )
+    state = reader.get_state(read_db(db), "canada-vs-qatar-2026-06-18")
+    assert state is not None and state["status"] == MatchStatus.IN_PLAY.value, (
+        "the actively-live canonical row must keep collecting, never a forced close"
+    )
+
+
+def test_stored_snapshot_prefers_fresher_canonical_over_stale_qualified_stub(tmp_path):
+    """Round-7 finding: with a stale pre-reconciliation source-qualified stub AND
+    a fresher canonical row (reachable only through provider_match_map) both
+    stored, the merge base must be the freshest across ALL THREE id forms — not
+    the stub, which the old bare/qualified-first lookup returned with an early
+    return before ever consulting the canonical row."""
+    from gamecollect.db.connection import connect
+    from gamecollect.engine import CollectorEngine
+
+    db = tmp_path / "engine.db"
+    conn = connect(str(db), side_table_ddl=FAKE_SIDE_TABLE_DDL)
+    try:
+        with conn:
+            for match_id, score_home, updated_at in (
+                # Stale qualified stub: freshest to a bare/qualified-only query,
+                # but OLDER than the canonical row it was reconciled into.
+                (qualified("m1"), 1, "2026-06-18T19:00:00Z"),
+                ("canada-vs-qatar-2026-06-18", 2, "2026-06-18T20:00:00Z"),
+            ):
+                conn.execute(
+                    "INSERT INTO matches (match_id, source, kickoff_utc, status, minute, "
+                    "score_home, score_away, payload, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        match_id,
+                        SOURCE,
+                        "2026-06-18T18:00:00Z",
+                        MatchStatus.IN_PLAY.value,
+                        88,
+                        score_home,
+                        0,
+                        json.dumps({"home_team": "Canada", "away_team": "Qatar"}),
+                        updated_at,
+                    ),
+                )
+            conn.execute(
+                "INSERT INTO provider_match_map (source, provider, provider_match_id, match_id) "
+                "VALUES (?, ?, ?, ?)",
+                (SOURCE, "espn", "m1", "canada-vs-qatar-2026-06-18"),
+            )
+    finally:
+        conn.close()
+
+    provider = ScriptedDetailProvider([])
+    pack = make_pack(provider, seed_match=_reconciling_seed)
+    engine = CollectorEngine(pack, str(db), SOURCE, 0.01, provider=provider)
+    try:
+        snap = engine._stored_match_snapshot("m1")
+    finally:
+        engine.close()
+    assert snap is not None
+    assert snap.score_home == 2, (
+        "the fresher canonical row must win over the stale qualified stub across all three forms"
+    )

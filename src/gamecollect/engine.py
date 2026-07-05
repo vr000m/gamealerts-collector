@@ -1195,6 +1195,48 @@ class CollectorEngine:
             snapshot.score_away,
         )
 
+    def _stored_rows_for_provider(self, provider_match_id: str) -> list[tuple]:
+        """Candidate stored ``matches`` rows for a provider id, freshest first.
+
+        Gathers every stored row this source could hold for the match under
+        all THREE id forms core knows — the bare provider id, the
+        source-qualified ``f"{source}:{id}"`` stub, and the canonical
+        (reconciled) row reached through ``provider_match_map`` — as a single
+        result ordered by ``updated_at`` DESC, so callers can take the
+        freshest deterministically instead of privileging one id form. Shared
+        by :meth:`_stored_match_snapshot` (which takes ``rows[0]``) and
+        :meth:`_stored_status_is_live` (which scans every row's status). The
+        map join is skipped for ``default_seed_match`` packs: that hook writes
+        provider-native ids verbatim, so no ``provider_match_map`` entry can
+        exist and the join would only cost a scan (mirrors
+        :meth:`_resolve_stored_provider_id`'s discrimination).
+
+        Columns, in order: ``status, minute, score_home, score_away,
+        display_clock, kickoff_utc, payload, updated_at``.
+        """
+        cols = (
+            "status, minute, score_home, score_away, "
+            "display_clock, kickoff_utc, payload, updated_at"
+        )
+        qualified = f"{self._source}:{provider_match_id}"
+        if self._pack.seed_match is default_seed_match:
+            return self._conn.execute(
+                f"SELECT {cols} FROM matches "
+                "WHERE source = ? AND match_id IN (?, ?) "
+                "ORDER BY updated_at DESC",
+                (self._source, provider_match_id, qualified),
+            ).fetchall()
+        m_cols = ", ".join(f"m.{c}" for c in cols.split(", "))
+        return self._conn.execute(
+            f"SELECT {cols} FROM matches WHERE source = ? AND match_id IN (?, ?) "
+            "UNION ALL "
+            f"SELECT {m_cols} FROM provider_match_map pm "
+            "JOIN matches m ON m.source = pm.source AND m.match_id = pm.match_id "
+            "WHERE pm.source = ? AND pm.provider_match_id = ? "
+            "ORDER BY updated_at DESC",
+            (self._source, provider_match_id, qualified, self._source, provider_match_id),
+        ).fetchall()
+
     def _stored_match_snapshot(self, provider_match_id: str) -> NormalizedMatch | None:
         """Rebuild a merge base from the stored ``matches`` row, if any.
 
@@ -1203,41 +1245,24 @@ class CollectorEngine:
         (``home_team``/``away_team`` ride in the payload JSON per the
         ``default_seed_match`` convention, when present) and last-known
         scores so a sparse terminal snapshot does not seed identity-less or
-        NULL known scores. Looked up under all THREE id forms core knows
-        (like :meth:`_stored_status_is_live`): the bare provider id, the
-        source-qualified stub, and — when neither matches — the canonical
+        NULL known scores. Candidate rows are gathered across all THREE id
+        forms core knows (via :meth:`_stored_rows_for_provider`): the bare
+        provider id, the source-qualified stub, and the canonical
         (reconciled) row resolved through ``provider_match_map``; a
         restart-seeded reconciled match whose detail keeps failing must
         find its canonical row here, or the give-up would have nothing to
-        persist and the row would stay in-play forever. When both bare and
-        qualified rows exist, the freshest (``updated_at``) wins
-        deterministically.
+        persist and the row would stay in-play forever. Whenever more than
+        one id form has a row (e.g. a stale pre-reconciliation ``source:id``
+        stub alongside a fresher canonical row), the freshest
+        (``updated_at`` DESC) wins deterministically across ALL three forms
+        — never the first form queried.
         """
-        row = self._conn.execute(
-            "SELECT status, minute, score_home, score_away, display_clock, "
-            "kickoff_utc, payload FROM matches WHERE source = ? AND match_id IN (?, ?) "
-            "ORDER BY updated_at DESC LIMIT 1",
-            (
-                self._source,
-                provider_match_id,
-                f"{self._source}:{provider_match_id}",
-            ),
-        ).fetchone()
-        if row is None:
-            # Canonical/reconciled row: the stored id is a pack-owned
-            # canonical id reachable only through provider_match_map.
-            row = self._conn.execute(
-                "SELECT m.status, m.minute, m.score_home, m.score_away, "
-                "m.display_clock, m.kickoff_utc, m.payload "
-                "FROM provider_match_map pm "
-                "JOIN matches m ON m.source = pm.source AND m.match_id = pm.match_id "
-                "WHERE pm.source = ? AND pm.provider_match_id = ? "
-                "ORDER BY m.updated_at DESC LIMIT 1",
-                (self._source, provider_match_id),
-            ).fetchone()
-        if row is None:
+        rows = self._stored_rows_for_provider(provider_match_id)
+        if not rows:
             return None
-        status_value, minute, score_home, score_away, display_clock, kickoff_utc, payload = row
+        status_value, minute, score_home, score_away, display_clock, kickoff_utc, payload, _ = rows[
+            0
+        ]
         extras: dict[str, Any] = {}
         if payload:
             try:
@@ -1274,23 +1299,12 @@ class CollectorEngine:
         packs write for unreconciled live matches), and the canonical
         (reconciled) id resolved through ``provider_match_map`` — a pack
         that reconciles provider ids onto canonical rows must still get its
-        transition-across-restart hydrated.
+        transition-across-restart hydrated. The candidate rows come from the
+        shared :meth:`_stored_rows_for_provider` lookup (which skips the map
+        join for ``default_seed_match`` packs, where no map entry can exist).
         """
-        rows = self._conn.execute(
-            "SELECT status FROM matches WHERE source = ? AND match_id IN (?, ?) "
-            "UNION ALL "
-            "SELECT m.status FROM provider_match_map pm "
-            "JOIN matches m ON m.source = pm.source AND m.match_id = pm.match_id "
-            "WHERE pm.source = ? AND pm.provider_match_id = ?",
-            (
-                self._source,
-                provider_match_id,
-                f"{self._source}:{provider_match_id}",
-                self._source,
-                provider_match_id,
-            ),
-        ).fetchall()
-        return any(status in LIVE_STATUS_VALUES for (status,) in rows)
+        rows = self._stored_rows_for_provider(provider_match_id)
+        return any(row[0] in LIVE_STATUS_VALUES for row in rows)
 
     def _seed_restart_trackers(self, slate_ids: set[str]) -> None:
         """One-time restart scan: track stored-live matches gone from the slate.
@@ -1308,10 +1322,15 @@ class CollectorEngine:
 
         Two guards keep the scan from doing harm:
 
-        * A stored row whose resolved provider id IS on the current slate is
-          skipped — the match is still being collected normally (or its
-          transition is on the slate for the regular paths); seeding a
-          tracker for it would be wrong.
+        * A stored row ANY of whose mapped provider ids is on the current
+          slate is skipped — the match is still being collected normally
+          under one of its ids (or its transition is on the slate for the
+          regular paths). Checking the WHOLE mapped set, not just the chosen
+          first pick, matters for a multi-provider row: seeding a tracker
+          keyed to a non-slate id whose match is actually live under a
+          SIBLING id would wedge the row (the live-resumption pop only ever
+          clears the id the slate carries) and the give-up could force-CLOSE
+          an actively-live canonical row.
         * A row whose provider id cannot be resolved
           (:meth:`_resolve_stored_provider_id` returned ``None``) is skipped
           with the WARNING logged there — detail-fetching a non-provider id
@@ -1324,8 +1343,8 @@ class CollectorEngine:
             (self._source, *sorted(LIVE_STATUS_VALUES)),
         ).fetchall()
         for (stored_id,) in rows:
-            provider_id = self._resolve_stored_provider_id(stored_id)
-            if provider_id is None or provider_id in slate_ids:
+            provider_id, mapped_ids = self._resolve_stored_provider_id(stored_id)
+            if provider_id is None or mapped_ids & slate_ids:
                 continue
             if provider_id in self._transitions:
                 continue
@@ -1339,15 +1358,23 @@ class CollectorEngine:
             )
             self._tracker(provider_id)
 
-    def _resolve_stored_provider_id(self, stored_match_id: str) -> str | None:
+    def _resolve_stored_provider_id(
+        self, stored_match_id: str
+    ) -> tuple[str | None, frozenset[str]]:
         """Map a stored ``matches.match_id`` back to its provider-native id.
+
+        Returns ``(chosen_id, mapped_ids)``: the id to hydrate under, plus the
+        FULL set of distinct provider ids that could reach this stored row. The
+        restart scan skips the row when ANY ``mapped_ids`` is on the slate — see
+        the multi-provider note below. ``chosen_id`` is ``None`` (and
+        ``mapped_ids`` empty) when no provider id can be trusted.
 
         ``matches.match_id`` comes in three shapes (schema comment;
         :meth:`_stored_status_is_live`), while the slate and
         ``fetch_match_detail`` speak PROVIDER ids only:
 
         * source-qualified unreconciled stub ``f"{source}:{provider_id}"`` →
-          the suffix after the source prefix;
+          the suffix after the source prefix (``mapped_ids`` is that one id);
         * bare provider id (the :func:`default_seed_match` shape — that hook
           writes provider-native ids verbatim, so when the pack uses it every
           stored id under this source IS a provider id) → itself;
@@ -1360,18 +1387,24 @@ class CollectorEngine:
         SINGLE-PROVIDER ASSUMPTION: a source is expected to map each
         canonical row through exactly one provider. When the map holds more
         than one DISTINCT provider id for the row (a multi-provider source),
-        this WARNs naming all of them and proceeds with the first in
-        ``(provider, provider_match_id)`` order — graceful loud degradation:
-        even if the chosen id's detail fetch never succeeds, the give-up
-        path closes the row from the stored base
-        (:meth:`_stored_match_snapshot` resolves it via the map), so a wrong
-        pick cannot wedge the row in-play.
+        this WARNs naming all of them and returns the first in
+        ``(provider, provider_match_id)`` order as ``chosen_id`` alongside the
+        whole set. Returning the whole set is what lets the restart scan skip
+        the row when the live id is a SIBLING of the first pick: keying a
+        tracker to a non-slate id whose match is live under another id would
+        wedge the row (the live-resumption pop never clears the wrong key) and
+        the give-up could force-CLOSE an actively-live canonical row. For rows
+        genuinely off-slate the chosen first pick still hydrates, and even if
+        its detail fetch never succeeds the give-up path closes the row from
+        the stored base (:meth:`_stored_match_snapshot` resolves it via the
+        map).
         """
         prefix = f"{self._source}:"
         if stored_match_id.startswith(prefix):
-            return stored_match_id[len(prefix) :]
+            provider_id = stored_match_id[len(prefix) :]
+            return provider_id, frozenset({provider_id})
         if self._pack.seed_match is default_seed_match:
-            return stored_match_id
+            return stored_match_id, frozenset({stored_match_id})
         rows = self._conn.execute(
             "SELECT DISTINCT provider, provider_match_id FROM provider_match_map "
             "WHERE source = ? AND match_id = ? "
@@ -1392,7 +1425,7 @@ class CollectorEngine:
                     rows[0][1],
                     rows[0][0],
                 )
-            return rows[0][1]
+            return rows[0][1], frozenset(distinct_ids)
         log.warning(
             "stored match %s on source %s is live from before a restart and "
             "absent from the slate, but has no provider_match_map entry to "
@@ -1401,7 +1434,7 @@ class CollectorEngine:
             stored_match_id,
             self._source,
         )
-        return None
+        return None, frozenset()
 
     def stop(self) -> None:
         """Signal the loop to finish its current iteration and shut down."""
