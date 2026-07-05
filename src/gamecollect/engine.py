@@ -1369,27 +1369,51 @@ class CollectorEngine:
     ) -> bool:
         """True when a durable live apply proves a cooldown's terminal fallback stale.
 
-        Mirrors the STRICT ``>`` of :meth:`_live_supersedes_fallback` (X2): only a
-        live board that has advanced STRICTLY PAST the fallback's known score on
-        at least one side — with no regression on the other — proves the match is
-        genuinely still live and the pre-recovery terminal fallback stale. A live
-        board merely EQUAL to the fallback's final score is NOT proof of liveness:
-        a lagging scoreboard still showing the genuine final 2-1 must not drop a
-        real FINISHED 2-1 fallback (the events/terminal richness would be lost).
-        There must be at least one side where the fallback has a known score; a
-        NULL applied score on a side the fallback knows proves nothing (keep it).
+        Supersession holds under EITHER condition (Y3 resolves the round-13/round-14
+        duality):
+
+        1. STRICT score advance (X2): the live board advanced STRICTLY PAST the
+           fallback's known score on at least one side, with no regression on the
+           other — the match is genuinely still live and the pre-recovery terminal
+           fallback stale.
+        2. EQUAL scores at a STRICTLY LATER minute (Y3): both sides' scores are
+           known and equal AND the applied live minute is strictly greater than the
+           fallback's minute (both known). Equal scores ALONE are not proof — a
+           lagging scoreboard still showing the genuine final 2-1 must not drop a
+           real FINISHED 2-1 fallback (round 13: >= wrongly dropped it). But equal
+           scores at a demonstrably later minute ARE proof: a false pre-recovery
+           terminal (FINISHED 1-0 min 55) on a match that plays on and never scores
+           again would otherwise live forever (round 14: strict > wrongly kept it).
+           Null minutes are conservative — keep the fallback.
+
+        A NULL applied score on a side the fallback knows proves nothing (keep it).
         """
         strictly_advanced = False
+        both_sides_known = True
         for field in ("score_home", "score_away"):
             live = getattr(applied, field)
             captured = getattr(fallback, field)
             if captured is None:
+                both_sides_known = False
                 continue
             if live is None or live < captured:
                 return False
             if live > captured:
                 strictly_advanced = True
-        return strictly_advanced
+        if strictly_advanced:
+            return True
+        # Y3: no strict advance and no regression → every known side is EQUAL. Equal
+        # scores alone are not proof of liveness (a lagging board at the genuine
+        # final), but equal scores at a STRICTLY LATER minute are: play demonstrably
+        # continued past the fallback's capture, so a false pre-recovery terminal
+        # (e.g. FINISHED 1-0 min 55 on a match that never scores again) must drop.
+        # Null minutes are conservative — keep the fallback.
+        return (
+            both_sides_known
+            and applied.minute is not None
+            and fallback.minute is not None
+            and applied.minute > fallback.minute
+        )
 
     def _reset_resumption_budget(self, match_id: str) -> None:
         """Reset a tracker's retry BUDGET on a live slate reappearance.
@@ -1456,19 +1480,47 @@ class CollectorEngine:
 
     @staticmethod
     def _live_supersedes_fallback(applied: NormalizedMatch, fallback: NormalizedMatch) -> bool:
-        """True when a live board proves the captured fallback is stale.
+        """True when a live board proves the captured resumption fallback is stale.
 
         Scores only ever climb, so a live snapshot whose home or away score is
         strictly greater than the fallback's proves the match progressed past
         it — the fallback must be dropped so it cannot beat the real (higher)
         score at a later give-up. A NULL score on either side proves nothing.
+
+        Y3 (twin): this shares the equal-score blind spot of
+        :meth:`_live_supersedes_cooldown_fallback`. It is judged against the DURABLE
+        applied live state (which carries a real minute, not a NULL slate board), so
+        the same failure mode applies — a false pre-recovery terminal kept alive
+        across a live match that never scores again. So equal known scores on both
+        sides at a STRICTLY LATER applied minute (both minutes known) also supersede;
+        null minutes stay conservative.
         """
+        strictly_advanced = False
+        both_sides_known = True
         for field in ("score_home", "score_away"):
             live = getattr(applied, field)
             captured = getattr(fallback, field)
-            if live is not None and captured is not None and live > captured:
-                return True
-        return False
+            if live is None or captured is None:
+                both_sides_known = False
+                continue
+            if live > captured:
+                strictly_advanced = True
+            elif live < captured:
+                both_sides_known = False
+        if strictly_advanced:
+            return True
+        # Y3 (twin): same equal-score blind spot as
+        # :meth:`_live_supersedes_cooldown_fallback`. The resumption fallback is
+        # judged against the DURABLE applied live state (which carries a real
+        # minute), so a false pre-recovery terminal kept alive across a live match
+        # that never scores again is the same failure mode — equal known scores at a
+        # strictly later minute prove play continued, dropping the stale fallback.
+        return (
+            both_sides_known
+            and applied.minute is not None
+            and fallback.minute is not None
+            and applied.minute > fallback.minute
+        )
 
     @staticmethod
     def _accrue_fallback(old: NormalizedMatch | None, new: NormalizedMatch) -> NormalizedMatch:
@@ -1484,28 +1536,45 @@ class CollectorEngine:
 
         * SCORES: per side the MAX of the known values; a ``None`` NEVER replaces
           a known value (a FINISHED None-0 board over a 2-0 incumbent yields 2-0).
-        * REGRESSION VETO (X3): when the NEWER side (``new``) regresses a known
-          incumbent score on either side (both values known, ``new < old``), the
-          new side is a bogus/reset board — it is untrustworthy for every field,
-          so the incumbent keeps status, clock, events, and payload precedence and
-          the new side contributes ONLY where the incumbent has nothing. The
-          per-side score max still holds (it already keeps the higher incumbent).
+        * REGRESSION VETO (X3, terminality-classed per Y1): when the NEWER side
+          (``new``) regresses a known incumbent score on either side (both values
+          known, ``new < old``) AND both sides share a terminality class (both live
+          or both terminal), the new side is a bogus/reset board — it is
+          untrustworthy for every field, so the incumbent keeps status, clock,
+          events, payload, and IDENTITY (Y2) precedence and the new side contributes
+          ONLY where the incumbent has nothing. The per-side score max still holds
+          (it already keeps the higher incumbent).
+        * TERMINALITY PREFERENCE PRECEDES THE VETO ACROSS CLASSES (Y1): the veto
+          fires ONLY within one terminality class. When the sides differ in class —
+          a transient inflated live incumbent (a LIVE 3-0 glitch) versus a genuinely
+          FINISHED 2-0 provider final — the terminal side is the provider's final
+          view and wins status, clock, events, payload, and identity REGARDLESS of
+          the score regression, so its authoritative final events are never dropped.
+          Judgment call / residual: the per-side score max still keeps the inflated
+          3 (an inflated transient score is indistinguishable from a real one under
+          the scores-are-cumulative doctrine), so the final reads FINISHED 3-0.
         * STATUS: prefer the genuinely-terminal side's status; if neither or both
           are terminal the newer side's status wins (unless vetoed above).
-        * CLOCK (X1): ``minute``/``display_clock`` are taken as a PAIR from a
-          status-eligible side only — the status winner itself, or the OTHER side
+        * CLOCK (X1 + Y4 per-field fill): ``minute``/``display_clock`` are sourced
+          from status-ELIGIBLE sides only — the status winner, or the OTHER side
           only when it shares the winning status (or, when the winner is terminal,
-          is also terminal). A live side's mid-match clock never fills an
-          accumulated terminal, and the two fields never mix across sides. If no
-          eligible side has a clock BOTH stay null (doctrine: a null clock at FT is
-          legitimate — emission-time G3 fills from a stored terminal row).
+          is also terminal). A live side's mid-match clock never fills an accumulated
+          terminal (an INELIGIBLE side contributes nothing). Y4 relaxes the old
+          all-or-nothing PAIR rule to a PER-FIELD fill AMONG ELIGIBLE SIDES: a null
+          winner field is filled independently from the eligible other side, so a
+          winner's minute 90 / null display_clock merges with an eligible side's
+          "90'+3" to 90/"90'+3" (same-status mixing is fine). If no eligible side has
+          a clock BOTH stay null (doctrine: a null clock at FT is legitimate —
+          emission-time G3 fills from a stored terminal row).
         * EVENTS (X4): a NEWER side that is genuinely terminal with a non-empty
           list is the provider's FINAL authoritative view — its list wins outright,
           even if shorter (a corrected terminal list drops rescinded events).
           Otherwise keep the non-empty list, and the LONGER when both are non-empty
           (events accumulate). The regression veto (X3) overrides this entirely.
         * IDENTITY (home_team/away_team/kickoff_utc): fill ``None``s from either
-          side (the newer value wins when both are present).
+          side (the newer value wins when both are present) — EXCEPT under the veto
+          (Y2), where the incumbent's non-None identity wins and the new side fills
+          only where the incumbent is None.
         * PAYLOAD: preserve-richer merge (:func:`is_empty_payload_value`) — the
           newer value wins unless empty over a non-empty incumbent; under the
           regression veto the precedence flips so the incumbent's non-empty values
@@ -1522,18 +1591,24 @@ class CollectorEngine:
             and n < o
             for field in ("score_home", "score_away")
         )
-        if regressed:
+        # Y1: the regression veto only fires BETWEEN SIDES OF THE SAME TERMINALITY
+        # CLASS. Across classes (one live, one terminal) the genuinely-terminal side
+        # is the provider's final view and wins status/clock/events/payload/identity
+        # regardless of a score regression; per-side max still keeps the higher
+        # score, so an inflated transient score itself persists (see Y1 in docstring).
+        vetoed = regressed and (_is_terminal(new.status) == _is_terminal(old.status))
+        if vetoed:
             winner, other = old, new
         elif _is_terminal(new.status) and not _is_terminal(old.status):
             winner, other = new, old
         elif _is_terminal(old.status) and not _is_terminal(new.status):
             winner, other = old, new
         else:
-            # Both terminal or neither terminal: the newer side wins.
+            # Both terminal or neither terminal (and not vetoed): the newer side wins.
             winner, other = new, old
         status = winner.status
         minute, display_clock = CollectorEngine._paired_clock(winner, other)
-        if regressed:
+        if vetoed:
             # X3: the incumbent (old) keeps its events; the new side contributes
             # only when the incumbent has none.
             events = old.events if old.events else new.events
@@ -1545,7 +1620,7 @@ class CollectorEngine:
             events = new.events
         else:
             events = new.events if len(new.events) >= len(old.events) else old.events
-        if regressed:
+        if vetoed:
             # X3: incumbent payload precedence — old non-empty values win, the new
             # side only fills keys the incumbent lacks (or where it is empty).
             payload = dict(new.payload)
@@ -1557,6 +1632,16 @@ class CollectorEngine:
             for key, value in new.payload.items():
                 if key not in payload or not is_empty_payload_value(value):
                     payload[key] = value
+        if vetoed:
+            # Y2: identity fields also keep the incumbent's values under the veto,
+            # filling only where the incumbent has None.
+            home_team = old.home_team if old.home_team is not None else new.home_team
+            away_team = old.away_team if old.away_team is not None else new.away_team
+            kickoff_utc = old.kickoff_utc if old.kickoff_utc is not None else new.kickoff_utc
+        else:
+            home_team = new.home_team if new.home_team is not None else old.home_team
+            away_team = new.away_team if new.away_team is not None else old.away_team
+            kickoff_utc = new.kickoff_utc if new.kickoff_utc is not None else old.kickoff_utc
         return replace(
             new,
             status=status,
@@ -1565,9 +1650,9 @@ class CollectorEngine:
             score_away=score_away,
             display_clock=display_clock,
             events=events,
-            home_team=new.home_team if new.home_team is not None else old.home_team,
-            away_team=new.away_team if new.away_team is not None else old.away_team,
-            kickoff_utc=new.kickoff_utc if new.kickoff_utc is not None else old.kickoff_utc,
+            home_team=home_team,
+            away_team=away_team,
+            kickoff_utc=kickoff_utc,
             payload=payload,
         )
 
@@ -1575,24 +1660,36 @@ class CollectorEngine:
     def _paired_clock(
         winner: NormalizedMatch, other: NormalizedMatch
     ) -> tuple[int | None, str | None]:
-        """X1: minute+display_clock as a PAIR from a status-eligible side only.
+        """X1 + Y4: minute/display_clock filled PER-FIELD among status-eligible sides.
 
-        The clock is sourced from the winning-status side, never mixed across
-        sides. The ``winner`` (which defines the winning status) is preferred when
-        it carries any clock; otherwise the ``other`` side is used ONLY when it is
+        The clock is sourced from status-eligible sides only, never from an
+        ineligible one. The ``winner`` (which defines the winning status) supplies
+        every field it knows; each field the winner leaves null is then filled
+        INDEPENDENTLY (Y4) from the ``other`` side, but ONLY when ``other`` is
         status-eligible — it shares the winning status, or (when the winner is
-        terminal) is itself terminal — so a live side's mid-match clock can never
-        leak into an accumulated terminal. If no eligible side has a clock both
-        stay null.
+        terminal) is itself terminal. So a winner's minute 90 / null display_clock
+        merges with an eligible side's null-minute / "90'+3" to 90/"90'+3", while a
+        live side's mid-match clock can never leak into an accumulated terminal. The
+        winner's own known field is never overwritten. If no eligible side has a
+        given field it stays null.
         """
-        if winner.minute is not None or winner.display_clock is not None:
-            return winner.minute, winner.display_clock
+        minute = winner.minute
+        display_clock = winner.display_clock
+        if minute is not None and display_clock is not None:
+            return minute, display_clock
         other_eligible = other.status == winner.status or (
             _is_terminal(winner.status) and _is_terminal(other.status)
         )
-        if other_eligible and (other.minute is not None or other.display_clock is not None):
-            return other.minute, other.display_clock
-        return None, None
+        # Y4: among ELIGIBLE sides only, fill each null clock field independently —
+        # the winner's known field is never overwritten, but a null one is filled
+        # from the eligible other side (same-status mixing is fine). An INELIGIBLE
+        # side (e.g. a live board under a terminal winner) contributes nothing.
+        if other_eligible:
+            if minute is None:
+                minute = other.minute
+            if display_clock is None:
+                display_clock = other.display_clock
+        return minute, display_clock
 
     @staticmethod
     def _max_known(a: int | None, b: int | None) -> int | None:

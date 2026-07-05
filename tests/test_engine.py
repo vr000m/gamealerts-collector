@@ -4633,10 +4633,12 @@ def test_x1_give_up_fills_stored_terminal_clock_never_the_live_clock(tmp_path):
 
 
 def test_x2_cooldown_fallback_kept_when_live_only_equals_final_score(tmp_path):
-    """X2: a lagging live board EQUAL to the fallback's final score is not proof of
-    liveness — a durable IN_PLAY 2-1 apply must NOT drop a FINISHED 2-1 cooldown
-    fallback (its events/terminal richness would be lost). A strictly-higher apply
-    still drops it."""
+    """X2 (refined by round-14 Y3): a lagging live board EQUAL to the fallback's
+    final score AT AN EARLIER minute is not proof of liveness — a durable IN_PLAY
+    2-1 apply at minute 88 must NOT drop a FINISHED 2-1 / minute-90 cooldown fallback
+    (its events/terminal richness would be lost). A strictly-higher apply still drops
+    it. (Equal scores at a strictly LATER minute DO supersede under Y3 — covered by
+    ``test_y3_equal_score_later_minute_supersedes_but_earlier_minute_keeps``.)"""
     from gamecollect.engine import CollectorEngine, _Cooldown
 
     db = tmp_path / "engine.db"
@@ -4764,6 +4766,231 @@ def test_x4_newer_terminal_shorter_events_list_wins_but_nonterminal_does_not():
     merged2 = CollectorEngine._accrue_fallback(live_three, live_two)
     assert [e.seq for e in merged2.events] == [0, 1, 2], (
         "X4: a newer NON-terminal shorter list does not drop the longer accumulated list"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Round-14 rule-interaction refinements (Y1 terminality-classed veto + Y2
+# identity under veto + Y3 minute-disambiguated equal-score supersession +
+# Y4 per-field eligible clock fill)
+# --------------------------------------------------------------------------- #
+
+
+def test_y1_terminal_final_wins_over_score_regressed_live_glitch_incumbent():
+    """Y1: a transient inflated LIVE 3-0 glitch incumbent must NOT veto a genuinely
+    FINISHED 2-0 provider final across terminality classes. The terminal side is the
+    provider's final view: its status, clock, and authoritative events all win, even
+    though its 2 regresses the incumbent's 3. Only the per-side score MAX still bites
+    — the inflated 3 persists (indistinguishable from a real score under the
+    cumulative doctrine), so the final reads FINISHED 3-0 WITH the terminal events."""
+    from gamecollect.engine import CollectorEngine
+
+    live_glitch = nm(
+        "m1",
+        (),
+        status=MatchStatus.IN_PLAY,
+        minute=70,
+        score_home=3,
+        score_away=0,
+        display_clock="70'",
+    )
+    genuine_final = nm(
+        "m1",
+        (ev(0, "goal", minute=20), ev(1, "goal", minute=55)),
+        status=MatchStatus.FINISHED,
+        minute=90,
+        score_home=2,
+        score_away=0,
+        display_clock="FT",
+    )
+    merged = CollectorEngine._accrue_fallback(live_glitch, genuine_final)
+    assert merged.status is MatchStatus.FINISHED, (
+        "Y1: the genuine terminal final wins status across classes, not the live glitch"
+    )
+    assert merged.minute == 90 and merged.display_clock == "FT", (
+        "Y1: the terminal clock wins across classes (no live 70' leak)"
+    )
+    assert [e.seq for e in merged.events] == [0, 1], (
+        "Y1: the provider's authoritative final events are kept, never dropped by the veto"
+    )
+    # Score residual (documented judgment call): the per-side max keeps the inflated
+    # 3 — a transient inflated score cannot be told from a real one under the
+    # scores-are-cumulative doctrine, so the final legitimately reads 3-0.
+    assert (merged.score_home, merged.score_away) == (3, 0), (
+        "Y1: per-side max keeps the inflated 3 (cumulative-doctrine residual)"
+    )
+
+
+def test_y1_same_class_terminal_veto_still_protects_incumbent_unchanged():
+    """Y1 guard: the round-13 X3 scenario is terminal-vs-terminal (SAME class), so
+    the veto still fires — a FINISHED 0-0/90/FT reset must NOT steal a FINISHED
+    2-0/120/AET incumbent's status, clock, or events. Confirms Y1 narrowed the veto
+    to same-class only, leaving same-class protection intact."""
+    from gamecollect.engine import CollectorEngine
+
+    incumbent = nm(
+        "m1",
+        (ev(0, "goal", minute=30), ev(1, "goal", minute=100)),
+        status=MatchStatus.FINISHED,
+        minute=120,
+        score_home=2,
+        score_away=0,
+        display_clock="AET",
+    )
+    reset_board = nm(
+        "m1",
+        (),
+        status=MatchStatus.FINISHED,
+        minute=90,
+        score_home=0,
+        score_away=0,
+        display_clock="FT",
+    )
+    merged = CollectorEngine._accrue_fallback(incumbent, reset_board)
+    assert (merged.score_home, merged.score_away) == (2, 0)
+    assert merged.minute == 120 and merged.display_clock == "AET", (
+        "Y1: same-class veto still protects the incumbent's terminal clock"
+    )
+    assert [e.seq for e in merged.events] == [0, 1], "Y1: same-class veto keeps incumbent events"
+
+
+def test_y2_veto_keeps_incumbent_identity_filling_only_nulls():
+    """Y2: under the (same-class) veto the score-regressed reset board's identity
+    fields must NOT overwrite the incumbent's — its "TBD" home_team may not replace
+    the real "Argentina", and the incumbent keeps its kickoff. The new side fills
+    ONLY where the incumbent is None (the incumbent's null away_team takes the
+    reset's "France")."""
+    from gamecollect.engine import CollectorEngine
+
+    incumbent = nm(
+        "m1",
+        (),
+        status=MatchStatus.FINISHED,
+        minute=120,
+        score_home=2,
+        score_away=0,
+        display_clock="AET",
+        home_team="Argentina",
+        away_team=None,
+        kickoff_utc="2026-06-18T18:00:00Z",
+    )
+    reset_board = nm(
+        "m1",
+        (),
+        status=MatchStatus.FINISHED,
+        minute=90,
+        score_home=0,
+        score_away=0,
+        display_clock="FT",
+        home_team="TBD",
+        away_team="France",
+        kickoff_utc="2026-01-01T00:00:00Z",
+    )
+    merged = CollectorEngine._accrue_fallback(incumbent, reset_board)
+    assert merged.home_team == "Argentina", (
+        "Y2: the vetoed reset's 'TBD' must not overwrite the incumbent's real name"
+    )
+    assert merged.kickoff_utc == "2026-06-18T18:00:00Z", "Y2: incumbent kickoff kept under veto"
+    assert merged.away_team == "France", (
+        "Y2: the new side fills only where the incumbent is None (null away_team)"
+    )
+
+
+def test_y3_equal_score_later_minute_supersedes_but_earlier_minute_keeps():
+    """Y3 (both directions of the round-13/round-14 duality): for the cooldown
+    supersession, equal known scores at a STRICTLY LATER applied minute drop a false
+    pre-recovery terminal (play demonstrably continued), while equal scores at an
+    EARLIER/equal minute keep a genuine lagging terminal. Null minutes are
+    conservative — keep."""
+    from gamecollect.engine import CollectorEngine
+
+    # False terminal FINISHED 1-0 min 55; live plays on to 70 without scoring → drop.
+    false_terminal = nm(
+        "m1", (), status=MatchStatus.FINISHED, minute=55, score_home=1, score_away=0
+    )
+    live_later = nm("m1", (), status=MatchStatus.IN_PLAY, minute=70, score_home=1, score_away=0)
+    assert CollectorEngine._live_supersedes_cooldown_fallback(live_later, false_terminal), (
+        "Y3: equal scores at a strictly later minute prove play continued → supersede"
+    )
+
+    # Genuine terminal FINISHED 2-1 min 90; lagging live board at 80 → keep.
+    genuine_terminal = nm(
+        "m1", (), status=MatchStatus.FINISHED, minute=90, score_home=2, score_away=1
+    )
+    live_lagging = nm("m1", (), status=MatchStatus.IN_PLAY, minute=80, score_home=2, score_away=1)
+    assert not CollectorEngine._live_supersedes_cooldown_fallback(live_lagging, genuine_terminal), (
+        "Y3: equal scores at an earlier minute are a lagging final, not liveness → keep"
+    )
+
+    # Null applied minute → conservative keep even with equal scores.
+    live_null_minute = nm(
+        "m1", (), status=MatchStatus.IN_PLAY, minute=None, score_home=1, score_away=0
+    )
+    assert not CollectorEngine._live_supersedes_cooldown_fallback(
+        live_null_minute, false_terminal
+    ), "Y3: a null applied minute is conservative — keep the fallback"
+
+
+def test_y3_twin_resumption_fallback_equal_score_later_minute_supersedes():
+    """Y3 (twin): the resumption-tracker :meth:`_live_supersedes_fallback` shares the
+    equal-score blind spot and is judged against a durable applied live state with a
+    real minute, so it gets the same rule — equal scores at a strictly later minute
+    supersede, an earlier/equal minute keeps."""
+    from gamecollect.engine import CollectorEngine
+
+    false_terminal = nm(
+        "m1", (), status=MatchStatus.FINISHED, minute=55, score_home=1, score_away=0
+    )
+    live_later = nm("m1", (), status=MatchStatus.IN_PLAY, minute=70, score_home=1, score_away=0)
+    assert CollectorEngine._live_supersedes_fallback(live_later, false_terminal), (
+        "Y3 twin: equal scores at a strictly later minute supersede the stale fallback"
+    )
+    live_earlier = nm("m1", (), status=MatchStatus.IN_PLAY, minute=50, score_home=1, score_away=0)
+    assert not CollectorEngine._live_supersedes_fallback(live_earlier, false_terminal), (
+        "Y3 twin: equal scores at an earlier minute keep the fallback"
+    )
+
+
+def test_y4_per_field_clock_fill_among_eligible_sides_but_not_ineligible():
+    """Y4: among status-ELIGIBLE sides the clock is filled PER FIELD — a FINISHED
+    winner carrying minute 90 / null display_clock merges with an eligible FINISHED
+    side's null-minute / "90'+3" to 90/"90'+3". An INELIGIBLE live side contributes
+    nothing (the winner's null display_clock stays null — no cross-status leak)."""
+    from gamecollect.engine import CollectorEngine
+
+    winner = nm(
+        "m1",
+        (),
+        status=MatchStatus.FINISHED,
+        minute=90,
+        score_home=2,
+        score_away=0,
+        display_clock=None,
+    )
+    eligible_terminal = nm(
+        "m1",
+        (),
+        status=MatchStatus.FINISHED,
+        minute=None,
+        score_home=2,
+        score_away=0,
+        display_clock="90'+3",
+    )
+    assert CollectorEngine._paired_clock(winner, eligible_terminal) == (90, "90'+3"), (
+        "Y4: eligible sides fill each null clock field independently (merged 90/90'+3)"
+    )
+
+    ineligible_live = nm(
+        "m1",
+        (),
+        status=MatchStatus.IN_PLAY,
+        minute=None,
+        score_home=2,
+        score_away=0,
+        display_clock="90'+3",
+    )
+    assert CollectorEngine._paired_clock(winner, ineligible_live) == (90, None), (
+        "Y4: an ineligible live side contributes nothing; the null display stays null"
     )
 
 
