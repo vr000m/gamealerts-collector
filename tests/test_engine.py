@@ -2768,8 +2768,10 @@ def test_abandoned_tracker_does_not_hot_loop_and_recovers_on_live_reappearance(t
             score_home=1,
         )
         provider._polls.extend([([live2], {"m1": live_detail2}), ([], {"m1": ft_detail})])
-        engine.poll_once()  # live reappearance clears the cooldown
-        assert "m1" not in engine._cooldowns, "a genuine LIVE reappearance must clear the cooldown"
+        engine.poll_once()  # live reappearance clears the cooling GATE (L1)
+        assert not engine._cooling_down("m1"), (
+            "a genuine LIVE reappearance must clear the cooling gate (re-tracking resumes)"
+        )
         engine.poll_once()  # clean FT transition recovers
     finally:
         engine.close()
@@ -3825,13 +3827,13 @@ def _full_stored_row(
     )
 
 
-def test_give_up_nonregress_never_elevates_candidate_into_a_live_status(tmp_path):
-    """Round-10 F1: the status floor must apply ONLY when the stored status is
-    TERMINAL. A stored LIVE status (IN_PLAY) must NEVER elevate a lower-ranked
-    SCHEDULED give-up candidate — a give-up carrying a live status is short-
-    circuited by _resolve_tracker (the non-live consume point), so it would
-    never pop the tracker, never clear the cooldown, and re-emit forever. The
-    guarded snapshot must stay non-live (resolvable)."""
+def test_give_up_decision_g0_coerces_nonterminal_candidate_to_finished_keeping_scores(tmp_path):
+    """Round-11 G0 TERMINALITY: the emitted give-up status MUST be terminal. A
+    non-terminal candidate (a SCHEDULED provider reset accepted upstream as the
+    fallback) over a stored LIVE row is coerced to FINISHED — never left SCHEDULED
+    (which would regress the stored live row) and never elevated into a live
+    status (unresolvable at _resolve_tracker). G1 keeps the known scores. G0 also
+    nulls the clock: a coerced close has no authoritative clock."""
     from gamecollect.db.connection import connect
     from gamecollect.engine import CollectorEngine
 
@@ -3849,28 +3851,29 @@ def test_give_up_nonregress_never_elevates_candidate_into_a_live_status(tmp_path
     engine = CollectorEngine(
         make_pack(provider, seed_match=default_seed_match), str(db), SOURCE, 0.01, provider=provider
     )
-    # A give-up candidate carrying a non-live provider reset (SCHEDULED), as
-    # _build_give_up_snapshot accepts a fallback's non-live status as-is.
+    # A give-up candidate carrying a non-live provider reset (SCHEDULED).
     candidate = nm("m1", (), status=MatchStatus.SCHEDULED, minute=None, score_home=1, score_away=0)
     try:
-        guarded = engine._nonregress_over_stored("m1", candidate)
+        emitted = engine._nonregress_over_stored("m1", candidate)
     finally:
         engine.close()
 
     from gamecollect.provider import LIVE_STATUSES
 
-    assert guarded.status not in LIVE_STATUSES, (
-        "a stored live status must never elevate a give-up candidate into a live "
-        "status — the emission would be unresolvable"
+    assert emitted.status is MatchStatus.FINISHED, (
+        "a non-terminal candidate must be coerced to the terminal FINISHED (G0)"
     )
-    assert guarded.status is MatchStatus.SCHEDULED
+    assert emitted.status not in LIVE_STATUSES, "the emission must stay non-live (resolvable)"
+    assert emitted.score_home == 1 and emitted.score_away == 0, (
+        "known scores must survive the coercion (G1)"
+    )
 
 
-def test_give_up_nonregress_preserves_stored_terminal_clock_over_stale_fallback(tmp_path):
-    """Round-10 F2: when a TERMINAL stored row wins or ties the candidate's
-    rank, its minute/display_clock are authoritative — a stale fallback's
-    80'/"80'" must not overwrite the stored 90/'FT'. The stored terminal status
-    also still floors a lower-ranked candidate."""
+def test_give_up_decision_g0_coerced_close_never_ships_a_stale_live_clock(tmp_path):
+    """Round-11 G0 CLOCK: coercing a still-live candidate to FINISHED must NULL its
+    live clock — a coerced close has no authoritative clock, so a stale "80'"/80
+    must never be shipped. With a non-terminal stored row there is no terminal
+    clock to fill from, so the emitted clock is null."""
     from gamecollect.db.connection import connect
     from gamecollect.engine import CollectorEngine
 
@@ -3879,13 +3882,7 @@ def test_give_up_nonregress_preserves_stored_terminal_clock_over_stale_fallback(
     try:
         with conn:
             _full_stored_row(
-                conn,
-                "m1",
-                status=MatchStatus.FINISHED,
-                minute=90,
-                score_home=2,
-                score_away=1,
-                display_clock="FT",
+                conn, "m1", status=MatchStatus.IN_PLAY, minute=80, score_home=1, display_clock="80'"
             )
     finally:
         conn.close()
@@ -3894,31 +3891,82 @@ def test_give_up_nonregress_preserves_stored_terminal_clock_over_stale_fallback(
     engine = CollectorEngine(
         make_pack(provider, seed_match=default_seed_match), str(db), SOURCE, 0.01, provider=provider
     )
-    # A stale FINISHED fallback still carrying an in-progress clock (80'/"80'").
+    # Still-live candidate carrying a live clock.
+    candidate = nm(
+        "m1", (), status=MatchStatus.IN_PLAY, minute=80, score_home=1, display_clock="80'"
+    )
+    try:
+        emitted = engine._nonregress_over_stored("m1", candidate)
+    finally:
+        engine.close()
+
+    assert emitted.status is MatchStatus.FINISHED, "a live candidate is coerced terminal (G0)"
+    assert emitted.minute is None and emitted.display_clock is None, (
+        "a coerced close must null the stale live clock, not ship 80'/80 (G0)"
+    )
+
+
+def test_give_up_decision_g2_g3_genuinely_terminal_candidate_repairs_stale_stored_clock(tmp_path):
+    """Round-11 [6] (G2/G3): a GENUINELY-terminal candidate's status and non-null
+    clock win even over a stored terminal row — fresher terminal knowledge repairs
+    stale stored state. Here the stored row was prematurely closed with an
+    in-progress clock (80/"80'"); the genuinely-terminal candidate carrying the
+    real full-time clock (90/"FT") must overwrite it, not defer to it (the
+    opposite of the round-10 coerced-close rule)."""
+    from gamecollect.db.connection import connect
+    from gamecollect.engine import CollectorEngine
+
+    db = tmp_path / "engine.db"
+    conn = connect(str(db), side_table_ddl=FAKE_SIDE_TABLE_DDL)
+    try:
+        with conn:
+            # Stored terminal row prematurely closed with a stale in-progress clock.
+            _full_stored_row(
+                conn,
+                "m1",
+                status=MatchStatus.FINISHED,
+                minute=80,
+                score_home=2,
+                score_away=1,
+                display_clock="80'",
+            )
+    finally:
+        conn.close()
+
+    provider = ScriptedDetailProvider([])
+    engine = CollectorEngine(
+        make_pack(provider, seed_match=default_seed_match), str(db), SOURCE, 0.01, provider=provider
+    )
+    # A genuinely-terminal candidate carrying the correct full-time clock.
     candidate = nm(
         "m1",
         (),
         status=MatchStatus.FINISHED,
-        minute=80,
+        minute=90,
         score_home=2,
         score_away=1,
-        display_clock="80'",
+        display_clock="FT",
     )
     try:
-        guarded = engine._nonregress_over_stored("m1", candidate)
+        emitted = engine._nonregress_over_stored("m1", candidate)
     finally:
         engine.close()
 
-    assert guarded.minute == 90, "the stored terminal minute must survive a stale fallback clock"
-    assert guarded.display_clock == "FT", "the stored terminal display_clock must survive"
+    assert emitted.status is MatchStatus.FINISHED
+    assert emitted.minute == 90, (
+        "a genuinely-terminal candidate's clock repairs the stale stored one"
+    )
+    assert emitted.display_clock == "FT", "the fresh terminal display_clock must win (G3)"
 
 
-def test_richer_score_observed_while_cooling_accrues_into_fallback(tmp_path):
-    """Round-10 F3: a richer live observation during a cooldown (a 2-0 detail
-    over a 1-0 baseline) must still accrue into the tracker fallback (the
-    richest-fallback invariant), so the eventual post-cooldown give-up does not
-    close with a stale score. The tracker's attempt count must NOT advance while
-    cooling (no give-up machinery)."""
+def test_richer_score_observed_while_cooling_accrues_into_cooldown_fallback(tmp_path):
+    """Round-11 R2: a richer live observation during a cooldown (a 2-0 detail over
+    a 1-0 baseline) must accrue into the COOLDOWN entry's fallback — NOT a tracker
+    (get-or-creating one while cooling would re-arm the very give-up hot-loop the
+    cooldown suppresses). When the gate lapses and re-tracking begins the fresh
+    tracker's fallback is SEEDED from cooldown.fallback, so the eventual post-
+    cooldown give-up still closes with the richest observed 2-0. No tracker and no
+    attempt count advance while cooling."""
     from gamecollect.engine import CollectorEngine, _Cooldown
 
     db = tmp_path / "engine.db"
@@ -3935,10 +3983,15 @@ def test_richer_score_observed_while_cooling_accrues_into_fallback(tmp_path):
     engine._cooldowns["m1"] = _Cooldown(remaining=8, epoch=1)  # cooling
     try:
         engine._fetch_poll_snapshots()
-        tracker = engine._transitions.get("m1")
-        assert tracker is not None, "cooling must still accrue a fallback into the tracker"
+        assert "m1" not in engine._transitions, "cooling must NOT get-or-create a tracker (R2)"
+        cooldown = engine._cooldowns["m1"]
+        assert cooldown.fallback is not None and cooldown.fallback.score_home == 2, (
+            "the richer 2-0 observed while cooling must accrue into the cooldown entry"
+        )
+        # Gate lapses → re-tracking seeds the fresh tracker's fallback from the entry.
+        tracker = engine._tracker("m1")
         assert tracker.fallback is not None and tracker.fallback.score_home == 2, (
-            "the richer 2-0 observed while cooling must not be dropped"
+            "the re-tracked tracker's fallback must be seeded from cooldown.fallback"
         )
         assert tracker.total_attempts == 0, "cooling must NOT advance the give-up attempt count"
         give_up = engine._build_give_up_snapshot("m1", tracker, fresh=None)
@@ -3950,12 +4003,15 @@ def test_richer_score_observed_while_cooling_accrues_into_fallback(tmp_path):
     )
 
 
-def test_durable_live_apply_via_cooling_path_clears_cooldown_without_resumption(tmp_path):
-    """Round-10 F4: ANY genuinely durable (state_advanced) live apply clears the
-    abandonment cooldown, even a live DETAIL recovery reached via the cooling
+def test_durable_live_apply_via_cooling_path_clears_gate_but_preserves_epoch(tmp_path):
+    """Round-10 F4 + round-11 L1: ANY genuinely durable (state_advanced) live apply
+    clears the cooling GATE, even a live DETAIL recovery reached via the cooling
     hydration path that never appeared on the slate as live (absent from
     live_resumptions). A no-change flicker (state_advanced False) must still NOT
-    clear it."""
+    clear it. Round-11 L1: the live apply clears only the GATE (remaining → 0),
+    PRESERVING the entry and its epoch — the entry is removed only by a terminal
+    resolution or the expired-unseen purge, so a still-failing terminal write
+    keeps its exponential backoff."""
     from gamecollect.engine import CollectorEngine, _Cooldown
 
     db = tmp_path / "engine.db"
@@ -3963,17 +4019,20 @@ def test_durable_live_apply_via_cooling_path_clears_cooldown_without_resumption(
     engine = CollectorEngine(make_pack(provider), str(db), SOURCE, 0.01, provider=provider)
     live = nm("m1", (), status=MatchStatus.IN_PLAY, minute=60, score_home=1, score_away=0)
     try:
-        # No-change flicker: must NOT clear the cooldown.
-        engine._cooldowns["m1"] = _Cooldown(remaining=8, epoch=1)
+        # No-change flicker: must NOT clear the gate.
+        engine._cooldowns["m1"] = _Cooldown(remaining=8, epoch=2)
         engine._on_durable_snapshot("m1", live, live_resumptions=set(), state_advanced=False)
-        assert "m1" in engine._cooldowns, "a no-change live flicker must not clear the cooldown"
+        assert engine._cooling_down("m1"), "a no-change live flicker must not clear the gate"
 
         # Durable live apply reached via the cooling path (NOT in live_resumptions):
-        # must clear the cooldown.
+        # clears the GATE but PRESERVES the entry/epoch (L1).
         engine._on_durable_snapshot("m1", live, live_resumptions=set(), state_advanced=True)
-        assert "m1" not in engine._cooldowns, (
-            "a durable live detail recovery must clear the cooldown even when the "
+        assert not engine._cooling_down("m1"), (
+            "a durable live detail recovery must clear the cooling gate even when the "
             "match never appeared live on the slate this poll"
+        )
+        assert "m1" in engine._cooldowns and engine._cooldowns["m1"].epoch == 2, (
+            "a live recovery clears only the gate — the epoch/backoff memory survives"
         )
     finally:
         engine.close()
@@ -4088,4 +4147,192 @@ def test_two_canonical_rank_zero_rows_tied_on_updated_at_resolve_by_match_id(tmp
 
     assert snap is not None and snap.score_home == 5, (
         "a rank-0 tie on updated_at must resolve to the lower match_id deterministically"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Round-11 prescribed give-up decision table + cooldown gate/epoch split:
+# score-monotonic fallback comparator (R1), no-tracker-while-cooling accrual
+# (R2), gate-vs-epoch split (L1), drift log damping (L3)
+# --------------------------------------------------------------------------- #
+
+
+def test_richest_fallback_r1_score_reset_never_replaces_higher_incumbent():
+    """Round-11 R1(a): scores are cumulative facts — a later 0-0 provider reset
+    board must NEVER replace a 2-0 incumbent fallback, even though the reset board
+    is "fresher". The comparator vetoes any per-side regression."""
+    from gamecollect.engine import CollectorEngine
+
+    incumbent = nm("m1", (), status=MatchStatus.FINISHED, minute=None, score_home=2, score_away=0)
+    reset_board = nm(
+        "m1", (), status=MatchStatus.SCHEDULED, minute=None, score_home=0, score_away=0
+    )
+    assert CollectorEngine._richest_fallback(incumbent, reset_board) is incumbent, (
+        "a 0-0 reset must not replace a 2-0 fallback (R1 score monotonicity)"
+    )
+
+
+def test_richest_fallback_r1_strictly_higher_score_supersedes():
+    """Round-11 R1(a): a strictly higher known score on a side (with no regression
+    on the other) is a cumulative advance and supersedes the incumbent — a 2-0
+    detail replaces a 1-0 fallback."""
+    from gamecollect.engine import CollectorEngine
+
+    old = nm("m1", (), status=MatchStatus.IN_PLAY, minute=40, score_home=1, score_away=0)
+    new = nm("m1", (), status=MatchStatus.IN_PLAY, minute=52, score_home=2, score_away=0)
+    assert CollectorEngine._richest_fallback(old, new) is new, (
+        "a strictly higher score must supersede the incumbent fallback (R1)"
+    )
+
+
+def test_richest_fallback_r1_prefers_events_without_clock_leakage(tmp_path):
+    """Round-11 R1(b): at equal scores an events-carrying live snapshot is
+    preferred over a bare terminal board (events rank before terminal). And there
+    is NO live-clock leakage: when that live fallback becomes the give-up
+    candidate, G0 coerces it terminal and nulls the clock at emission."""
+    from gamecollect.engine import CollectorEngine
+
+    bare_ft = nm(
+        "m1",
+        (),
+        status=MatchStatus.FINISHED,
+        minute=None,
+        score_home=1,
+        score_away=0,
+        display_clock=None,
+    )
+    live_with_events = nm(
+        "m1",
+        (ev(0, "goal", minute=30),),
+        status=MatchStatus.IN_PLAY,
+        minute=48,
+        score_home=1,
+        score_away=0,
+        display_clock="48'",
+    )
+    chosen = CollectorEngine._richest_fallback(bare_ft, live_with_events)
+    assert chosen is live_with_events, (
+        "an events-carrying snapshot beats a bare terminal board (R1 b)"
+    )
+
+    # No clock leakage: emit through the decision table against an empty store.
+    db = tmp_path / "engine.db"
+    provider = ScriptedDetailProvider([])
+    engine = CollectorEngine(make_pack(provider), str(db), SOURCE, 0.01, provider=provider)
+    try:
+        emitted = engine._nonregress_over_stored("m1", chosen)
+    finally:
+        engine.close()
+    assert emitted.status is MatchStatus.FINISHED, (
+        "the live fallback is coerced terminal at emission"
+    )
+    assert emitted.minute is None and emitted.display_clock is None, (
+        "the live 48' clock must NOT leak into the emitted give-up (G0)"
+    )
+
+
+def test_r2_slate_board_on_fetch_failure_branch_survives_into_post_cooldown_give_up(tmp_path):
+    """Round-11 R2 (workflow [4]): while cooling, the fetch-FAILURE branch must
+    accrue its non-live slate board into cooldown.fallback (NOT a tracker), so a
+    richer board seen when the detail fetch fails is not lost. When the gate
+    lapses the re-tracked tracker is seeded from it and the give-up closes with
+    that board's score."""
+    from gamecollect.engine import CollectorEngine, _Cooldown
+
+    db = tmp_path / "engine.db"
+    baseline_live = nm("m1", (), status=MatchStatus.IN_PLAY, minute=40, score_home=1, score_away=0)
+    # A richer non-live board on the slate, but its detail fetch fails this poll.
+    ft_board = nm(
+        "m1",
+        (),
+        status=MatchStatus.FINISHED,
+        minute=None,
+        score_home=2,
+        score_away=1,
+        display_clock="FT",
+    )
+    provider = ScriptedDetailProvider([([ft_board], {"m1": ProviderUnavailableError("down")})])
+    engine = CollectorEngine(make_pack(provider), str(db), SOURCE, 0.01, provider=provider)
+    engine._restart_scan_done = True
+    engine._last["m1"] = baseline_live  # was_live → in_transition on the non-live board
+    engine._cooldowns["m1"] = _Cooldown(remaining=8, epoch=1)  # cooling
+    try:
+        engine._fetch_poll_snapshots()
+        assert "m1" not in engine._transitions, (
+            "the cooling fetch-failure branch must not get-or-create a tracker (R2)"
+        )
+        cooldown = engine._cooldowns["m1"]
+        assert (
+            cooldown.fallback is not None
+            and cooldown.fallback.score_home == 2
+            and cooldown.fallback.score_away == 1
+        ), "the non-live slate board on the fetch-failure branch must accrue into cooldown.fallback"
+        tracker = engine._tracker("m1")  # gate lapses → re-track seeds fallback
+        give_up = engine._build_give_up_snapshot("m1", tracker, fresh=None)
+    finally:
+        engine.close()
+    assert give_up is not None and give_up.score_home == 2 and give_up.score_away == 1, (
+        "the post-cooldown give-up must close with the 2-1 board observed while cooling"
+    )
+
+
+def test_l1_live_recovery_preserves_epoch_no_repeated_error_backoff_grows(tmp_path, caplog):
+    """Round-11 L1: a durable state-advanced live apply clears only the cooling
+    GATE while PRESERVING the epoch, so a still-failing terminal write path keeps
+    its exponential backoff and its WARN-after-first-epoch damping. First
+    abandonment ERRORs (epoch 1); after a live recovery clears the gate, a later
+    abandonment doubles the backoff and logs a single WARN — no per-cycle ERROR."""
+    from gamecollect.engine import _COOLDOWN_BASE_POLLS, CollectorEngine
+
+    db = tmp_path / "engine.db"
+    provider = ScriptedDetailProvider([])
+    engine = CollectorEngine(make_pack(provider), str(db), SOURCE, 0.01, provider=provider)
+    live = nm("m1", (), status=MatchStatus.IN_PLAY, minute=60, score_home=1, score_away=0)
+    try:
+        with caplog.at_level(logging.WARNING, logger="gamecollect.engine"):
+            engine._abandon("m1", "abandon %s", "one")  # epoch 1 → ERROR
+            assert engine._cooldowns["m1"].remaining == _COOLDOWN_BASE_POLLS
+            # Durable live recovery: clears the GATE, PRESERVES epoch 1.
+            engine._on_durable_snapshot("m1", live, live_resumptions=set(), state_advanced=True)
+            assert not engine._cooling_down("m1"), "the live recovery must clear the cooling gate"
+            assert engine._cooldowns["m1"].epoch == 1, (
+                "the epoch must survive the live recovery (L1)"
+            )
+            # The terminal write is still failing → abandon again. Backoff grows.
+            engine._abandon("m1", "abandon %s", "two")  # epoch 2 → WARN (no repeated ERROR)
+    finally:
+        engine.close()
+
+    levels = [r.levelno for r in caplog.records if r.getMessage().startswith("abandon")]
+    assert levels == [logging.ERROR, logging.WARNING], (
+        "the first abandonment ERRORs; later epochs WARN — no per-cycle ERROR storm (L1)"
+    )
+    assert engine._cooldowns["m1"].epoch == 2
+    assert engine._cooldowns["m1"].remaining == _COOLDOWN_BASE_POLLS * 2, (
+        "the preserved epoch means the next abandonment doubles the backoff (L1)"
+    )
+
+
+def test_l3_drift_logs_one_error_per_epoch_then_debug(tmp_path, caplog):
+    """Round-11 L3: while cooling, ShapeDriftError logs a full ERROR ONCE per
+    cooldown epoch per match; subsequent drifts in the SAME epoch drop to DEBUG. A
+    new epoch re-arms the ERROR. Never a per-poll ERROR storm, never zero lines."""
+    from gamecollect.engine import CollectorEngine, _Cooldown
+
+    db = tmp_path / "engine.db"
+    provider = ScriptedDetailProvider([])
+    engine = CollectorEngine(make_pack(provider), str(db), SOURCE, 0.01, provider=provider)
+    engine._cooldowns["m1"] = _Cooldown(remaining=8, epoch=1)
+    try:
+        with caplog.at_level(logging.DEBUG, logger="gamecollect.engine"):
+            engine._log_drift_while_cooling("m1", ShapeDriftError("drift 1"))  # ERROR (epoch 1)
+            engine._log_drift_while_cooling("m1", ShapeDriftError("drift 2"))  # DEBUG (same epoch)
+            engine._enter_cooldown("m1")  # epoch 2 → drift flag reset
+            engine._log_drift_while_cooling("m1", ShapeDriftError("drift 3"))  # ERROR (epoch 2)
+    finally:
+        engine.close()
+
+    levels = [r.levelno for r in caplog.records if "shape drift" in r.getMessage()]
+    assert levels == [logging.ERROR, logging.DEBUG, logging.ERROR], (
+        "drift logs one ERROR per epoch, DEBUG for same-epoch repeats, ERROR again on a new epoch"
     )

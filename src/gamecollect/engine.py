@@ -165,6 +165,18 @@ _STATUS_RANK: dict[MatchStatus, int] = {
     MatchStatus.FINISHED: 2,
 }
 
+# Terminal lifecycle statuses: a match in one of these has reached an end state
+# and will not legitimately go live again. Today only FINISHED is terminal, but
+# every give-up / fallback decision tests membership in THIS set (never ``is
+# FINISHED``) so a future terminal kind (AET, penalties, abandoned) is carried by
+# the same monotonicity rules without hunting down every call site.
+_TERMINAL_STATUSES: frozenset[MatchStatus] = frozenset({MatchStatus.FINISHED})
+
+
+def _is_terminal(status: MatchStatus) -> bool:
+    """True when ``status`` is a terminal (end-of-match) lifecycle state."""
+    return status in _TERMINAL_STATUSES
+
 
 def _merge_detail(scoreboard: NormalizedMatch, detail: NormalizedMatch) -> NormalizedMatch:
     """Merge a detail snapshot over its scoreboard snapshot, field by field.
@@ -256,11 +268,32 @@ class _Cooldown:
     purged (:meth:`_age_cooldowns`) — the epoch/backoff memory is lost, which is
     fine: a match reappearing after a full cap-length quiet window deserves a
     fresh epoch.
+
+    ``fallback`` holds the RICHEST non-live observation accrued WHILE cooling —
+    the give-up machinery does NOT get-or-create a tracker during a cooldown
+    (that would re-arm the very hot-loop the cooldown suppresses), so a richer
+    board seen while cooling (a 2-0 detail over a stale 1-0) accrues here via the
+    :meth:`_richest_fallback` comparator instead. When the cooldown lapses and
+    re-tracking begins, the fresh tracker's ``fallback`` is SEEDED from this slot
+    (see :meth:`_tracker`) so a rich terminal state observed during the quiet
+    window still closes the eventual give-up. ``drift_logged`` damps the
+    schema-drift ERROR to ONCE per epoch per match (:meth:`_log_drift_while_cooling`);
+    it is reset by :meth:`_enter_cooldown` when a new epoch starts.
+
+    GATE vs MEMORY: ``remaining`` is the SUPPRESSION GATE (re-tracking is blocked
+    only while ``remaining > 0``); ``epoch``/``fallback`` are the MEMORY. A
+    durable state-advanced LIVE apply clears only the gate (zeroes ``remaining``,
+    see :meth:`_on_durable_snapshot`) but PRESERVES the epoch, so a still-failing
+    terminal write keeps exponential backoff and the WARN-after-first-epoch
+    damping. The ENTRY itself is removed only by a terminal resolution
+    (:meth:`_resolve_tracker`) or the expired-and-unseen purge.
     """
 
     remaining: int
     epoch: int
     expired_unseen: int = 0
+    fallback: NormalizedMatch | None = None
+    drift_logged: bool = False
 
 
 @dataclass
@@ -331,15 +364,20 @@ class _TransitionTracker:
       gate a genuinely recoverable board: an on-slate board whose detail fetch
       SUCCEEDS is merged/applied normally even while cooling (a live board
       resumes it, a FINISHED board closes it); only the give-up machinery
-      (fetch-failure/non-terminal tracker accrual + re-emission) is suppressed.
-      The cooldown is CLEARED (``_cooldowns.pop``) on ANY genuinely durable
-      apply for the match — one that actually wrote: a terminal apply via
-      ``_resolve_tracker``, or ANY ``state_advanced`` live apply via
-      ``_on_durable_snapshot`` (``_reconcile_live_apply`` handles resumption
-      tracker semantics only for a match that was live on the slate this poll,
-      but the cooldown clear itself is unconditional on ``state_advanced`` — a
-      live DETAIL recovery reached through the cooling hydration path, absent
-      from ``live_resumptions``, clears it too). A no-change snapshot
+      (fetch-failure/non-terminal fallback accrual + re-emission) is suppressed —
+      and while cooling that accrual lands on the :class:`_Cooldown` entry, NOT a
+      tracker (a tracker is never get-or-created during a cooldown). GATE vs
+      MEMORY: a durable apply CLEARS THE COOLING GATE (``remaining`` → 0, so
+      re-tracking resumes) on ANY genuinely durable apply for the match — a
+      terminal apply via ``_resolve_tracker``, or ANY ``state_advanced`` live
+      apply via ``_on_durable_snapshot`` (``_reconcile_live_apply`` handles
+      resumption tracker semantics only for a match live on the slate this poll,
+      but the gate clear itself is unconditional on ``state_advanced`` — a live
+      DETAIL recovery reached through the cooling hydration path, absent from
+      ``live_resumptions``, clears the gate too). The ENTRY is REMOVED only by a
+      terminal resolution (``_resolve_tracker``) or the expired-and-unseen purge:
+      a live recovery preserves the epoch/backoff memory so a still-failing
+      terminal write path keeps its exponential spacing. A no-change snapshot
       (``diff.has_changes`` False) advanced nothing, so it is NOT routed through
       the cooldown-clearing path (see ``_on_durable_snapshot``'s
       ``state_advanced`` gate) — a live flicker that writes nothing must not
@@ -347,8 +385,8 @@ class _TransitionTracker:
       literally never advances (a frozen provider cache emitting an identical
       snapshot every poll) cannot clear its cooldown via this no-change path —
       it is indistinguishable from a stale flicker. A genuinely live match
-      clears the cooldown on its next real state change (a minute tick, a score,
-      a status move); a truly frozen id simply ages out via the bounded
+      clears the cooling gate on its next real state change (a minute tick, a
+      score, a status move); a truly frozen id simply ages out via the bounded
       expired-and-unseen purge (:meth:`_age_cooldowns`) once it also leaves the
       slate. The behaviour matrix this design must satisfy (all hold):
 
@@ -357,10 +395,14 @@ class _TransitionTracker:
         b. abandoned → live-during-outage (apply fails) → vanishes → outage
            lifts → a later cooldown epoch re-tracks and persists the final
            state (no permanent loss).
-        c. no-changes live flicker → cooldown state untouched.
+        c. no-changes live flicker → cooldown state untouched (gate and memory).
         d. recoverable FINISHED board after outage lifts → applied, persisted,
-           cooldown cleared (immediately when its detail fetch succeeds).
-        e. durable live recovery → normal collection, cooldown cleared.
+           ENTRY REMOVED by the terminal resolution (immediately when its detail
+           fetch succeeds).
+        e. durable live recovery → normal collection, cooling GATE cleared
+           (re-tracking resumes) but the epoch/backoff MEMORY preserved, so a
+           terminal write that keeps failing afterwards keeps its exponential
+           spacing (L1).
         f. transient live flicker with failing apply → no immediate re-track
            (cooldown holds).
     * ``last_reported_status`` dedupes the non-terminal WARN: once per detail
@@ -449,13 +491,17 @@ class CollectorEngine:
         self._transitions: dict[str, _TransitionTracker] = {}
         # Match ids in an abandonment COOLDOWN (see _Cooldown / _emit_give_up):
         # a match whose give-up snapshot could not be durably applied is
-        # re-tracked only after its cooldown lapses, the interval doubling per
-        # successive abandonment. Gates BOTH the off-slate vanished re-tracking
-        # path and the on-slate give-up machinery so a persistently-unapplyable
-        # match retries at exponentially spaced intervals instead of hot-looping
-        # a fresh give-up every poll; a board whose detail fetch SUCCEEDS is
-        # still applied normally while cooling. Cleared only on the next durable
-        # apply for the match (see _reconcile_live_apply / _resolve_tracker).
+        # re-tracked only after its cooldown GATE (remaining polls) lapses, the
+        # interval doubling per successive abandonment. Gates BOTH the off-slate
+        # vanished re-tracking path and the on-slate give-up machinery so a
+        # persistently-unapplyable match retries at exponentially spaced intervals
+        # instead of hot-looping a fresh give-up every poll; a board whose detail
+        # fetch SUCCEEDS is still applied normally while cooling, and richer
+        # observations accrue into the entry's `fallback` (no tracker is created
+        # while cooling). The GATE is cleared (remaining → 0, epoch preserved) by
+        # the next durable state-advancing apply (_on_durable_snapshot); the ENTRY
+        # is removed only by a terminal resolution (_resolve_tracker) or the
+        # expired-and-unseen purge (_age_cooldowns).
         self._cooldowns: dict[str, _Cooldown] = {}
         self._record: dict[str, _RecordedMatch] = {}
         self._record_flush_failed = False
@@ -807,6 +853,30 @@ class CollectorEngine:
                 exc,
             )
 
+    def _log_drift_while_cooling(self, match_id: str, exc: ShapeDriftError) -> None:
+        """Log a schema-drift failure seen while cooling, DAMPED to once/epoch (L3).
+
+        Schema drift is a PROVIDER-level signal, so it must surface even while a
+        match is cooling — but a per-poll ERROR (with traceback) for up to
+        ``_COOLDOWN_MAX_POLLS`` polls is noise, not signal. The FIRST drift of a
+        cooldown epoch logs the full ERROR (via
+        :meth:`_log_detail_fetch_failure`); later drifts in the SAME epoch drop to
+        DEBUG. The per-epoch flag lives on the :class:`_Cooldown` entry and is
+        reset by :meth:`_enter_cooldown` when a new epoch begins.
+        """
+        cooldown = self._cooldowns.get(match_id)
+        if cooldown is not None and not cooldown.drift_logged:
+            cooldown.drift_logged = True
+            self._log_detail_fetch_failure(match_id, exc)
+            return
+        log.debug(
+            "detail shape drift for match %s on source %s while cooling "
+            "(already logged this cooldown epoch): %s",
+            match_id,
+            self._source,
+            exc,
+        )
+
     def _fetch_poll_snapshots(self) -> tuple[list[NormalizedMatch], set[str]]:
         """Fetch the live slate, replacing in-progress rows with full detail.
 
@@ -903,12 +973,13 @@ class CollectorEngine:
                 continue
             in_transition = was_live and match.status not in LIVE_STATUSES
             # A recoverable board is ALWAYS processed (fetch/merge/apply): a
-            # FINISHED board closes an abandoned row, a live board resumes it,
-            # and either clears the cooldown on its durable apply. The cooldown
-            # gates only the give-up MACHINERY (tracker accrual + re-emission)
-            # for a transition whose detail fetch/apply keeps failing — while
-            # cooling we do not rebuild a tracker or re-emit a give-up, so an
-            # unapplyable match cannot hot-loop; the next retry waits for the
+            # FINISHED board closes an abandoned row (removing the cooldown entry
+            # via _resolve_tracker), a live board resumes it (clearing the cooling
+            # gate, epoch preserved). The cooldown gates only the give-up
+            # MACHINERY (fallback accrual + re-emission) for a transition whose
+            # detail fetch/apply keeps failing — while cooling we do not rebuild a
+            # tracker or re-emit a give-up (accrual lands on the cooldown entry),
+            # so an unapplyable match cannot hot-loop; the next retry waits for the
             # cooldown to lapse (:meth:`_cooling_down`).
             cooling = self._cooling_down(match.match_id)
             tracker = self._transitions.get(match.match_id)
@@ -929,15 +1000,21 @@ class CollectorEngine:
                 if in_transition and cooling:
                     # In cooldown: the fetch is STILL attempted (so a recovered
                     # board applies immediately — matrix (d)), but a persistent
-                    # ordinary unavailability neither logs nor advances a
-                    # tracker/give-up, so an unresolvable board makes bounded
-                    # noise — matrix (a). Schema drift is the exception: it is a
-                    # PROVIDER-level signal (not per-match flapping), so its ERROR
-                    # always fires — otherwise up to _COOLDOWN_MAX_POLLS of drift
-                    # would produce zero log lines. The retry cycle resumes when
-                    # the cooldown lapses.
+                    # ordinary unavailability neither advances a give-up nor
+                    # (per L3) spams its ERROR, so an unresolvable board makes
+                    # bounded noise — matrix (a). No tracker is created while
+                    # cooling; instead the non-live slate board accrues into the
+                    # cooldown's own `fallback` (the R1 comparator keeps the
+                    # richest) so an observation seen during the quiet window is
+                    # not lost from the eventual post-cooldown give-up. Schema
+                    # drift is a PROVIDER-level signal (not per-match flapping),
+                    # so it is logged — but DAMPED to once per epoch
+                    # (:meth:`_log_drift_while_cooling`) rather than a per-poll
+                    # ERROR storm. The retry cycle resumes when the gate lapses.
+                    cooldown = self._cooldowns[match.match_id]
+                    cooldown.fallback = self._richest_fallback(cooldown.fallback, match)
                     if isinstance(exc, ShapeDriftError):
-                        self._log_detail_fetch_failure(match.match_id, exc)
+                        self._log_drift_while_cooling(match.match_id, exc)
                     continue
                 self._log_detail_fetch_failure(match.match_id, exc)
                 if not in_transition:
@@ -966,23 +1043,24 @@ class CollectorEngine:
             if tracker is not None:
                 tracker.consecutive_failures = 0
             merged = _merge_detail(match, detail)
-            if in_transition and merged.status is not MatchStatus.FINISHED:
+            if in_transition and not _is_terminal(merged.status):
                 # The transition hydration succeeded but did NOT yield a
                 # terminal snapshot: either the detail still says live over a
                 # non-live board, or both report a SCHEDULED/UNKNOWN provider
                 # reset. Persist live progress, but never a non-live
                 # non-terminal reset.
                 if cooling:
-                    # In cooldown: still accrue the richest fallback (the
-                    # richest-fallback invariant) so a richer observation during
-                    # cooldown — e.g. a 2-0 detail over a 1-0 baseline — is not
-                    # dropped and the eventual post-cooldown give-up does not
-                    # close with a stale score. Persist live progress (a durable
-                    # live apply clears the cooldown) but do NOT advance the
-                    # tracker's attempt count or emit a give-up off a non-terminal
-                    # reset.
-                    tracker = self._tracker(match.match_id)
-                    tracker.fallback = self._richest_fallback(tracker.fallback, merged)
+                    # In cooldown: accrue the richest observation into the
+                    # COOLDOWN entry (NOT a tracker — creating one here would
+                    # re-arm the give-up machinery the cooldown exists to
+                    # suppress) so a richer observation during the quiet window —
+                    # e.g. a 2-0 detail over a 1-0 baseline — is not dropped and
+                    # the eventual post-cooldown give-up does not close with a
+                    # stale score. Persist live progress (a durable live apply
+                    # clears the cooling gate) but do NOT advance any attempt
+                    # count or emit a give-up off a non-terminal reset.
+                    cooldown = self._cooldowns[match.match_id]
+                    cooldown.fallback = self._richest_fallback(cooldown.fallback, merged)
                     if merged.status in LIVE_STATUSES:
                         hydrated.append(merged)
                     continue
@@ -1081,7 +1159,7 @@ class CollectorEngine:
             tracker.consecutive_failures = 0
             base = self._transition_base(match_id, tracker)
             merged = _merge_over_base(base, detail) if base is not None else detail
-            if detail.status is MatchStatus.FINISHED:
+            if _is_terminal(detail.status):
                 # Terminal from the detail itself: persist the merge; the
                 # tracker pops only after the apply lands (_resolve_tracker).
                 snapshots.append(merged)
@@ -1111,10 +1189,22 @@ class CollectorEngine:
     # ------------------------------------------------------------------
 
     def _tracker(self, match_id: str) -> _TransitionTracker:
-        """Get-or-create the transition tracker for ``match_id``."""
+        """Get-or-create the transition tracker for ``match_id``.
+
+        When a fresh tracker is created and a (possibly lapsed) cooldown entry
+        still carries a ``fallback`` — the richest state accrued WHILE cooling,
+        since no tracker existed then — the new tracker is SEEDED from it, so a
+        rich terminal observation from the quiet window still closes the eventual
+        give-up (round-11 R2). Get-or-create is only reached OUTSIDE an active
+        cooldown (the cooling branches accrue into the entry directly and never
+        call this), so this cannot re-arm a still-suppressed give-up.
+        """
         tracker = self._transitions.get(match_id)
         if tracker is None:
             tracker = self._transitions[match_id] = _TransitionTracker()
+            cooldown = self._cooldowns.get(match_id)
+            if cooldown is not None and cooldown.fallback is not None:
+                tracker.fallback = self._richest_fallback(tracker.fallback, cooldown.fallback)
         return tracker
 
     @staticmethod
@@ -1162,20 +1252,34 @@ class CollectorEngine:
         cooldown = self._cooldowns.get(match_id)
         return cooldown is not None and cooldown.remaining > 0
 
-    def _enter_cooldown(self, match_id: str) -> int:
+    def _enter_cooldown(self, match_id: str, fallback: NormalizedMatch | None = None) -> int:
         """Abandon ``match_id`` into a fresh cooldown; return the new epoch.
 
         Each successive abandonment increments the epoch and DOUBLES the poll
         interval (``_COOLDOWN_BASE_POLLS`` × 2^(epoch-1), capped at
         ``_COOLDOWN_MAX_POLLS``), so a match whose apply persistently fails is
-        retried at exponentially spaced intervals. A prior (possibly expired)
-        entry supplies the epoch to grow from; a durable apply pops the entry
-        and resets the sequence.
+        retried at exponentially spaced intervals. A prior entry (an expired one,
+        or one whose gate a live recovery zeroed but whose memory survived, see
+        L1) supplies the epoch to grow from; the ENTRY is removed only by a
+        terminal resolution or the expired-unseen purge, never here.
+
+        ``fallback`` — the abandoned tracker's best-known state — is carried onto
+        the new entry (merged with any already accrued, richest kept) so the
+        richest terminal observation survives into the cooldown and seeds the
+        re-track after the gate lapses. The fresh entry starts ``drift_logged``
+        False, arming one schema-drift ERROR for the new epoch (L3).
         """
         previous = self._cooldowns.get(match_id)
         epoch = previous.epoch + 1 if previous is not None else 1
         remaining = min(_COOLDOWN_BASE_POLLS * (2 ** (epoch - 1)), _COOLDOWN_MAX_POLLS)
-        self._cooldowns[match_id] = _Cooldown(remaining=remaining, epoch=epoch)
+        carried = fallback
+        if previous is not None and previous.fallback is not None:
+            carried = (
+                self._richest_fallback(previous.fallback, fallback)
+                if fallback is not None
+                else previous.fallback
+            )
+        self._cooldowns[match_id] = _Cooldown(remaining=remaining, epoch=epoch, fallback=carried)
         return epoch
 
     def _on_durable_snapshot(
@@ -1188,21 +1292,27 @@ class CollectorEngine:
     ) -> None:
         """Route a durably-applied snapshot to the right tracker handler.
 
-        A non-live apply resolves a pending terminal tracker (and clears any
-        abandonment cooldown) — a stored row already matching the terminal
-        snapshot (no-change) IS durably terminal, so this runs regardless of
+        A non-live apply resolves a pending terminal tracker and REMOVES the
+        cooldown entry — a stored row already matching the terminal snapshot
+        (no-change) IS durably terminal, so this runs regardless of
         ``state_advanced``.
 
-        ANY genuinely durable (``state_advanced``) live apply clears the
-        abandonment cooldown — normal collection has demonstrably resumed. This
-        includes a live DETAIL recovery reached via the cooling hydration path
-        (slate board SCHEDULED/UNKNOWN, detail returns IN_PLAY): such a match is
-        absent from ``live_resumptions`` (which is populated only from slate-LIVE
-        boards), so gating the cooldown clear on membership would leave it cooling
-        forever. The ``state_advanced`` guard is load-bearing: a no-change live
-        flicker (snapshot == baseline, zero writes) must NOT clear a cooldown —
-        without proof the state advanced, a bogus flicker would re-arm re-tracking
-        on a match that never actually recovered.
+        ANY genuinely durable (``state_advanced``) live apply clears the cooling
+        GATE — but NOT the entry (L1): normal collection has demonstrably
+        resumed, so re-tracking must no longer be suppressed, yet the epoch /
+        backoff memory is PRESERVED so a terminal write that keeps failing after
+        the live recovery keeps its exponential spacing (and the WARN-after-first-
+        epoch damping) instead of restarting the ladder. The entry is removed
+        only by a terminal resolution or the expired-unseen purge. This gate clear
+        is the SINGLE owner of the live-side clear (L2): a live DETAIL recovery
+        reached via the cooling hydration path (slate board SCHEDULED/UNKNOWN,
+        detail returns IN_PLAY) is absent from ``live_resumptions`` (populated only
+        from slate-LIVE boards), so gating on membership would leave it cooling
+        forever — the gate clear is unconditional on ``state_advanced``. The
+        ``state_advanced`` guard is load-bearing: a no-change live flicker
+        (snapshot == baseline, zero writes) must NOT clear the gate — without proof
+        the state advanced, a bogus flicker would re-arm re-tracking on a match
+        that never actually recovered.
 
         ``live_resumptions`` gates ONLY the resumption tracker semantics
         (:meth:`_reconcile_live_apply`: budget reset / fallback retention): a
@@ -1213,11 +1323,23 @@ class CollectorEngine:
         """
         if snapshot.status in LIVE_STATUSES:
             if state_advanced:
-                self._cooldowns.pop(match_id, None)
+                self._clear_cooling_gate(match_id)
                 if match_id in live_resumptions:
                     self._reconcile_live_apply(match_id, snapshot)
             return
         self._resolve_tracker(match_id, snapshot)
+
+    def _clear_cooling_gate(self, match_id: str) -> None:
+        """Zero a cooldown's suppression gate while PRESERVING its memory (L1).
+
+        Stops suppressing re-tracking (``remaining`` → 0) but keeps the entry, so
+        its ``epoch`` (and any accrued ``fallback``) survives — a terminal write
+        that keeps failing after a live recovery keeps its exponential backoff.
+        A no-op when the match is not cooling.
+        """
+        cooldown = self._cooldowns.get(match_id)
+        if cooldown is not None:
+            cooldown.remaining = 0
 
     def _reset_resumption_budget(self, match_id: str) -> None:
         """Reset a tracker's retry BUDGET on a live slate reappearance.
@@ -1241,20 +1363,20 @@ class CollectorEngine:
         self._transitions[match_id] = _TransitionTracker(fallback=tracker.fallback)
 
     def _reconcile_live_apply(self, match_id: str, applied: NormalizedMatch) -> None:
-        """Reconcile a tracked match after a DURABLE live apply.
+        """Reconcile a tracked match's RESUMPTION fallback after a DURABLE live apply.
 
-        A durable live apply proves normal collection has resumed, so the
-        abandonment cooldown is cleared (only reached with ``state_advanced`` —
-        a no-change flicker never gets here). The retained ``fallback`` is then
-        judged against the APPLIED state — not the raw slate board, whose scores
-        are often NULL until the detail merge lands: a fallback too sparse to
-        persist, or one the applied live score has already climbed past, is
-        stale, so its tracker is dropped; a rich fallback the live score has NOT
-        surpassed is kept (with the freshly reset budget) across a one-poll
-        flicker until the match vanishes again — a genuine fresh transition
-        rebuilds the tracker.
+        This handles ONLY the resumption tracker semantics; the cooling GATE was
+        already cleared by :meth:`_on_durable_snapshot` (the single owner, L2) —
+        this method no longer touches ``_cooldowns`` at all. Only reached with
+        ``state_advanced`` (a no-change flicker never gets here) and only for a
+        match live on the slate this poll. The retained ``fallback`` is judged
+        against the APPLIED state — not the raw slate board, whose scores are
+        often NULL until the detail merge lands: a fallback too sparse to persist,
+        or one the applied live score has already climbed past, is stale, so its
+        tracker is dropped; a rich fallback the live score has NOT surpassed is
+        kept (with the freshly reset budget) across a one-poll flicker until the
+        match vanishes again — a genuine fresh transition rebuilds the tracker.
         """
-        self._cooldowns.pop(match_id, None)
         tracker = self._transitions.get(match_id)
         if tracker is None:
             return
@@ -1300,23 +1422,57 @@ class CollectorEngine:
 
     @staticmethod
     def _richest_fallback(old: NormalizedMatch | None, new: NormalizedMatch) -> NormalizedMatch:
-        """Keep the RICHEST non-live scoreboard snapshot as the fallback.
+        """Score-monotonic comparator picking the richer of two fallbacks (R1).
 
-        A fallback that carries events, known scores, or a terminal status
-        must not be overwritten by a sparser one (e.g. a later SCHEDULED
-        reset board with NULL scores); ties prefer the fresher snapshot.
+        Replaces the old rank-tuple-with-new-wins-on-ties, which let a later
+        SCORE-REGRESSED board (a 0-0 provider reset over a durable 2-0) or a
+        merely-fresher-but-poorer snapshot overwrite the incumbent. Decision, in
+        order:
+
+        (a) SCORE MONOTONICITY (cumulative facts, the strongest signal): a known
+            per-side score never legitimately drops. If ``new`` is strictly LOWER
+            than ``old`` on EITHER side, keep ``old`` (a 0-0 reset never replaces
+            a 2-0). If ``new`` is strictly HIGHER on a side with no regression on
+            the other, adopt ``new`` (a 2-0 detail supersedes a 1-0 fallback).
+            ``None`` on either side is "unknown", not lower/higher.
+        (b) EVENTS: otherwise prefer the one carrying events (an events-bearing
+            live snapshot can win over a bare terminal board — its live clock is
+            nulled at emission by G0, so nothing leaks).
+        (c) TERMINAL: else prefer a genuinely terminal status.
+        (d) STABILITY: on a full tie keep the INCUMBENT, except adopt ``new`` when
+            it is strictly richer in payload/clock completeness (a known-score
+            count, a present clock, or a larger payload the incumbent lacks).
         """
         if old is None:
             return new
+        home = CollectorEngine._score_delta(new.score_home, old.score_home)
+        away = CollectorEngine._score_delta(new.score_away, old.score_away)
+        if home < 0 or away < 0:
+            return old
+        if home > 0 or away > 0:
+            return new
 
-        def rank(m: NormalizedMatch) -> tuple[bool, bool, bool]:
+        def rank(m: NormalizedMatch) -> tuple[bool, bool, int, bool, int]:
             return (
                 bool(m.events),
-                m.score_home is not None or m.score_away is not None,
-                m.status is MatchStatus.FINISHED,
+                _is_terminal(m.status),
+                (m.score_home is not None) + (m.score_away is not None),
+                m.minute is not None or m.display_clock is not None,
+                len(m.payload),
             )
 
-        return new if rank(new) >= rank(old) else old
+        return new if rank(new) > rank(old) else old
+
+    @staticmethod
+    def _score_delta(new_score: int | None, old_score: int | None) -> int:
+        """+1 if ``new`` strictly exceeds ``old``, -1 if strictly below, else 0.
+
+        ``None`` (unknown) on either side yields 0 — an unknown score is neither a
+        regression nor an advance, so it never vetoes or forces adoption.
+        """
+        if new_score is None or old_score is None:
+            return 0
+        return (new_score > old_score) - (new_score < old_score)
 
     def _transition_base(
         self, match_id: str, tracker: _TransitionTracker
@@ -1411,13 +1567,17 @@ class CollectorEngine:
     def _abandon(self, match_id: str, message: str, *log_args: Any) -> None:
         """Pop the tracker, enter a cooldown, and log at the epoch-based level.
 
-        The FIRST abandonment (epoch 1) logs ERROR; each later epoch logs a
-        single WARN (one abandonment per epoch by construction), so a match
-        that keeps failing to persist does not spam ERROR every retry cycle
-        while still surfacing loudly the first time.
+        The popped tracker's ``fallback`` — the best-known terminal state — is
+        carried onto the cooldown entry (R2) so a rich observation is not lost
+        while cooling and seeds the re-track once the gate lapses. The FIRST
+        abandonment (epoch 1) logs ERROR; each later epoch logs a single WARN
+        (one abandonment per epoch by construction), so a match that keeps
+        failing to persist does not spam ERROR every retry cycle while still
+        surfacing loudly the first time.
         """
-        self._transitions.pop(match_id, None)
-        epoch = self._enter_cooldown(match_id)
+        tracker = self._transitions.pop(match_id, None)
+        fallback = tracker.fallback if tracker is not None else None
+        epoch = self._enter_cooldown(match_id, fallback=fallback)
         log.log(logging.ERROR if epoch == 1 else logging.WARNING, message, *log_args)
 
     def _build_give_up_snapshot(
@@ -1425,26 +1585,27 @@ class CollectorEngine:
     ) -> NormalizedMatch | None:
         """Best-known terminal snapshot at give-up — merged, never raw.
 
-        Candidate order: a fresh same-poll TERMINAL scoreboard snapshot, else
-        the tracker's fallback (its non-live status is accepted as-is: at
-        give-up a provider status reset is termination-worthy), else whatever
+        Candidate order: a fresh same-poll TERMINAL scoreboard snapshot, else the
+        tracker's fallback (accepted as the candidate whatever its status; a
+        non-terminal reset is coerced terminal at emission below), else whatever
         fresh non-terminal snapshot this poll produced, else the in-memory
-        baseline, else the stored row — the latter three force-closed to
-        FINISHED when still live. The candidate is merged over the best base
-        (baseline → fallback → stored row) so known identity and scores are
-        never NULLed by a sparse snapshot.
+        baseline, else the stored row. The candidate is merged over the best base
+        (baseline → fallback → stored row) so known identity and scores are never
+        NULLed by a sparse snapshot; the merge leaves the candidate's own
+        status/clock intact for the decision table to rule on.
 
-        INVARIANT 1 — MONOTONIC GIVE-UP: before returning, the result is guarded
-        against the DURABLY-STORED row (:meth:`_nonregress_over_stored`) so the
-        persisted give-up can never regress a higher already-stored score (a
-        stale fallback of 1-0 must not overwrite a durably-applied 2-0) nor a
-        higher stored status rank. This is the emission choke point that makes
-        ANY upstream retention policy safe by construction — the detection-time
-        and post-apply supersession checks remain only as best-effort hygiene.
+        The single emission choke point is :meth:`_nonregress_over_stored`, which
+        applies the round-11 give-up decision table (G0 terminality + clock null,
+        G1 score monotonicity, G2 terminal-status precedence, G3 clock
+        monotonicity) against the DURABLY-STORED row — coercing a still-live or
+        reset candidate to a terminal, clock-null close and never regressing a
+        higher already-stored score. That makes ANY upstream retention policy
+        safe by construction; the detection-time and post-apply supersession
+        checks remain only as best-effort hygiene.
         """
         baseline = self._last.get(match_id)
         stored: NormalizedMatch | None = None
-        if fresh is not None and fresh.status is MatchStatus.FINISHED:
+        if fresh is not None and _is_terminal(fresh.status):
             snap = fresh
         elif tracker.fallback is not None:
             snap = tracker.fallback
@@ -1457,62 +1618,76 @@ class CollectorEngine:
             snap = stored
         if snap is None:
             return None
-        if snap.status in LIVE_STATUSES:
-            snap = replace(snap, status=MatchStatus.FINISHED)
         base = next(
             (c for c in (baseline, tracker.fallback) if c is not None and c is not snap),
             None,
         )
         if base is None and stored is None:
             base = self._stored_match_snapshot(match_id)
-        result = _merge_over_base(base, snap) if base is not None else snap
-        return self._nonregress_over_stored(match_id, result)
+        candidate = _merge_over_base(base, snap) if base is not None else snap
+        return self._nonregress_over_stored(match_id, candidate)
 
     def _nonregress_over_stored(self, match_id: str, snap: NormalizedMatch) -> NormalizedMatch:
-        """Guard a give-up snapshot against regressing the durably-stored row.
+        """Round-11 give-up decision table: emit a terminal, score/clock-monotonic close.
 
-        Scores are cumulative facts that never legitimately drop, so per side
-        the persisted value is the NON-regressing one: the stored score when the
-        candidate would null or lower it, else the candidate.
+        The single emission choke point. Combines the candidate ``snap`` with the
+        durably-stored row per the prescribed table (a give-up MUST be terminal so
+        the non-live consume point :meth:`_resolve_tracker` can resolve it — a
+        live emission would never pop the tracker, never clear the gate, and
+        re-emit forever):
 
-        The status floor applies ONLY when the stored status is TERMINAL
-        (FINISHED). A stored terminal status may still override a lower-ranked
-        candidate (a fallback's SCHEDULED reset accepted as-is upstream must not
-        overwrite a stored FINISHED), but a stored LIVE status must NEVER elevate
-        the candidate: a give-up snapshot carrying a live status is short-
-        circuited by :meth:`_resolve_tracker` (the non-live consume point) and so
-        can never resolve — the tracker is never popped, the cooldown never
-        clears, and every epoch re-emits the same unresolvable snapshot forever.
-        A give-up emission must always remain resolvable, so it stays non-live.
-
-        When a terminal stored status wins OR ties the candidate's rank, its
-        clock (minute/display_clock) is likewise authoritative: a stale fallback
-        (80'/"80'") must not overwrite the stored terminal clock (90/'FT'). With
-        no stored row there is nothing to regress. This runs at the single
-        emission choke point so an apply failure that leaves a stale fallback
-        armed cannot beat a higher score already in the DB.
+        G0 TERMINALITY: the emitted status MUST be terminal. If the candidate's
+           status is not terminal it is coerced to FINISHED (the accepted loud
+           force-close) AND its minute/display_clock are NULLed — a coerced close
+           has no authoritative clock (mirrors the detail-merge doctrine that
+           clocks are legitimately null at FT), so it can never ship a stale live
+           clock like "80'". A genuinely-terminal candidate keeps its own
+           status and clock.
+        G1 SCORES: per side the emitted score is the MAX of candidate and stored
+           (``None`` = unknown, filled from the other) — a stored non-null score
+           is never regressed (cumulative facts).
+        G2 STATUS between terminals: a GENUINELY-terminal candidate's status wins
+           even over a stored terminal (fresher terminal knowledge repairs stale
+           stored state); a COERCED candidate defers to a stored TERMINAL status
+           (the store knew the real terminal kind).
+        G3 CLOCK: a coerced candidate (clock nulled by G0) fills its clock from a
+           stored TERMINAL row's non-null minute/display_clock; a genuinely-
+           terminal candidate's non-null clock always wins (repairs a stale stored
+           clock). A non-null clock is never overwritten with the other side's
+           null; both null emits null.
         """
         stored = self._stored_match_snapshot(match_id)
-        if stored is None:
-            return snap
-        overrides: dict[str, Any] = {}
-        for name in ("score_home", "score_away"):
-            guarded = self._non_regressing_score(getattr(snap, name), getattr(stored, name))
-            if guarded != getattr(snap, name):
-                overrides[name] = guarded
-        if stored.status is MatchStatus.FINISHED:
-            if _STATUS_RANK[stored.status] > _STATUS_RANK[snap.status]:
-                overrides["status"] = stored.status
-            if _STATUS_RANK[stored.status] >= _STATUS_RANK[snap.status]:
-                if stored.minute != snap.minute:
-                    overrides["minute"] = stored.minute
-                if stored.display_clock != snap.display_clock:
-                    overrides["display_clock"] = stored.display_clock
-        return replace(snap, **overrides) if overrides else snap
+        coerced = not _is_terminal(snap.status)
+        if coerced:
+            status = MatchStatus.FINISHED  # G0
+            minute: int | None = None
+            display_clock: str | None = None
+        else:
+            status = snap.status
+            minute = snap.minute
+            display_clock = snap.display_clock
+        stored_home = stored.score_home if stored is not None else None
+        stored_away = stored.score_away if stored is not None else None
+        score_home = self._non_regressing_score(snap.score_home, stored_home)  # G1
+        score_away = self._non_regressing_score(snap.score_away, stored_away)  # G1
+        if coerced and stored is not None and _is_terminal(stored.status):
+            status = stored.status  # G2: stored terminal kind wins over a coerced close
+            if stored.minute is not None:  # G3: fill the nulled clock from stored terminal
+                minute = stored.minute
+            if stored.display_clock is not None:
+                display_clock = stored.display_clock
+        return replace(
+            snap,
+            status=status,
+            minute=minute,
+            display_clock=display_clock,
+            score_home=score_home,
+            score_away=score_away,
+        )
 
     @staticmethod
     def _non_regressing_score(candidate: int | None, stored: int | None) -> int | None:
-        """The non-regressing score for one side: never below the stored value."""
+        """Per-side max with ``None``-fill (G1): never below the stored value."""
         if stored is None:
             return candidate
         if candidate is None:
@@ -1526,8 +1701,10 @@ class CollectorEngine:
         (or the snapshot produced no diff because stored state already
         matches). A pending give-up logs its ERROR here — persistence is
         claimed only after the write actually landed. A durable non-live apply
-        also clears the abandonment cooldown: the row has resolved, so the
-        cooldown is moot but must not linger and block later re-tracking.
+        REMOVES the cooldown entry entirely (the terminal resolution is one of
+        the only two entry-removal points, alongside the expired-unseen purge):
+        the row has resolved terminally, so the epoch/backoff memory is moot and
+        must not linger and block later re-tracking.
         """
         if snapshot.status in LIVE_STATUSES:
             return
