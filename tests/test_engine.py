@@ -2126,6 +2126,47 @@ def test_default_seed_persists_identity_and_payload_corrections(tmp_path):
     assert payload["round_name"] == "Group A"
 
 
+def test_default_seed_empty_payload_value_does_not_clobber_richer_stored(tmp_path):
+    """Preserve-richer regression: default_seed_match must merge like the football
+    reconciler, not with a plain dict.update(). A first poll stores a rich payload
+    value; a later sparse poll carrying an EMPTY value for the same key (reachable
+    because _merge_detail upstream is last-wins) must NOT overwrite the stored
+    non-empty value. A non-empty later value still wins (correction path above)."""
+    from dataclasses import replace
+
+    from gamecollect.engine import CollectorEngine
+
+    db = tmp_path / "preserve.db"
+    poll1 = replace(
+        nm("m-id", (ev(0, "goal"),)),
+        payload={"venue": "BMO Field", "round_name": "Group A"},
+    )
+    # Sparse later poll: venue empty, round_name dropped to None — neither may
+    # clobber the richer stored values; a plain dict.update would erase both.
+    poll2 = replace(
+        nm("m-id", (ev(0, "goal"),)),
+        payload={"venue": "", "round_name": None},
+    )
+    provider = ScriptedProvider([[poll1], [poll2]])
+    pack = make_pack(provider, seed_match=default_seed_match)
+    engine = CollectorEngine(pack, str(db), SOURCE, 0.01)
+    run_engine(engine, provider)
+
+    conn = read_db(db)
+    try:
+        row = reader.get_state(conn, "m-id")
+    finally:
+        conn.close()
+    assert row is not None
+    payload = json.loads(row["payload"])
+    assert payload["venue"] == "BMO Field", (
+        "an empty later value must not clobber the richer stored value"
+    )
+    assert payload["round_name"] == "Group A", (
+        "a None later value must not erase a stored non-empty value"
+    )
+
+
 # --------------------------------------------------------------------------- #
 # close(): flush-once, always close the connection, idempotent
 # --------------------------------------------------------------------------- #

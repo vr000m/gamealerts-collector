@@ -13,7 +13,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from gamecollect.provider import MatchDataProvider, NormalizedMatch
+from gamecollect.provider import MatchDataProvider, NormalizedMatch, is_empty_payload_value
 
 if TYPE_CHECKING:
     from gamecollect.db.writer import PartitionWriter
@@ -59,7 +59,13 @@ def default_seed_match(
     from gamecollect.db import reader  # runtime import: keep module import light
 
     payload = reader.get_stored_payload(conn, match.match_id)
-    payload.update(match.payload)
+    # Preserve-richer merge (NOT plain dict.update): a sparse snapshot's empty
+    # value must never clobber a richer stored value. _merge_detail upstream is
+    # last-wins, so an empty payload value can legitimately reach here; the
+    # football reconciler guards the same way via _merge_preserving_richer.
+    for key, value in match.payload.items():
+        if key not in payload or not is_empty_payload_value(value):
+            payload[key] = value
     if match.home_team is not None:
         payload["home_team"] = match.home_team
     if match.away_team is not None:
