@@ -112,9 +112,11 @@ def _to_text(value: object) -> str | None:
     return None
 
 
-# A plain decimal float spelling: digits, one dot, digits (optional sign).
+# A plain decimal float spelling: digits, one dot, digits (optional sign) —
+# including dot-terminal ("123.") and dot-leading (".5") forms, each requiring
+# at least one digit on the other side of the dot so a lone "." never matches.
 # Deliberately EXCLUDES exponent forms — see _to_key_text.
-_PLAIN_DECIMAL_RE = re.compile(r"^[+-]?[0-9]+\.[0-9]+$")
+_PLAIN_DECIMAL_RE = re.compile(r"^[+-]?([0-9]+\.[0-9]*|\.[0-9]+)$")
 
 
 def _to_key_text(value: object) -> str | None:
@@ -125,17 +127,22 @@ def _to_key_text(value: object) -> str | None:
     team/athlete key); non-finite floats are rejected too (a literal ``"nan"``
     or ``"inf"`` PK key is garbage). An integral float canonicalizes to its
     int string, and so does an integral PLAIN-decimal string — a JSON payload
-    spelling the same athlete as ``760421.0``, ``"760421.0"``, and ``"760421"``
-    must collapse to ONE primary-key row, not duplicate the player. Only
-    strings matching ``^[+-]?[0-9]+\\.[0-9]+$`` are reparsed: a plain digit
-    string like ``"01"`` is an opaque id and must keep its leading zero, and
-    strings carrying an exponent marker (``"1E2"``, ``"1e999999999"``) pass
-    through VERBATIM — they are opaque ids too; reparsing them would collide
-    ``"1E2"`` with a genuine ``"100"`` (silent wrong-player attribution) and a
-    huge exponent would materialize an astronomical digit string (poll-loop
-    hang / MemoryError). Floats keep the ``is_integer()`` path — a finite
-    float cannot mint a pathological digit string. Anything else follows
-    :func:`_to_text`."""
+    spelling the same athlete as ``760421.0``, ``"760421.0"``, ``"760421."``,
+    and ``"760421"`` must collapse to ONE primary-key row, not duplicate the
+    player. Only strings matching ``^[+-]?([0-9]+\\.[0-9]*|\\.[0-9]+)$`` are
+    reparsed — this covers dot-terminal (``"123."``) and dot-leading
+    (``".5"``) spellings alongside the two-sided form. A plain digit string
+    like ``"01"`` (no dot at all) is an opaque id and must keep its leading
+    zero, and strings carrying an exponent marker (``"1E2"``,
+    ``"1e999999999"``) pass through VERBATIM — they are opaque ids too;
+    reparsing them would collide ``"1E2"`` with a genuine ``"100"`` (silent
+    wrong-player attribution) and a huge exponent would materialize an
+    astronomical digit string (poll-loop hang / MemoryError). Floats keep the
+    ``is_integer()`` path — a finite float cannot mint a pathological digit
+    string. Whitespace is never stripped: matching is anchored (``^``/``$``)
+    against the raw string, so a padded spelling like ``" 760421 "`` fails the
+    regex and passes through :func:`_to_key_text` verbatim (it is treated as
+    an opaque id, not reparsed). Anything else follows :func:`_to_text`."""
     if isinstance(value, bool):
         return None
     if isinstance(value, float):
@@ -162,7 +169,11 @@ def _to_key_text(value: object) -> str | None:
 # the logging) and a static bad row would otherwise re-WARN for the lifetime
 # of the match. Keyed (source, match_id, kind, repr(value)) so each offending
 # row warns exactly once; bounded — when full the set resets (a rare re-WARN
-# beats unbounded growth in a long-lived daemon).
+# beats unbounded growth in a long-lived daemon). The lineup-athlete call site
+# folds the TEAM into ``kind`` (``f"lineup-athlete:{team}"``) — two different
+# teams in the same match each fielding a player with the same invalid
+# athlete_id value are two distinct offending rows, and must each warn once,
+# not share one dedupe slot.
 _WARNED_SKIPS: set[tuple[str, str, str, str]] = set()
 _WARNED_SKIPS_MAX = 4096
 
@@ -270,7 +281,7 @@ def _lineup_rows(
                 _warn_skip_once(
                     source,
                     seeded_match_id,
-                    "lineup-athlete",
+                    f"lineup-athlete:{team}",
                     player.get("athlete_id"),
                     "football_lineups: skipping player for match %s (team %s) — "
                     "invalid athlete_id %r",

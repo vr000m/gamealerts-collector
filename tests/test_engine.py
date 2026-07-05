@@ -3048,3 +3048,53 @@ def test_stored_snapshot_prefers_fresher_canonical_over_stale_qualified_stub(tmp
     assert snap.score_home == 2, (
         "the fresher canonical row must win over the stale qualified stub across all three forms"
     )
+
+
+# --------------------------------------------------------------------------- #
+# Round-7 review finding: _merge_over_base preserve-richer payload semantics
+# --------------------------------------------------------------------------- #
+
+
+def test_merge_over_base_preserves_richer_payload_value_against_empty():
+    """An explicitly-present empty value ('' / None / [] / {}) in the snapshot
+    payload must NOT clobber a richer base payload value — mirrors the DB-side
+    ``_merge_preserving_richer`` (gamecollect_football.reconcile), which this
+    in-memory baseline merge does not otherwise get for free."""
+    from dataclasses import replace as dc_replace
+
+    from gamecollect.engine import _merge_over_base
+
+    base = dc_replace(nm("m1", ()), payload={"lineups": [{"team": "Canada"}], "venue": "BC Place"})
+    snapshot = dc_replace(
+        nm("m1", ()), payload={"lineups": [], "venue": None, "round_name": "Group A"}
+    )
+
+    merged = _merge_over_base(base, snapshot)
+
+    assert merged.payload["lineups"] == [{"team": "Canada"}], (
+        "an empty incoming list must not clobber the richer base list"
+    )
+    assert merged.payload["venue"] == "BC Place", (
+        "an incoming None must not clobber the richer base string"
+    )
+    assert merged.payload["round_name"] == "Group A", (
+        "a key absent from the base must still land from the snapshot"
+    )
+
+
+def test_merge_over_base_non_empty_snapshot_value_still_wins():
+    """Fresher, non-empty data must still win over the base — preserve-richer
+    only guards against EMPTY clobbering richer, not last-wins in general."""
+    from dataclasses import replace as dc_replace
+
+    from gamecollect.engine import _merge_over_base
+
+    base = dc_replace(nm("m1", ()), payload={"venue": "BC Place", "possession": {"home": 40}})
+    snapshot = dc_replace(
+        nm("m1", ()), payload={"venue": "Lumen Field", "possession": {"home": 55}}
+    )
+
+    merged = _merge_over_base(base, snapshot)
+
+    assert merged.payload["venue"] == "Lumen Field"
+    assert merged.payload["possession"] == {"home": 55}

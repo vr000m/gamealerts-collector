@@ -434,6 +434,51 @@ def test_key_text_canonicalizes_plain_decimals_only():
     assert _to_key_text("01") == "01"
 
 
+def test_key_text_canonicalizes_dot_terminal_and_dot_leading_decimals():
+    """Round-7 finding: dot-terminal ("760421.") and dot-leading (".5") plain
+    decimal spellings must canonicalize too, not just the two-sided form —
+    otherwise the same athlete spelled "760421." in one poll and "760421"/
+    760421.0 in another mints two distinct primary-key rows."""
+    from gamecollect_football.pack import _to_key_text
+
+    assert _to_key_text("760421.") == "760421"
+    assert _to_key_text("123.") == "123"
+    assert _to_key_text("-5.") == "-5"
+    # Non-integral dot-leading forms are matched (finite, exponent-free parse)
+    # but keep their verbatim spelling — same as "123.45" above.
+    assert _to_key_text(".5") == ".5"
+    assert _to_key_text("-.5") == "-.5"
+    # Exponent forms must still stay verbatim after the broadened regex.
+    assert _to_key_text("1E2") == "1E2"
+    assert _to_key_text("1e999999999") == "1e999999999"
+    # A padded spelling is an opaque id — never reparsed, never stripped.
+    assert _to_key_text(" 760421 ") == " 760421 "
+
+
+def test_dot_terminal_athlete_id_collapses_with_bare_string(db):
+    """The same athlete spelled "760421." and "760421" must collapse to ONE
+    primary-key row (last-wins), not two."""
+    conn, writer = db
+    payload = {
+        "lineups": [
+            {
+                "team": "Canada",
+                "players": [
+                    {"athlete_id": "760421.", "display_name": "Dot Terminal Spelling"},
+                    {"athlete_id": "760421", "display_name": "Bare String Spelling"},
+                ],
+            }
+        ]
+    }
+    persist_football_side_tables(conn, writer, _match(payload), MATCH_ID)
+    rows = conn.execute(
+        "SELECT athlete_id, display_name FROM football_lineups WHERE match_id = ?", (MATCH_ID,)
+    ).fetchall()
+    assert [tuple(r) for r in rows] == [("760421", "Bare String Spelling")], (
+        "dot-terminal and bare-string spellings must collapse to one row, last-wins"
+    )
+
+
 def test_exponent_form_athlete_id_does_not_collide_with_numeric_equivalent(db):
     """'1E2' and '100' are two DIFFERENT opaque athlete ids: reparsing the
     exponent form would silently attribute one player's rows to the other."""
@@ -491,3 +536,33 @@ def test_repeated_bad_payload_warns_once_per_offending_row(db, caplog):
         persist_football_side_tables(conn, writer, _match(payload2), MATCH_ID)
     stats_warns_after = [r for r in caplog.records if "football_stats" in r.getMessage()]
     assert len(stats_warns_after) == 2, "a new offending value must warn once too"
+
+
+def test_two_teams_with_same_invalid_athlete_id_each_warn_once(db, caplog):
+    """Round-7 finding: the skip dedupe key omitted the TEAM, so two teams in
+    the same match each fielding a player with the same invalid athlete_id
+    value shared one dedupe slot — the second team's skip warned NEVER. Each
+    team must get its own warning."""
+    import logging
+
+    conn, writer = db
+    payload = {
+        "lineups": [
+            {
+                "team": "Morocco",
+                "players": [{"athlete_id": True, "display_name": "Ghost One"}],
+            },
+            {
+                "team": "Haiti",
+                "players": [{"athlete_id": True, "display_name": "Ghost Two"}],
+            },
+        ]
+    }
+    with caplog.at_level(logging.WARNING, logger="gamecollect_football.pack"):
+        persist_football_side_tables(conn, writer, _match(payload), MATCH_ID)
+
+    athlete_warns = [r for r in caplog.records if "invalid athlete_id" in r.getMessage()]
+    assert len(athlete_warns) == 2, "each team's skip must warn once, not share one dedupe slot"
+    messages = [r.getMessage() for r in athlete_warns]
+    assert any("Morocco" in m for m in messages)
+    assert any("Haiti" in m for m in messages)

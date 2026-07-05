@@ -197,6 +197,20 @@ def _merge_detail(scoreboard: NormalizedMatch, detail: NormalizedMatch) -> Norma
     return merged
 
 
+def _is_empty_payload_value(value: Any) -> bool:
+    """True for the "carries no information" payload values: None/""/[]/{}.
+
+    Mirrors ``gamecollect_football.reconcile._is_empty_value`` — core cannot
+    import the football pack, so the (small) predicate is replicated here
+    rather than shared. ``0``/``0.0``/``False`` are real data (a nil score, an
+    unset flag) and are NOT empty."""
+    if value is None:
+        return True
+    if isinstance(value, (str, list, dict, tuple)) and len(value) == 0:
+        return True
+    return False
+
+
 def _merge_over_base(base: NormalizedMatch, snapshot: NormalizedMatch) -> NormalizedMatch:
     """Merge ``snapshot`` over a BASE from an earlier poll (baseline/fallback/stored).
 
@@ -207,9 +221,22 @@ def _merge_over_base(base: NormalizedMatch, snapshot: NormalizedMatch) -> Normal
     only ever accepted from the detail itself, or from the fallback at
     give-up). The base underlays the payload and fills identity and score
     ``None``s, exactly like the scoreboard does in :func:`_merge_detail`.
+
+    The payload merge is PRESERVE-RICHER, not last-wins: an incoming key only
+    overwrites the base when its value is non-empty, or the base doesn't have
+    the key at all — an explicitly-present empty value (``""``/``None``/``[]``/
+    ``{}``) in a sparse snapshot must not clobber a richer base payload value.
+    This mirrors the DB-side ``_merge_preserving_richer`` in
+    ``gamecollect_football.reconcile`` (which protects the stored row); this
+    in-memory baseline needs the same guarantee independently, since a
+    baseline/fallback carried between polls is not read back through that DB
+    path. (:func:`_merge_detail` stays last-wins by design — detail-wins is
+    intentional there and is NOT touched by this rule.)
     """
     payload = dict(base.payload)
-    payload.update(snapshot.payload)
+    for key, value in snapshot.payload.items():
+        if key not in payload or not _is_empty_payload_value(value):
+            payload[key] = value
     fills = {
         name: getattr(base, name) for name in _MERGE_FILL_FIELDS if getattr(snapshot, name) is None
     }
