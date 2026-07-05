@@ -65,6 +65,7 @@ from gamecollect.provider import (
     NormalizedMatch,
     ProviderUnavailableError,
     ShapeDriftError,
+    is_empty_payload_value,
 )
 
 __all__ = ["CollectorEngine"]
@@ -197,20 +198,6 @@ def _merge_detail(scoreboard: NormalizedMatch, detail: NormalizedMatch) -> Norma
     return merged
 
 
-def _is_empty_payload_value(value: Any) -> bool:
-    """True for the "carries no information" payload values: None/""/[]/{}.
-
-    Mirrors ``gamecollect_football.reconcile._is_empty_value`` — core cannot
-    import the football pack, so the (small) predicate is replicated here
-    rather than shared. ``0``/``0.0``/``False`` are real data (a nil score, an
-    unset flag) and are NOT empty."""
-    if value is None:
-        return True
-    if isinstance(value, (str, list, dict, tuple)) and len(value) == 0:
-        return True
-    return False
-
-
 def _merge_over_base(base: NormalizedMatch, snapshot: NormalizedMatch) -> NormalizedMatch:
     """Merge ``snapshot`` over a BASE from an earlier poll (baseline/fallback/stored).
 
@@ -235,7 +222,7 @@ def _merge_over_base(base: NormalizedMatch, snapshot: NormalizedMatch) -> Normal
     """
     payload = dict(base.payload)
     for key, value in snapshot.payload.items():
-        if key not in payload or not _is_empty_payload_value(value):
+        if key not in payload or not is_empty_payload_value(value):
             payload[key] = value
     fills = {
         name: getattr(base, name) for name in _MERGE_FILL_FIELDS if getattr(snapshot, name) is None
@@ -1279,45 +1266,81 @@ class CollectorEngine:
             snapshot.score_away,
         )
 
-    def _stored_rows_for_provider(self, provider_match_id: str) -> list[tuple]:
-        """Candidate stored ``matches`` rows for a provider id, freshest first.
+    # Full row shape for :meth:`_stored_match_snapshot`.
+    _STORED_MATCH_COLUMNS: tuple[str, ...] = (
+        "status",
+        "minute",
+        "score_home",
+        "score_away",
+        "display_clock",
+        "kickoff_utc",
+        "payload",
+        "updated_at",
+    )
+    # Narrow shape for the :meth:`_stored_status_is_live` hot path: no payload
+    # JSON blob, just what deciding + ordering needs.
+    _STORED_LIVENESS_COLUMNS: tuple[str, ...] = ("status", "updated_at")
+
+    def _stored_rows_for_provider(
+        self, provider_match_id: str, *, columns: tuple[str, ...] = _STORED_MATCH_COLUMNS
+    ) -> list[tuple]:
+        """Candidate stored ``matches`` rows for a provider id, best-first.
 
         Gathers every stored row this source could hold for the match under
         all THREE id forms core knows — the bare provider id, the
         source-qualified ``f"{source}:{id}"`` stub, and the canonical
         (reconciled) row reached through ``provider_match_map`` — as a single
-        result ordered by ``updated_at`` DESC, so callers can take the
-        freshest deterministically instead of privileging one id form. Shared
-        by :meth:`_stored_match_snapshot` (which takes ``rows[0]``) and
-        :meth:`_stored_status_is_live` (which scans every row's status). The
-        map join is skipped for ``default_seed_match`` packs: that hook writes
-        provider-native ids verbatim, so no ``provider_match_map`` entry can
-        exist and the join would only cost a scan (mirrors
-        :meth:`_resolve_stored_provider_id`'s discrimination).
+        deduplicated result. Shared by :meth:`_stored_match_snapshot` (which
+        takes ``rows[0]``) and :meth:`_stored_status_is_live` (which now also
+        reads only ``rows[0]``, not "any row"). The map join is skipped for
+        ``default_seed_match`` packs: that hook writes provider-native ids
+        verbatim, so no ``provider_match_map`` entry can exist and the join
+        would only cost a scan (mirrors :meth:`_resolve_stored_provider_id`'s
+        discrimination). This also means a source that switches from a
+        custom-seed pack to ``default_seed_match`` over an existing partition
+        will not see map-reachable canonical rows written under the old
+        strategy — accepted: the partition-per-writer contract does not
+        support switching seeding strategies over an existing source
+        partition.
 
-        Columns, in order: ``status, minute, score_home, score_away,
-        display_clock, kickoff_utc, payload, updated_at``.
+        Ordering is freshest-``updated_at``-first, with a deterministic
+        secondary key: on a TIED ``updated_at``, a row reached through the
+        canonical ``provider_match_map`` join (rank 0) is preferred over a
+        bare/qualified-id row (rank 1) — a sparse stale stub must not beat
+        the richer canonical row on a same-timestamp tie. A row reachable
+        through BOTH arms (its canonical id happens to equal the bare or
+        qualified id) is returned exactly ONCE, keeping its best (lowest)
+        rank — plain ``UNION ALL`` would otherwise duplicate it.
+
+        ``columns`` selects the row shape: pass :data:`_STORED_MATCH_COLUMNS`
+        (default) for the full row :meth:`_stored_match_snapshot` needs, or
+        :data:`_STORED_LIVENESS_COLUMNS` for the narrow liveness probe that
+        skips the payload JSON blob. Both column sets share this one query
+        builder — the three-id-form SQL is never duplicated. ``columns`` MUST
+        include ``updated_at`` (the ordering key).
         """
-        cols = (
-            "status, minute, score_home, score_away, "
-            "display_clock, kickoff_utc, payload, updated_at"
-        )
+        cols = ", ".join(columns)
         qualified = f"{self._source}:{provider_match_id}"
         if self._pack.seed_match is default_seed_match:
             return self._conn.execute(
-                f"SELECT {cols} FROM matches "
+                f"SELECT {cols}, 1 AS rank FROM matches "
                 "WHERE source = ? AND match_id IN (?, ?) "
-                "ORDER BY updated_at DESC",
+                "ORDER BY updated_at DESC, rank ASC",
                 (self._source, provider_match_id, qualified),
             ).fetchall()
-        m_cols = ", ".join(f"m.{c}" for c in cols.split(", "))
+        m_cols = ", ".join(f"m.{c}" for c in columns)
         return self._conn.execute(
-            f"SELECT {cols} FROM matches WHERE source = ? AND match_id IN (?, ?) "
+            f"SELECT {cols}, MIN(rank) AS rank FROM ("
+            f"SELECT match_id, {cols}, 1 AS rank "
+            "FROM matches WHERE source = ? AND match_id IN (?, ?) "
             "UNION ALL "
-            f"SELECT {m_cols} FROM provider_match_map pm "
+            f"SELECT m.match_id, {m_cols}, 0 AS rank "
+            "FROM provider_match_map pm "
             "JOIN matches m ON m.source = pm.source AND m.match_id = pm.match_id "
-            "WHERE pm.source = ? AND pm.provider_match_id = ? "
-            "ORDER BY updated_at DESC",
+            "WHERE pm.source = ? AND pm.provider_match_id = ?"
+            ") candidates "
+            "GROUP BY match_id "
+            "ORDER BY updated_at DESC, rank ASC",
             (self._source, provider_match_id, qualified, self._source, provider_match_id),
         ).fetchall()
 
@@ -1339,14 +1362,24 @@ class CollectorEngine:
         one id form has a row (e.g. a stale pre-reconciliation ``source:id``
         stub alongside a fresher canonical row), the freshest
         (``updated_at`` DESC) wins deterministically across ALL three forms
-        — never the first form queried.
+        — never the first form queried; on a TIED ``updated_at`` the
+        canonical (map-resolved) row wins over a bare/qualified row (see
+        :meth:`_stored_rows_for_provider`'s rank tiebreak).
         """
         rows = self._stored_rows_for_provider(provider_match_id)
         if not rows:
             return None
-        status_value, minute, score_home, score_away, display_clock, kickoff_utc, payload, _ = rows[
-            0
-        ]
+        (
+            status_value,
+            minute,
+            score_home,
+            score_away,
+            display_clock,
+            kickoff_utc,
+            payload,
+            _updated_at,
+            _rank,
+        ) = rows[0]
         extras: dict[str, Any] = {}
         if payload:
             try:
@@ -1373,7 +1406,7 @@ class CollectorEngine:
         )
 
     def _stored_status_is_live(self, provider_match_id: str) -> bool:
-        """True when the stored ``matches`` row for this match is still live.
+        """True when the FRESHEST stored ``matches`` row for this match is live.
 
         Consulted only for a non-live slate match with no in-memory diff
         baseline (a restart gap). The row is looked up under this source by
@@ -1384,11 +1417,24 @@ class CollectorEngine:
         (reconciled) id resolved through ``provider_match_map`` — a pack
         that reconciles provider ids onto canonical rows must still get its
         transition-across-restart hydrated. The candidate rows come from the
-        shared :meth:`_stored_rows_for_provider` lookup (which skips the map
-        join for ``default_seed_match`` packs, where no map entry can exist).
+        shared :meth:`_stored_rows_for_provider` lookup (narrow-columns mode,
+        skipping the payload JSON blob on this hot path — it runs for every
+        non-baselined non-live slate match), which also skips the map join
+        for ``default_seed_match`` packs, where no map entry can exist.
+
+        Evaluates ONLY the best (freshest, canonical-preferring) row's
+        status — consistent with :meth:`_stored_match_snapshot`, which merges
+        from that same row. Scanning "is ANY candidate row live" would let an
+        older live stub override a fresher non-live canonical row, wrongly
+        classifying a restart-gap match as a live→terminal transition when
+        the canonical row already recorded the terminal state.
         """
-        rows = self._stored_rows_for_provider(provider_match_id)
-        return any(row[0] in LIVE_STATUS_VALUES for row in rows)
+        rows = self._stored_rows_for_provider(
+            provider_match_id, columns=self._STORED_LIVENESS_COLUMNS
+        )
+        if not rows:
+            return False
+        return rows[0][0] in LIVE_STATUS_VALUES
 
     def _seed_restart_trackers(self, slate_ids: set[str]) -> None:
         """One-time restart scan: track stored-live matches gone from the slate.

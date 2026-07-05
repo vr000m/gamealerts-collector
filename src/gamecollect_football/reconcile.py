@@ -36,7 +36,7 @@ from typing import Any
 from gamecollect.db import reader
 from gamecollect.db.writer import PartitionWriter
 from gamecollect.fold import fold
-from gamecollect.provider import NormalizedMatch
+from gamecollect.provider import NormalizedMatch, is_empty_payload_value
 
 __all__ = [
     "TEAM_ALIASES",
@@ -470,18 +470,6 @@ def register_unreconciled_match(
     return qualified_id
 
 
-def _is_empty_value(value: Any) -> bool:
-    """True for the "carries no information" payload values: None/""/[]/{}.
-
-    ``0``/``0.0``/``False`` are real data (a nil score, an unset flag) and are
-    NOT empty."""
-    if value is None:
-        return True
-    if isinstance(value, (str, list, dict, tuple)) and len(value) == 0:
-        return True
-    return False
-
-
 def _merge_preserving_richer(stored: dict[str, Any], incoming: dict[str, Any]) -> None:
     """Merge *incoming* payload keys into *stored*, never losing richer data.
 
@@ -490,9 +478,11 @@ def _merge_preserving_richer(stored: dict[str, Any], incoming: dict[str, Any]) -
     []/{}) only lands when the key is missing from *stored* — it never
     replaces a stored non-empty value, so a sparse post-FT scoreboard
     snapshot cannot clobber detail-derived stats/lineups the strip row
-    already carries."""
+    already carries. Emptiness is :func:`gamecollect.provider.is_empty_payload_value`,
+    shared with core's in-memory :func:`~gamecollect.engine._merge_over_base`
+    so the rule can't drift between the two merge paths."""
     for key, value in incoming.items():
-        if key not in stored or not _is_empty_value(value):
+        if key not in stored or not is_empty_payload_value(value):
             stored[key] = value
 
 

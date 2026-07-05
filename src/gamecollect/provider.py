@@ -22,6 +22,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import Any
 
 __all__ = [
     "MatchStatus",
@@ -29,6 +30,7 @@ __all__ = [
     "LIVE_STATUS_VALUES",
     "NormalizedEvent",
     "NormalizedMatch",
+    "is_empty_payload_value",
     "ProviderError",
     "ShapeDriftError",
     "ProviderUnavailableError",
@@ -107,6 +109,22 @@ class NormalizedMatch:
     away_team: str | None = None
     kickoff_utc: str | None = None  # ISO-8601 UTC instant
     payload: dict = field(default_factory=dict)
+
+
+def is_empty_payload_value(value: Any) -> bool:
+    """True for the "carries no information" payload values: None/""/[]/{}.
+
+    Shared by every payload-merge site that must not let a sparse snapshot's
+    explicitly-present empty value clobber a richer stored value — core's
+    in-memory :func:`~gamecollect.engine._merge_over_base` and the football
+    pack's DB-side ``_merge_preserving_richer`` both call this so the rule
+    can't drift between the two merge paths. ``0``/``0.0``/``False`` are real
+    data (a nil score, an unset flag) and are NOT empty."""
+    if value is None:
+        return True
+    if isinstance(value, (str, list, dict, tuple)) and len(value) == 0:
+        return True
+    return False
 
 
 # ---------------------------------------------------------------------------

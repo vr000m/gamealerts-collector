@@ -3266,6 +3266,173 @@ def test_stored_snapshot_prefers_fresher_canonical_over_stale_qualified_stub(tmp
 
 
 # --------------------------------------------------------------------------- #
+# Round-8 lookup cluster: canonical-preferring tiebreak, freshest-row
+# liveness, deduped narrow probe
+# --------------------------------------------------------------------------- #
+
+
+def _stored_row(conn, match_id, *, status, score_home, updated_at):
+    conn.execute(
+        "INSERT INTO matches (match_id, source, kickoff_utc, status, minute, "
+        "score_home, score_away, payload, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            match_id,
+            SOURCE,
+            "2026-06-18T18:00:00Z",
+            status.value,
+            88,
+            score_home,
+            0,
+            json.dumps({"home_team": "Canada", "away_team": "Qatar"}),
+            updated_at,
+        ),
+    )
+
+
+def test_stored_snapshot_and_liveness_prefer_canonical_row_on_tied_updated_at(tmp_path):
+    """Finding 1: with the bare/qualified stub row and the canonical
+    (map-resolved) row TIED on ``updated_at``, both the merge-base and the
+    liveness probe must deterministically prefer the canonical row — not
+    whichever arm the UNION happens to return first."""
+    from gamecollect.db.connection import connect
+    from gamecollect.engine import CollectorEngine
+
+    db = tmp_path / "engine.db"
+    canonical_id = "canada-vs-qatar-2026-06-18"
+    tied_at = "2026-06-18T20:00:00Z"
+    conn = connect(str(db), side_table_ddl=FAKE_SIDE_TABLE_DDL)
+    try:
+        with conn:
+            _stored_row(
+                conn,
+                qualified("m1"),
+                status=MatchStatus.IN_PLAY,
+                score_home=1,
+                updated_at=tied_at,
+            )
+            _stored_row(
+                conn,
+                canonical_id,
+                status=MatchStatus.FINISHED,
+                score_home=2,
+                updated_at=tied_at,
+            )
+            conn.execute(
+                "INSERT INTO provider_match_map (source, provider, provider_match_id, match_id) "
+                "VALUES (?, ?, ?, ?)",
+                (SOURCE, "espn", "m1", canonical_id),
+            )
+    finally:
+        conn.close()
+
+    provider = ScriptedDetailProvider([])
+    pack = make_pack(provider, seed_match=_reconciling_seed)
+    engine = CollectorEngine(pack, str(db), SOURCE, 0.01, provider=provider)
+    try:
+        snap = engine._stored_match_snapshot("m1")
+        is_live = engine._stored_status_is_live("m1")
+    finally:
+        engine.close()
+
+    assert snap is not None
+    assert snap.score_home == 2, "on a tied updated_at, the canonical row must win the snapshot"
+    assert snap.status is MatchStatus.FINISHED
+    assert is_live is False, (
+        "on a tied updated_at, liveness must follow the canonical (non-live) row, "
+        "not the tied bare/qualified stub"
+    )
+
+
+def test_stored_status_is_live_freshest_row_not_any_row(tmp_path):
+    """Finding 1: an OLDER live stub must not override a FRESHER non-live
+    canonical row — liveness must read the freshest candidate row only,
+    consistent with the snapshot path, not "is any candidate row live"."""
+    from gamecollect.db.connection import connect
+    from gamecollect.engine import CollectorEngine
+
+    db = tmp_path / "engine.db"
+    canonical_id = "canada-vs-qatar-2026-06-18"
+    conn = connect(str(db), side_table_ddl=FAKE_SIDE_TABLE_DDL)
+    try:
+        with conn:
+            _stored_row(
+                conn,
+                qualified("m1"),
+                status=MatchStatus.IN_PLAY,
+                score_home=1,
+                updated_at="2026-06-18T19:00:00Z",
+            )
+            _stored_row(
+                conn,
+                canonical_id,
+                status=MatchStatus.FINISHED,
+                score_home=2,
+                updated_at="2026-06-18T20:00:00Z",
+            )
+            conn.execute(
+                "INSERT INTO provider_match_map (source, provider, provider_match_id, match_id) "
+                "VALUES (?, ?, ?, ?)",
+                (SOURCE, "espn", "m1", canonical_id),
+            )
+    finally:
+        conn.close()
+
+    provider = ScriptedDetailProvider([])
+    pack = make_pack(provider, seed_match=_reconciling_seed)
+    engine = CollectorEngine(pack, str(db), SOURCE, 0.01, provider=provider)
+    try:
+        is_live = engine._stored_status_is_live("m1")
+    finally:
+        engine.close()
+
+    assert is_live is False, (
+        "a fresher non-live canonical row must not be overridden by an older live stub"
+    )
+
+
+def test_stored_rows_for_provider_dedupes_row_reachable_via_two_arms(tmp_path):
+    """Finding 2: a row whose canonical id happens to equal the bare provider
+    id is reachable through BOTH the bare-id arm and the provider_match_map
+    join arm. It must be returned exactly once, not duplicated by the
+    underlying UNION."""
+    from gamecollect.db.connection import connect
+    from gamecollect.engine import CollectorEngine
+
+    db = tmp_path / "engine.db"
+    conn = connect(str(db), side_table_ddl=FAKE_SIDE_TABLE_DDL)
+    try:
+        with conn:
+            _stored_row(
+                conn,
+                "m1",
+                status=MatchStatus.IN_PLAY,
+                score_home=1,
+                updated_at="2026-06-18T19:00:00Z",
+            )
+            # Map entry whose canonical id is the SAME as the bare provider
+            # id — this row is reachable via both the bare-id arm and the
+            # map-join arm.
+            conn.execute(
+                "INSERT INTO provider_match_map (source, provider, provider_match_id, match_id) "
+                "VALUES (?, ?, ?, ?)",
+                (SOURCE, "espn", "m1", "m1"),
+            )
+    finally:
+        conn.close()
+
+    provider = ScriptedDetailProvider([])
+    pack = make_pack(provider, seed_match=_reconciling_seed)
+    engine = CollectorEngine(pack, str(db), SOURCE, 0.01, provider=provider)
+    try:
+        rows = engine._stored_rows_for_provider("m1")
+    finally:
+        engine.close()
+
+    assert len(rows) == 1, "a row reachable via two arms must be deduplicated, not doubled"
+
+
+# --------------------------------------------------------------------------- #
 # Round-7 review finding: _merge_over_base preserve-richer payload semantics
 # --------------------------------------------------------------------------- #
 
