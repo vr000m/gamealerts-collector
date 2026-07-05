@@ -121,6 +121,27 @@ def get_state(conn: sqlite3.Connection, match_id: str) -> dict[str, Any] | None:
     return rows[0] if rows else None
 
 
+def decode_payload(raw: Any) -> dict[str, Any]:
+    """Decode a stored ``matches.payload`` value to a dict.
+
+    Returns ``{}`` when *raw* is empty, unparseable, or not a JSON object.
+    Accepts either the raw JSON text (the DB column shape) or an
+    already-decoded value, so callers holding a fetched row and callers
+    re-reading by id share one decode-or-empty-dict rule (the drift-free
+    single source for :func:`get_stored_payload`, the reconciler's
+    candidate-name resolver, and the engine's stored-snapshot reader).
+    """
+    if not raw:
+        return {}
+    if isinstance(raw, dict):
+        return raw
+    try:
+        decoded = json.loads(raw)
+    except (TypeError, ValueError):
+        return {}
+    return decoded if isinstance(decoded, dict) else {}
+
+
 def get_stored_payload(conn: sqlite3.Connection, match_id: str) -> dict[str, Any]:
     """Decode the stored ``matches.payload`` JSON for ``match_id`` (``{}`` when
     the row is absent or the payload is empty/unparseable/not an object).
@@ -131,15 +152,7 @@ def get_stored_payload(conn: sqlite3.Connection, match_id: str) -> dict[str, Any
     the identical decode-or-empty-dict semantics.
     """
     existing = get_state(conn, match_id)
-    payload: dict[str, Any] = {}
-    if existing is not None and existing.get("payload"):
-        try:
-            decoded = json.loads(existing["payload"])
-        except (TypeError, ValueError):
-            decoded = None
-        if isinstance(decoded, dict):
-            payload = decoded
-    return payload
+    return decode_payload(existing["payload"]) if existing is not None else {}
 
 
 def get_events_since(

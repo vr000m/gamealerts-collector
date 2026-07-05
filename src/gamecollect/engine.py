@@ -45,6 +45,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
+from gamecollect.db import reader
 from gamecollect.db.connection import connect
 from gamecollect.db.writer import (
     CrossPartitionError,
@@ -2143,14 +2144,7 @@ class CollectorEngine:
             _updated_at,
             _rank,
         ) = rows[0]
-        extras: dict[str, Any] = {}
-        if payload:
-            try:
-                decoded = json.loads(payload)
-            except (TypeError, ValueError):
-                decoded = None
-            if isinstance(decoded, dict):
-                extras = decoded
+        extras = reader.decode_payload(payload)
         try:
             status = MatchStatus(status_value)
         except ValueError:

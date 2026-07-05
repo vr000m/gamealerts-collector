@@ -332,15 +332,7 @@ def _candidate_team_names(
     schedule-metadata-in-payload convention); falls back to the
     ``home_entity``/``away_entity`` soft refs via ``entities.display_name``.
     """
-    payload: dict[str, Any] = {}
-    raw_payload = row.get("payload")
-    if raw_payload:
-        try:
-            decoded = json.loads(raw_payload) if isinstance(raw_payload, str) else raw_payload
-            if isinstance(decoded, dict):
-                payload = decoded
-        except (ValueError, TypeError):
-            payload = {}
+    payload = reader.decode_payload(row.get("payload"))
 
     home = payload.get("home_team")
     away = payload.get("away_team")
