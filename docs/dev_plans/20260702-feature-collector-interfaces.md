@@ -6,7 +6,7 @@
 **Priority**: High
 **Branch**: feature/collector-interfaces
 **Created**: 2026-07-02
-**Completed**:
+**Completed**: 2026-07-04
 
 ## Objective
 
@@ -222,7 +222,8 @@ Context lifecycle:
 
 ## Findings
 
-- (append findings here as work proceeds)
+- Per-phase reviewer findings were fixed pre-commit and are summarised in the Progress bullets and Final Results below.
+- Post-conduct hardening (rounds 4–15, commits `c55ea75`..`90e6ef6`): 15 rounds of adversarial-review-driven engine-invariant fixes tracked in individual `fix(engine): round-N …` commit messages rather than re-transcribed here. Themes: give-up monotonicity, terminal-state precedence across classes, cooldown/veto/supersession interactions, per-field clock-fill, plus reconcile/football key-canonicalization and preserve-richer merge policy.
 
 ## Issues & Solutions
 
@@ -230,15 +231,16 @@ Context lifecycle:
 
 ## Final Results
 
-All four phases conducted 2026-07-03 via /conduct (clean-context implementer/test-writer/reviewer subagents per phase). Suite: 263 passed, 2 skipped; ruff clean. 18 commits on feature/collector-interfaces.
+All four phases conducted 2026-07-03 via /conduct (clean-context implementer/test-writer/reviewer subagents per phase), followed by 15 rounds of adversarial-review-driven engine hardening (2026-07-03/04). Suite: 433 passed, 2 skipped; ruff clean. 50 commits on feature/collector-interfaces.
 
 - Phase 1: CollectorEngine (jitter ±20%, capped exponential backoff, SIGTERM shutdown), diffing, fixture_io, SportPack.seed_match hook (football → register_unreconciled_match). Reviewer caught + fixed pre-commit: unseeded-poll baseline event loss, per-match writer-error isolation, multi-match `.json` record path.
 - Phase 2: typed core client (list_matches/get_state/get_events_since/get_standings), operation registry with pack-contributed ops (football squad/player-stats), WAL read-while-write proven. Fixed: missing-side-table never-error contract.
 - Phase 3: registry-generated CLI + `tools --json` manifest (contract_version 1), golden files for manifest + all six ops, registry-derivation identity test, output-schema conformance validator, broken-pack resilience, README usage.
 - Phase 4: ReplayProvider (paced + step/inf), gamealerts importer (both schema shapes, taxonomy mapping, ground-truth re-assert, --check determinism), four seed fixtures, synthetic mini-DB CI assets + drift guard, DESIGN.md fixture correction.
+- Post-conduct hardening (rounds 4–15, commits `c55ea75`..`90e6ef6`): 15 rounds of adversarial-review-driven invariant fixes to the poll/diff engine (`engine.py`) and reconcile paths — give-up monotonicity, terminal-state precedence, cooldown/veto/supersession interactions, per-field clock-fill, plus `reconcile.py`/`football/pack.py` key-canonicalization and preserve-richer merge policy. Suite grew 263→433 passed (2 skipped).
 
 Acceptance criteria: all verified — including live shell smoke (`gamecollect collect` with ReplayProvider via main() injection → `matches`/`events --json` show 6 events / 6–0 / David ×3). Note: `collect` reaches ReplayProvider through the main() injection seam; no shell-level `--fixture` flag was in scope.
 
 Header `**Status**: Not Started` left unedited deliberately — it sits above the review marker (hash window); this section is the completion record.
 
-Next: /update-docs, /deep-review, /security-review, then PR.
+Next: /deep-review, /security-review, then merge PR.

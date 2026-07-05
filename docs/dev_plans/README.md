@@ -6,7 +6,7 @@ Index of dev plans for gamealerts-collector. The plan file is the source of trut
 
 | Plan | Comp | Status | Branch | Notes |
 |------|------|--------|--------|-------|
-| [20260702-feature-collector-interfaces](20260702-feature-collector-interfaces.md) | collector | In Review | feature/collector-interfaces | Engine daemon, client library, CLI + manifest, ReplayProvider + fixtures. Implemented (263 tests); pre-PR reviews pending. |
+| [20260702-feature-collector-interfaces](20260702-feature-collector-interfaces.md) | collector | In Review | feature/collector-interfaces | Engine daemon, client library, CLI + manifest, ReplayProvider + fixtures. Implemented + 15 rounds engine hardening (433 tests); PR open. |
 
 ## Completed Tasks
 
