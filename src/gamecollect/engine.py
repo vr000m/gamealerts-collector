@@ -273,19 +273,22 @@ class _TransitionTracker:
       details, status resets) and is never reset. Reaching either cap
       triggers a give-up that persists the best-known state (merged, never
       raw) and sets ``give_up_pending``.
-    * **On healthy live resumption** (a tracked match reappearing on the slate
-      with a LIVE status — a slate flicker or a genuine resumption, which one
-      poll cannot distinguish): the consumed retry BUDGET
-      (``total_attempts``/``consecutive_failures``/``give_up_*``) is always
-      reset in place so an exhausted episode can never inherit into — and
-      force-close — a genuinely live match. The ``fallback`` is a separate
-      question: the tracker (holding it) is RETAINED only while the fallback is
-      still worth persisting (events, a known score, or FINISHED) AND the
-      applied live score has NOT climbed past it (scores are cumulative, so a
-      strictly higher live score proves the fallback stale); otherwise the
-      tracker is dropped. This keeps a rich full-time fallback across a
-      one-poll flicker without letting a stale one beat a genuinely higher
-      later score at give-up.
+    * **On a live slate reappearance** (a slate flicker or a genuine
+      resumption, which one poll cannot distinguish) the consumed retry BUDGET
+      is reset at DETECTION, unconditionally, by replacing the tracker with a
+      fresh one carrying only the ``fallback``
+      (``CollectorEngine._reset_resumption_budget``) — so an exhausted episode
+      can never inherit into (and force-close) a genuinely live match, even if
+      this poll's apply then fails. Whether the ``fallback`` survives is a
+      separate question decided ONLY against the DURABLY APPLIED live state
+      (``CollectorEngine._reconcile_live_apply``), never the raw slate board
+      whose scores are often NULL until the detail merge: the tracker is
+      RETAINED while the fallback is still worth persisting (events, a known
+      score, or FINISHED) AND the applied live score has NOT climbed past it
+      (scores are cumulative, so a strictly higher applied score proves the
+      fallback stale); otherwise the tracker is dropped. This keeps a rich
+      full-time fallback across a one-poll flicker without letting a stale one
+      beat a genuinely higher later score at give-up.
     * ``give_up_pending`` short-circuits further detail fetches: the give-up
       snapshot is re-emitted every poll until its apply lands, and the ERROR
       log stating what was persisted fires only after that durable success.
@@ -295,11 +298,17 @@ class _TransitionTracker:
     * **Abandonment is a per-run latch**: when a give-up snapshot's apply never
       lands (``_MAX_GIVE_UP_EMISSIONS`` exhausted, or nothing was ever known to
       persist) the tracker is popped AND the match id is recorded in
-      ``CollectorEngine._abandoned``, which the re-track paths (on-slate
-      transition and vanished-match hydration) consult so the bounded give-up
-      cannot hot-loop forever on a match whose apply persistently fails. A
-      genuine LIVE slate reappearance clears the latch so real resumption still
-      recovers.
+      ``CollectorEngine._abandoned``. The latch gates ONLY the off-slate
+      vanished-match re-tracking path
+      (``CollectorEngine._hydrate_vanished_matches``) so the bounded give-up
+      cannot hot-loop forever on a match whose apply persistently fails. It does
+      NOT gate on-slate processing: any slate appearance — live or terminal — is
+      fetched/merged/applied normally, so a recoverable FINISHED board can still
+      close the row and a live board resume it. The latch clears ONLY on the
+      next DURABLE apply for the match (``_reconcile_live_apply`` for a live
+      board, ``_resolve_tracker`` for a terminal one) — never on mere slate
+      appearance, so a transient live flicker whose recovery write fails cannot
+      prematurely re-arm vanished re-tracking.
     * ``last_reported_status`` dedupes the non-terminal WARN: once per detail
       status change, not once per poll.
     """
@@ -385,11 +394,18 @@ class CollectorEngine:
         # snapshot for the match was durably applied.
         self._transitions: dict[str, _TransitionTracker] = {}
         # Match ids whose give-up snapshot could never be durably applied and
-        # were abandoned this run (see _emit_give_up). Consulted by the
-        # re-track paths so a persistently-unapplyable match does not hot-loop
-        # a fresh bounded give-up every poll; cleared by a genuine LIVE slate
-        # reappearance (see _on_live_resumption).
+        # were abandoned this run (see _emit_give_up). Gates ONLY the off-slate
+        # vanished re-tracking path so a persistently-unapplyable match does not
+        # hot-loop a fresh bounded give-up every poll; on-slate appearances are
+        # processed normally. Cleared only on the next durable apply for the
+        # match (see _reconcile_live_apply / _resolve_tracker).
         self._abandoned: set[str] = set()
+        # Provider ids that appeared LIVE on the slate this poll (repopulated
+        # each _fetch_poll_snapshots). Only these are treated as resumptions
+        # when their apply lands durably (budget/fallback reconciliation); a
+        # still-live vanished-match progress snapshot flows through the same
+        # apply path but must NOT reset its tracker (see _on_durable_snapshot).
+        self._live_resumptions: set[str] = set()
         self._record: dict[str, _RecordedMatch] = {}
         self._record_flush_failed = False
         self._backoff_multiplier = 1
@@ -475,10 +491,11 @@ class CollectorEngine:
             self._accumulate_record(matches)
         for diff in diff_matches(matches, self._last):
             if not diff.has_changes:
-                # Stored state already durably matches this snapshot; a
-                # pending transition tracker for a non-live snapshot is
-                # therefore resolved (its terminal state IS persisted).
-                self._resolve_tracker(diff.match.match_id, diff.match)
+                # Stored state already durably matches this snapshot: treat it
+                # as a durable apply — a pending terminal tracker is resolved
+                # (its state IS persisted) and any abandonment latch cleared,
+                # or a live resumption's fallback is reconciled.
+                self._on_durable_snapshot(diff.match.match_id, diff.match)
                 continue
             try:
                 baseline = self._apply(diff)
@@ -509,11 +526,13 @@ class CollectorEngine:
                 continue
             if baseline is not None:
                 self._last[diff.match.match_id] = baseline
-                # CONSUME point of the transition state machine: only a
-                # DURABLE apply of a non-live snapshot pops the tracker. An
-                # apply failure above (baseline None / exception) retains it,
-                # so the captured terminal state is retried next poll.
-                self._resolve_tracker(diff.match.match_id, baseline)
+                # CONSUME point of the transition state machine: a DURABLE apply
+                # resolves a pending terminal tracker (and clears any
+                # abandonment latch), or reconciles a live resumption's fallback
+                # against the applied state. An apply failure above (baseline
+                # None / exception) retains the tracker so the captured terminal
+                # state is retried next poll.
+                self._on_durable_snapshot(diff.match.match_id, baseline)
 
     def _apply(self, diff: MatchDiff) -> NormalizedMatch | None:
         """Seed the match through the pack hook, then append its new events.
@@ -751,6 +770,7 @@ class CollectorEngine:
         """
         matches = self._provider.fetch_live_matches()
         slate_ids = {m.match_id for m in matches}
+        self._live_resumptions = set()
         if not self._restart_scan_done:
             # First successful poll after (re)start: seed trackers for rows
             # left live in storage whose provider id is off the slate. Runs
@@ -761,13 +781,17 @@ class CollectorEngine:
         hydrated: list[NormalizedMatch] = []
         for match in matches:
             if match.status in LIVE_STATUSES:
-                # Healthy live resumption on the slate. A genuine live board is
-                # also the only signal that clears an abandonment latch, so a
-                # match we gave up persisting can still recover. (A NON-live
-                # slate appearance is the transition in progress — handled
-                # below — and must keep its tracker.)
-                self._abandoned.discard(match.match_id)
-                self._on_live_resumption(match)
+                # Live board on the slate: reset any tracker's retry BUDGET now,
+                # unconditionally, so an exhausted episode can never inherit into
+                # — and force-close — a genuinely live match, even if this poll's
+                # apply later fails. The fallback-supersession decision and the
+                # abandonment-latch clear both wait for the DURABLY APPLIED state
+                # (:meth:`_reconcile_live_apply`, from ``poll_once``): the raw
+                # slate board's scores are often NULL (they arrive only from
+                # ``fetch_match_detail``, merged below), so neither can be judged
+                # here.
+                self._live_resumptions.add(match.match_id)
+                self._reset_resumption_budget(match.match_id)
             previous = self._last.get(match.match_id)
             was_live = (
                 previous is not None and previous.status in LIVE_STATUSES
@@ -782,13 +806,13 @@ class CollectorEngine:
                 hydrated.append(match)
                 continue
             in_transition = was_live and match.status not in LIVE_STATUSES
-            if in_transition and match.match_id in self._abandoned:
-                # Abandoned earlier this run: the give-up snapshot's apply never
-                # landed (e.g. seed_match returns None forever), so rebuilding a
-                # tracker would only restart the bounded give-up cycle. Leave it
-                # dropped; a genuine LIVE reappearance (handled above) clears the
-                # latch and allows real recovery.
-                continue
+            # NOTE: the abandonment latch (``self._abandoned``) is NOT consulted
+            # here. ANY slate appearance — live or terminal — is processed
+            # normally (fetch/merge/apply attempted): a recoverable FINISHED
+            # board must be able to close out an abandoned row, and a live board
+            # to resume it. The latch gates ONLY the off-slate vanished
+            # re-tracking path (:meth:`_hydrate_vanished_matches`) and clears on
+            # the next durable apply for the match.
             tracker = self._transitions.get(match.match_id)
             if in_transition and tracker is not None and self._tracker_at_cap(tracker):
                 # A give-up is already due (typically re-emitted because its
@@ -982,38 +1006,68 @@ class CollectorEngine:
             or tracker.total_attempts >= _MAX_TRANSITION_TOTAL_ATTEMPTS
         )
 
-    def _on_live_resumption(self, applied: NormalizedMatch) -> None:
-        """Reconcile a tracked match reappearing LIVE on the slate.
+    def _on_durable_snapshot(self, match_id: str, snapshot: NormalizedMatch) -> None:
+        """Route a durably-applied snapshot to the right tracker handler.
+
+        A durable non-live apply resolves a pending terminal tracker (and
+        clears any abandonment latch). A durable LIVE apply is reconciled as a
+        resumption ONLY when the match actually appeared live on the slate this
+        poll (``self._live_resumptions``): a still-live vanished-match progress
+        snapshot flows through this same apply path but is NOT a resumption —
+        resetting its tracker would stop the total-attempts cap from ever
+        force-closing a match whose detail never turns terminal.
+        """
+        if snapshot.status in LIVE_STATUSES:
+            if match_id in self._live_resumptions:
+                self._reconcile_live_apply(match_id, snapshot)
+            return
+        self._resolve_tracker(match_id, snapshot)
+
+    def _reset_resumption_budget(self, match_id: str) -> None:
+        """Reset a tracker's retry BUDGET on a live slate reappearance.
 
         A live board is either a genuine resumption or a one-poll slate
-        flicker, and a single poll cannot tell them apart. Either way the
-        consumed retry BUDGET must not carry into a later genuine transition —
-        an exhausted episode must never force-close a live match — so the
-        budget fields are reset unconditionally. The captured ``fallback`` is a
-        separate question: a fallback too sparse to be worth persisting, or one
-        the resumed live score has already climbed past, is stale; but a bogus
-        flicker over a rich terminal fallback (full-time score/events) must NOT
-        lose it before the match vanishes again. So the tracker (which holds
-        the fallback) is RETAINED with a reset budget only when the fallback is
-        worth persisting AND the applied live score has not superseded it;
-        otherwise it is dropped entirely (a genuine fresh transition rebuilds).
+        flicker, and a single poll cannot tell them apart — but either way the
+        consumed retry budget must not carry into a later genuine transition,
+        or an exhausted episode could force-close a genuinely live match. So
+        the budget is reset UNCONDITIONALLY here, at detection, before this
+        poll's apply is even attempted (an apply failure must never skip the
+        reset). The retained ``fallback`` carries over into the fresh tracker;
+        whether it is still worth keeping is a separate question decided against
+        the DURABLY APPLIED state (:meth:`_reconcile_live_apply`), not the raw
+        slate board whose scores are often NULL. Constructing a fresh tracker
+        (rather than clearing fields in place) keeps the budget defaults in one
+        place, so a future field cannot silently leak across a resumption.
         """
-        tracker = self._transitions.get(applied.match_id)
+        tracker = self._transitions.get(match_id)
+        if tracker is None:
+            return
+        self._transitions[match_id] = _TransitionTracker(fallback=tracker.fallback)
+
+    def _reconcile_live_apply(self, match_id: str, applied: NormalizedMatch) -> None:
+        """Reconcile a tracked match after a DURABLE live apply.
+
+        A durable live apply proves normal collection has resumed, so the
+        abandonment latch (which only gates off-slate vanished re-tracking) is
+        cleared. The retained ``fallback`` is then judged against the APPLIED
+        state — not the raw slate board, whose scores are often NULL until the
+        detail merge lands: a fallback too sparse to persist, or one the applied
+        live score has already climbed past, is stale, so its tracker is
+        dropped; a rich fallback the live score has NOT surpassed is kept
+        (with the freshly reset budget) across a one-poll flicker until the
+        match vanishes again — a genuine fresh transition rebuilds the tracker.
+        """
+        self._abandoned.discard(match_id)
+        tracker = self._transitions.get(match_id)
         if tracker is None:
             return
         fallback = tracker.fallback
         if (
-            fallback is not None
-            and self._fallback_worth_retaining(fallback)
-            and not self._live_supersedes_fallback(applied, fallback)
+            fallback is None
+            or not self._fallback_worth_retaining(fallback)
+            or self._live_supersedes_fallback(applied, fallback)
         ):
-            tracker.consecutive_failures = 0
-            tracker.total_attempts = 0
-            tracker.give_up_pending = False
-            tracker.give_up_emissions = 0
-            tracker.last_reported_status = None
-        else:
-            self._transitions.pop(applied.match_id, None)
+            self._transitions.pop(match_id, None)
 
     @staticmethod
     def _fallback_worth_retaining(fallback: NormalizedMatch) -> bool:
@@ -1201,10 +1255,13 @@ class CollectorEngine:
         Called from ``poll_once`` only once ``_apply`` returned a baseline
         (or the snapshot produced no diff because stored state already
         matches). A pending give-up logs its ERROR here — persistence is
-        claimed only after the write actually landed.
+        claimed only after the write actually landed. A durable non-live apply
+        also clears the abandonment latch: the row has resolved, so the latch
+        is moot but must not linger and block later re-tracking.
         """
         if snapshot.status in LIVE_STATUSES:
             return
+        self._abandoned.discard(match_id)
         tracker = self._transitions.pop(match_id, None)
         if tracker is None or not tracker.give_up_pending:
             return

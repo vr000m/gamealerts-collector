@@ -2776,6 +2776,221 @@ def test_abandoned_tracker_does_not_hot_loop_and_recovers_on_live_reappearance(t
     )
 
 
+# --------------------------------------------------------------------------- #
+# 2026-07 round-8 tracker/latch findings: supersession judged on the DURABLY
+# APPLIED state (not the raw slate board), the abandonment latch gates only
+# off-slate re-tracking and clears on a durable apply
+# --------------------------------------------------------------------------- #
+
+
+def test_scoreboard_only_resumption_drops_stale_fallback_via_applied_score(tmp_path):
+    """Round-8 finding A: a resumption whose SLATE board omits scores (score_home
+    /score_away are NULL — a scoreboard-only provider) but whose DETAIL advances
+    past the captured fallback must still drop the stale fallback. The
+    supersession check must run against the applied/merged score, not the raw
+    board (whose NULL scores can never supersede) — else a stale 2-1 FT fallback
+    wrongly beats a 3-1 reality at give-up."""
+    from gamecollect.engine import _MAX_TRANSITION_DETAIL_FAILURES, CollectorEngine
+
+    db = tmp_path / "engine.db"
+    live1 = nm("m1", (), status=MatchStatus.IN_PLAY, minute=44, score_home=2, score_away=1)
+    live_detail1 = nm(
+        "m1",
+        (ev(0, "goal", minute=30), ev(1, "goal", minute=44, team="Qatar")),
+        status=MatchStatus.IN_PLAY,
+        minute=44,
+        score_home=2,
+        score_away=1,
+    )
+    ft_board = nm(
+        "m1",
+        (ev(0, "goal", minute=30), ev(1, "goal", minute=44, team="Qatar")),
+        status=MatchStatus.FINISHED,
+        minute=None,
+        score_home=2,
+        score_away=1,
+        display_clock="FT",
+    )
+    # Resumption: the SLATE board carries NULL scores (scoreboard omits them),
+    # but the DETAIL proves the match climbed to 3-1.
+    live2_board = nm(
+        "m1", (), status=MatchStatus.IN_PLAY, minute=80, score_home=None, score_away=None
+    )
+    live_detail2 = nm(
+        "m1",
+        (
+            ev(0, "goal", minute=30),
+            ev(1, "goal", minute=44, team="Qatar"),
+            ev(2, "goal", minute=80),
+        ),
+        status=MatchStatus.IN_PLAY,
+        minute=80,
+        score_home=3,
+        score_away=1,
+    )
+    polls = [
+        ([live1], {"m1": live_detail1}),
+        ([ft_board], {"m1": ProviderUnavailableError("premature FT board")}),  # capture 2-1
+        ([live2_board], {"m1": live_detail2}),  # NULL-score slate board, 3-1 detail
+    ]
+    polls += [
+        ([], {"m1": ProviderUnavailableError(f"gone #{i}")})
+        for i in range(_MAX_TRANSITION_DETAIL_FAILURES)
+    ]
+    provider = ScriptedDetailProvider(polls)
+    engine = CollectorEngine(make_pack(provider), str(db), SOURCE, 0.01, provider=provider)
+    try:
+        for _ in range(len(polls)):
+            engine.poll_once()
+    finally:
+        engine.close()
+
+    state = reader.get_state(read_db(db), qualified("m1"))
+    assert state is not None and state["status"] == MatchStatus.FINISHED.value
+    assert state["score_home"] == 3 and state["score_away"] == 1, (
+        "supersession must be judged on the applied 3-1 detail, not the NULL-score "
+        "slate board; the stale 2-1 fallback must be dropped"
+    )
+
+
+def test_finished_board_after_abandonment_persists_and_clears_latch(tmp_path, caplog):
+    """Round-8 finding B(1): the abandonment latch must NOT skip an on-slate
+    board. After a transient outage abandons a match, a later recoverable
+    FINISHED slate board must be fetched/merged/applied and persisted — a
+    finished match never goes live (the sole live-clear signal), so skipping it
+    would wedge the stored row stale until daemon restart. The durable terminal
+    apply also clears the latch."""
+    from gamecollect.engine import (
+        _MAX_GIVE_UP_EMISSIONS,
+        _MAX_TRANSITION_DETAIL_FAILURES,
+        CollectorEngine,
+    )
+
+    db = tmp_path / "engine.db"
+    live1 = nm("m1", (), status=MatchStatus.IN_PLAY, minute=20)
+    live_detail1 = nm("m1", (ev(0, "goal", minute=20),), status=MatchStatus.IN_PLAY, minute=20)
+    n_vanished = _MAX_TRANSITION_DETAIL_FAILURES + _MAX_GIVE_UP_EMISSIONS + 4
+    polls = [([live1], {"m1": live_detail1})]
+    polls += [([], {"m1": ProviderUnavailableError(f"down #{i}")}) for i in range(n_vanished)]
+    provider = ScriptedDetailProvider(polls)
+    pack = make_pack(provider)
+    original_persist = pack.persist_side_tables
+    outage = {"active": True}
+
+    def flaky_persist(conn, writer, match, seeded_id):
+        if match.status is MatchStatus.FINISHED and outage["active"]:
+            raise RuntimeError("permanent side-table outage")
+        return original_persist(conn, writer, match, seeded_id)
+
+    pack.persist_side_tables = flaky_persist
+    engine = CollectorEngine(pack, str(db), SOURCE, 0.01, provider=provider)
+    try:
+        with caplog.at_level(logging.ERROR, logger="gamecollect.engine"):
+            for _ in range(len(polls)):
+                engine.poll_once()
+        assert "m1" in engine._abandoned, "the failed give-up must latch abandonment"
+
+        # A recoverable FINISHED board now appears ON the slate (outage lifted).
+        outage["active"] = False
+        ft_board = nm(
+            "m1",
+            (ev(0, "goal", minute=20), ev(1, "goal", minute=90)),
+            status=MatchStatus.FINISHED,
+            minute=None,
+            score_home=2,
+            score_away=1,
+            display_clock="FT",
+        )
+        provider._polls.append(([ft_board], {"m1": ft_board}))
+        engine.poll_once()  # on-slate terminal board must be processed despite the latch
+    finally:
+        engine.close()
+
+    assert "m1" not in engine._abandoned, "a durable terminal apply must clear the latch"
+    state = reader.get_state(read_db(db), qualified("m1"))
+    assert state is not None and state["status"] == MatchStatus.FINISHED.value, (
+        "the recoverable FINISHED slate board must close the abandoned row"
+    )
+    assert state["score_home"] == 2 and state["score_away"] == 1
+    assert event_seqs(db, qualified("m1")) == [0, 1], "the final-whistle event must land"
+
+
+def test_live_flicker_with_failing_apply_keeps_abandonment_latch(tmp_path, caplog):
+    """Round-8 finding B(2): the latch must clear ONLY on a DURABLE apply, never
+    on mere live slate appearance. An abandoned match's transient LIVE flicker
+    whose recovery write fails (here: missing identity → seed_match returns None)
+    must keep the latch, or it would re-arm off-slate vanished re-tracking and
+    burn the give-up cycle repeatedly on a match that never actually recovered."""
+    from gamecollect.engine import (
+        _MAX_GIVE_UP_EMISSIONS,
+        _MAX_TRANSITION_DETAIL_FAILURES,
+        CollectorEngine,
+    )
+
+    db = tmp_path / "engine.db"
+    live1 = nm("m1", (), status=MatchStatus.IN_PLAY, minute=20)
+    live_detail1 = nm("m1", (ev(0, "goal", minute=20),), status=MatchStatus.IN_PLAY, minute=20)
+    n_vanished = _MAX_TRANSITION_DETAIL_FAILURES + _MAX_GIVE_UP_EMISSIONS + 4
+    polls = [([live1], {"m1": live_detail1})]
+    polls += [([], {"m1": ProviderUnavailableError(f"down #{i}")}) for i in range(n_vanished)]
+    provider = ScriptedDetailProvider(polls)
+    pack = make_pack(provider)
+    original_persist = pack.persist_side_tables
+    outage = {"active": True}
+
+    def flaky_persist(conn, writer, match, seeded_id):
+        if match.status is MatchStatus.FINISHED and outage["active"]:
+            raise RuntimeError("permanent side-table outage")
+        return original_persist(conn, writer, match, seeded_id)
+
+    pack.persist_side_tables = flaky_persist
+    engine = CollectorEngine(pack, str(db), SOURCE, 0.01, provider=provider)
+    try:
+        with caplog.at_level(logging.ERROR, logger="gamecollect.engine"):
+            for _ in range(len(polls)):
+                engine.poll_once()
+        assert "m1" in engine._abandoned
+
+        # A transient LIVE flicker appears, but its recovery apply FAILS: the
+        # board is missing identity, so seed_match returns None and nothing is
+        # written. The latch must survive.
+        flicker = nm(
+            "m1",
+            (),
+            status=MatchStatus.IN_PLAY,
+            minute=70,
+            home_team=None,
+            away_team=None,
+            kickoff_utc=None,
+        )
+        provider._polls.append(([flicker], {"m1": flicker}))
+        engine.poll_once()  # live flicker, apply fails
+        assert "m1" in engine._abandoned, (
+            "a live flicker whose recovery write fails must NOT clear the latch"
+        )
+        assert engine._transitions == {}, "the failed flicker must not re-arm a tracker"
+
+        # Prove no hot-loop: with the latch held, the off-slate vanished path
+        # stays gated across further empty polls — no fresh give-up ERROR.
+        before = len(provider.detail_calls)
+        provider._polls.extend([([], {}), ([], {})])
+        engine.poll_once()
+        engine.poll_once()
+        assert provider.detail_calls[before:] == [], (
+            "the latched match must not be re-fetched off-slate (no hot-loop)"
+        )
+        # The give-up ERROR fired only during the pre-flicker abandonment (the
+        # row was never durably closed); no give-up re-fired after the flicker.
+        give_ups = [
+            r for r in caplog.records if "persisted best-known terminal state" in r.getMessage()
+        ]
+        assert give_ups == [], "an unpersistable give-up logs on abandon, not on re-close"
+    finally:
+        engine.close()
+
+    assert engine._transitions == {}
+
+
 def test_multi_provider_map_rows_warn_and_hydrate_without_wedge(tmp_path, caplog):
     """Finding 3: >1 DISTINCT provider ids mapped to one stored row (a
     multi-provider source) must WARN naming them and proceed with the first —
