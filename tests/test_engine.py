@@ -4994,6 +4994,230 @@ def test_y4_per_field_clock_fill_among_eligible_sides_but_not_ineligible():
     )
 
 
+# --------------------------------------------------------------------------- #
+# Round-15 symmetry fixes (Z1 terminal wins ALL precedence across classes + Z2
+# unified no-regression supersession helper + Z3 veto-aware clock fill + Z4
+# contradiction-free clock pairs)
+# --------------------------------------------------------------------------- #
+
+
+def test_z1_terminal_incumbent_keeps_all_precedence_over_regressed_live_terminal_as_old():
+    """Z1: a genuinely FINISHED 2-0 terminal incumbent (real events/identity/rich
+    payload) accrued against a score-regressed reset LIVE 1-0 board must keep its
+    events, IDENTITY, and PAYLOAD across terminality classes — not just status/clock
+    (the round-14 leak). The live board contributes ONLY fields the terminal lacks.
+    This ordering has the terminal side as ``old`` (the incumbent)."""
+    from dataclasses import replace as dc_replace
+
+    from gamecollect.engine import CollectorEngine
+
+    terminal_incumbent = dc_replace(
+        nm(
+            "m1",
+            (ev(0, "goal", minute=20), ev(1, "goal", minute=55)),
+            status=MatchStatus.FINISHED,
+            minute=90,
+            score_home=2,
+            score_away=0,
+            display_clock="FT",
+            home_team="Argentina",
+            away_team=None,  # a gap the live side legitimately fills
+            kickoff_utc="2026-06-18T18:00:00Z",
+        ),
+        payload={"round_name": "Final", "venue": "Lusail"},
+    )
+    # A bogus reset LIVE board: score regressed to 1-0, a LONGER junk events list,
+    # junk identity/payload, mid-match clock. Under the round-14 rules its longer
+    # list / newer identity / newer payload would have leaked in.
+    regressed_live = dc_replace(
+        nm(
+            "m1",
+            (ev(5, "goal", minute=5), ev(6, "goal", minute=15), ev(7, "goal", minute=25)),
+            status=MatchStatus.IN_PLAY,
+            minute=30,
+            score_home=1,
+            score_away=0,
+            display_clock="30'",
+            home_team="TBD",
+            away_team="France",
+            kickoff_utc="2026-01-01T00:00:00Z",
+        ),
+        payload={"round_name": "Group A", "venue": "Nowhere"},
+    )
+    merged = CollectorEngine._accrue_fallback(terminal_incumbent, regressed_live)
+    assert merged.status is MatchStatus.FINISHED
+    assert [e.seq for e in merged.events] == [0, 1], (
+        "Z1: the terminal side wins events across classes; the longer junk list is dropped"
+    )
+    assert merged.home_team == "Argentina" and merged.kickoff_utc == "2026-06-18T18:00:00Z", (
+        "Z1: the terminal side wins identity precedence across classes"
+    )
+    assert merged.away_team == "France", "Z1: the live side fills only the terminal's null gap"
+    assert merged.payload["round_name"] == "Final" and merged.payload["venue"] == "Lusail", (
+        "Z1: the terminal side wins payload precedence across classes"
+    )
+    assert merged.minute == 90 and merged.display_clock == "FT", "Z1: terminal clock wins"
+    assert (merged.score_home, merged.score_away) == (2, 0), "Z1: per-side score max unchanged"
+
+
+def test_z1_terminal_wins_all_precedence_over_regressed_live_terminal_as_new():
+    """Z1 (mirror ordering): the same terminal-wins-all precedence holds when the
+    genuinely terminal side arrives as ``new`` against a bogus incumbent LIVE board
+    carrying a lower score and longer junk events/identity/payload."""
+    from dataclasses import replace as dc_replace
+
+    from gamecollect.engine import CollectorEngine
+
+    bogus_live_incumbent = dc_replace(
+        nm(
+            "m1",
+            (ev(5, "goal", minute=5), ev(6, "goal", minute=15), ev(7, "goal", minute=25)),
+            status=MatchStatus.IN_PLAY,
+            minute=30,
+            score_home=1,
+            score_away=0,
+            display_clock="30'",
+            home_team="TBD",
+            away_team="France",
+            kickoff_utc="2026-01-01T00:00:00Z",
+        ),
+        payload={"round_name": "Group A", "venue": "Nowhere"},
+    )
+    terminal_final = dc_replace(
+        nm(
+            "m1",
+            (ev(0, "goal", minute=20), ev(1, "goal", minute=55)),
+            status=MatchStatus.FINISHED,
+            minute=90,
+            score_home=2,
+            score_away=0,
+            display_clock="FT",
+            home_team="Argentina",
+            away_team=None,
+            kickoff_utc="2026-06-18T18:00:00Z",
+        ),
+        payload={"round_name": "Final", "venue": "Lusail"},
+    )
+    merged = CollectorEngine._accrue_fallback(bogus_live_incumbent, terminal_final)
+    assert merged.status is MatchStatus.FINISHED
+    assert [e.seq for e in merged.events] == [0, 1], (
+        "Z1: terminal events win regardless of ordering"
+    )
+    assert merged.home_team == "Argentina" and merged.kickoff_utc == "2026-06-18T18:00:00Z", (
+        "Z1: terminal identity wins regardless of ordering"
+    )
+    assert merged.away_team == "France", "Z1: the live side fills only the terminal's null gap"
+    assert merged.payload["round_name"] == "Final" and merged.payload["venue"] == "Lusail", (
+        "Z1: terminal payload wins regardless of ordering"
+    )
+    assert merged.minute == 90 and merged.display_clock == "FT"
+    assert (merged.score_home, merged.score_away) == (2, 0)
+
+
+def test_z2_swapped_score_board_does_not_supersede_but_clean_advance_does():
+    """Z2: the unified supersession helper requires NO regression on ANY side. A
+    swapped-score live board (2-1 vs a fallback 1-2 — home advanced, away regressed)
+    must NOT supersede the genuine fallback in the resumption-tracker twin (the
+    round-14 tracker code wrongly popped it on the one-sided advance). A CLEAN strict
+    advance with no regression still supersedes. Both twins share the one helper."""
+    from gamecollect.engine import CollectorEngine
+
+    fallback = nm("m1", (), status=MatchStatus.FINISHED, minute=80, score_home=1, score_away=2)
+    swapped = nm("m1", (), status=MatchStatus.IN_PLAY, minute=85, score_home=2, score_away=1)
+    assert not CollectorEngine._live_supersedes_fallback(swapped, fallback), (
+        "Z2: a swapped-score board (away regressed) must not supersede the genuine fallback"
+    )
+    assert not CollectorEngine._live_supersedes_cooldown_fallback(swapped, fallback), (
+        "Z2: the cooldown twin agrees — no supersession on a one-sided advance with regression"
+    )
+    # A clean strict advance (both sides >=, one strictly greater) still supersedes.
+    clean_advance = nm("m1", (), status=MatchStatus.IN_PLAY, minute=85, score_home=2, score_away=2)
+    assert CollectorEngine._live_supersedes_fallback(clean_advance, fallback), (
+        "Z2: a clean strict advance with no regression still supersedes"
+    )
+    assert CollectorEngine._live_supersedes_captured(clean_advance, fallback), (
+        "Z2: both call sites route through the one shared helper"
+    )
+
+
+def test_z3_vetoed_reset_board_never_fills_incumbents_null_clock():
+    """Z3: a same-class score-regression-vetoed reset board is untrustworthy for
+    EVERY field — its clock must not fill the trusted incumbent's null minute. A
+    FINISHED 2-0 incumbent with a null minute but a real display_clock "75'" accrued
+    against a bogus FINISHED 0-0 reset board carrying minute 3 must NOT end up pairing
+    minute 3 with "75'"; the incumbent's null minute stays null."""
+    from gamecollect.engine import CollectorEngine
+
+    incumbent = nm(
+        "m1",
+        (ev(0, "goal", minute=20),),
+        status=MatchStatus.FINISHED,
+        minute=None,
+        score_home=2,
+        score_away=0,
+        display_clock="75'",
+    )
+    reset_board = nm(
+        "m1",
+        (),
+        status=MatchStatus.FINISHED,
+        minute=3,  # a bogus mid-match minute on the reset board
+        score_home=0,
+        score_away=0,
+        display_clock="3'",
+    )
+    merged = CollectorEngine._accrue_fallback(incumbent, reset_board)
+    assert merged.minute is None, (
+        "Z3: the vetoed reset board's minute 3 must never fill the incumbent's null minute"
+    )
+    assert merged.display_clock == "75'", "Z3: the incumbent keeps its own clock under the veto"
+
+
+def test_z4_clock_fill_only_when_minutes_do_not_contradict():
+    """Z4: the per-field clock fill among ELIGIBLE sides must not build a
+    self-contradictory mixed-time pair. A missing display_clock is borrowed from the
+    other side only when the other's minute does not contradict the winner's minute."""
+    from gamecollect.engine import CollectorEngine
+
+    # Round-14 case still passes: winner (90, None) + other (None, "90'+3") → (90,
+    # "90'+3") — other.minute is None, so no contradiction, the fill happens.
+    winner = nm(
+        "m1",
+        (),
+        status=MatchStatus.FINISHED,
+        minute=90,
+        score_home=2,
+        score_away=0,
+        display_clock=None,
+    )
+    other_null_minute = nm(
+        "m1",
+        (),
+        status=MatchStatus.FINISHED,
+        minute=None,
+        score_home=2,
+        score_away=0,
+        display_clock="90'+3",
+    )
+    assert CollectorEngine._paired_clock(winner, other_null_minute) == (90, "90'+3"), (
+        "Z4: a null other-minute does not contradict, so the display_clock fill still happens"
+    )
+    # Round-15 case: winner (90, None) + other (87, "87'") → (90, None) — other.minute
+    # 87 contradicts the winner's minute 90, so display_clock is NOT borrowed.
+    other_contradicting = nm(
+        "m1",
+        (),
+        status=MatchStatus.FINISHED,
+        minute=87,
+        score_home=2,
+        score_away=0,
+        display_clock="87'",
+    )
+    assert CollectorEngine._paired_clock(winner, other_contradicting) == (90, None), (
+        "Z4: a contradicting other-minute (87 vs 90) blocks the display_clock fill"
+    )
+
+
 def test_r2_slate_board_on_fetch_failure_branch_survives_into_post_cooldown_give_up(tmp_path):
     """Round-11 R2 (workflow [4]): while cooling, the fetch-FAILURE branch must
     accrue its non-live slate board into cooldown.fallback (NOT a tracker), so a
