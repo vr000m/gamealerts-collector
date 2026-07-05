@@ -151,6 +151,11 @@ _MERGE_FILL_FIELDS = (
     "score_away",
 )
 
+# Sentinel distinguishing "stored row not supplied" (fetch it) from an explicit
+# ``None`` (no stored row) in :meth:`CollectorEngine._nonregress_over_stored`,
+# whose ``stored`` is threaded in once per emission but omitted by direct callers.
+_UNSET: Any = object()
+
 # Lifecycle rank for the merge's forward-only status rule: when scoreboard and
 # detail describe the SAME poll, status may only move forward — a cached or
 # lagging detail endpoint still saying live must never regress the scoreboard's
@@ -269,11 +274,11 @@ class _Cooldown:
     fine: a match reappearing after a full cap-length quiet window deserves a
     fresh epoch.
 
-    ``fallback`` holds the RICHEST non-live observation accrued WHILE cooling —
-    the give-up machinery does NOT get-or-create a tracker during a cooldown
-    (that would re-arm the very hot-loop the cooldown suppresses), so a richer
-    board seen while cooling (a 2-0 detail over a stale 1-0) accrues here via the
-    :meth:`_richest_fallback` comparator instead. When the cooldown lapses and
+    ``fallback`` holds the accumulated best-known non-live state accrued WHILE
+    cooling — the give-up machinery does NOT get-or-create a tracker during a
+    cooldown (that would re-arm the very hot-loop the cooldown suppresses), so a
+    richer board seen while cooling (a 2-0 detail over a stale 1-0) accrues here
+    field-wise via :meth:`_accrue_fallback` instead. When the cooldown lapses and
     re-tracking begins, the fresh tracker's ``fallback`` is SEEDED from this slot
     (see :meth:`_tracker`) so a rich terminal state observed during the quiet
     window still closes the eventual give-up. ``drift_logged`` damps the
@@ -1012,7 +1017,7 @@ class CollectorEngine:
                     # (:meth:`_log_drift_while_cooling`) rather than a per-poll
                     # ERROR storm. The retry cycle resumes when the gate lapses.
                     cooldown = self._cooldowns[match.match_id]
-                    cooldown.fallback = self._richest_fallback(cooldown.fallback, match)
+                    cooldown.fallback = self._accrue_fallback(cooldown.fallback, match)
                     if isinstance(exc, ShapeDriftError):
                         self._log_drift_while_cooling(match.match_id, exc)
                     continue
@@ -1023,7 +1028,7 @@ class CollectorEngine:
                     hydrated.append(match)
                     continue
                 tracker = self._tracker(match.match_id)
-                tracker.fallback = self._richest_fallback(tracker.fallback, match)
+                tracker.fallback = self._accrue_fallback(tracker.fallback, match)
                 tracker.consecutive_failures += 1
                 tracker.total_attempts += 1
                 if self._tracker_at_cap(tracker):
@@ -1060,14 +1065,16 @@ class CollectorEngine:
                     # clears the cooling gate) but do NOT advance any attempt
                     # count or emit a give-up off a non-terminal reset.
                     cooldown = self._cooldowns[match.match_id]
-                    cooldown.fallback = self._richest_fallback(cooldown.fallback, merged)
+                    cooldown.fallback = self._accrue_fallback(cooldown.fallback, merged)
                     if merged.status in LIVE_STATUSES:
                         hydrated.append(merged)
                     continue
-                # Count the attempt (bounded by the total cap) and keep the
-                # richest fallback either way.
+                # Count the attempt (bounded by the total cap) and accrue the
+                # detail-MERGED snapshot into the fallback either way (M4): the
+                # sparse slate board would drop the detail-only score/events the
+                # adjacent cooling branch already accrues via ``merged``.
                 tracker = self._tracker(match.match_id)
-                tracker.fallback = self._richest_fallback(tracker.fallback, match)
+                tracker.fallback = self._accrue_fallback(tracker.fallback, merged)
                 tracker.total_attempts += 1
                 self._warn_nonterminal(match.match_id, tracker, merged.status)
                 if self._tracker_at_cap(tracker):
@@ -1204,7 +1211,7 @@ class CollectorEngine:
             tracker = self._transitions[match_id] = _TransitionTracker()
             cooldown = self._cooldowns.get(match_id)
             if cooldown is not None and cooldown.fallback is not None:
-                tracker.fallback = self._richest_fallback(tracker.fallback, cooldown.fallback)
+                tracker.fallback = self._accrue_fallback(tracker.fallback, cooldown.fallback)
         return tracker
 
     @staticmethod
@@ -1275,7 +1282,7 @@ class CollectorEngine:
         carried = fallback
         if previous is not None and previous.fallback is not None:
             carried = (
-                self._richest_fallback(previous.fallback, fallback)
+                self._accrue_fallback(previous.fallback, fallback)
                 if fallback is not None
                 else previous.fallback
             )
@@ -1323,23 +1330,62 @@ class CollectorEngine:
         """
         if snapshot.status in LIVE_STATUSES:
             if state_advanced:
-                self._clear_cooling_gate(match_id)
+                self._clear_cooling_gate(match_id, snapshot)
                 if match_id in live_resumptions:
                     self._reconcile_live_apply(match_id, snapshot)
             return
         self._resolve_tracker(match_id, snapshot)
 
-    def _clear_cooling_gate(self, match_id: str) -> None:
+    def _clear_cooling_gate(self, match_id: str, applied: NormalizedMatch) -> None:
         """Zero a cooldown's suppression gate while PRESERVING its memory (L1).
 
         Stops suppressing re-tracking (``remaining`` → 0) but keeps the entry, so
         its ``epoch`` (and any accrued ``fallback``) survives — a terminal write
         that keeps failing after a live recovery keeps its exponential backoff.
         A no-op when the match is not cooling.
+
+        M5: a durable state-advanced live ``applied`` state that reaches or passes
+        the cooldown ``fallback``'s known per-side scores proves that fallback
+        stale — a bogus pre-recovery terminal board (e.g. FINISHED 1-0 min 88)
+        must not survive a durable IN_PLAY 2-1 apply and later seed a re-tracked
+        tracker whose stale terminal status/clock would win at give-up. We DROP
+        it rather than accrue the live state in: accruing would keep the stale
+        terminal side's status/clock (the accumulator prefers the terminal side),
+        which is exactly what must not win later. This mirrors the tracker-side
+        supersession in :meth:`_reconcile_live_apply`.
         """
         cooldown = self._cooldowns.get(match_id)
-        if cooldown is not None:
-            cooldown.remaining = 0
+        if cooldown is None:
+            return
+        cooldown.remaining = 0
+        if cooldown.fallback is not None and self._live_supersedes_cooldown_fallback(
+            applied, cooldown.fallback
+        ):
+            cooldown.fallback = None
+
+    @staticmethod
+    def _live_supersedes_cooldown_fallback(
+        applied: NormalizedMatch, fallback: NormalizedMatch
+    ) -> bool:
+        """True when a durable live apply proves a cooldown's terminal fallback stale.
+
+        Mirrors :meth:`_live_supersedes_fallback` but with ``>=`` rather than a
+        strict ``>``: a live board AT or beyond the fallback's known per-side
+        scores proves the match is genuinely still live, so a pre-recovery
+        terminal fallback is stale. There must be at least one side where the
+        fallback has a known score the live board reached; a NULL applied score
+        on a side the fallback knows proves nothing (keep the fallback).
+        """
+        superseded = False
+        for field in ("score_home", "score_away"):
+            live = getattr(applied, field)
+            captured = getattr(fallback, field)
+            if captured is None:
+                continue
+            if live is None or live < captured:
+                return False
+            superseded = True
+        return superseded
 
     def _reset_resumption_budget(self, match_id: str) -> None:
         """Reset a tracker's retry BUDGET on a live slate reappearance.
@@ -1392,7 +1438,7 @@ class CollectorEngine:
     def _fallback_worth_retaining(fallback: NormalizedMatch) -> bool:
         """True when a fallback carries terminal richness worth keeping.
 
-        A fallback with events, a known score, or a FINISHED status is a
+        A fallback with events, a known score, or a terminal status is a
         best-known terminal state that must survive a bogus live flicker; a
         sparse reset board (no events, NULL scores, non-terminal) carries
         nothing a fresh transition would not rebuild, so its tracker is dropped.
@@ -1401,7 +1447,7 @@ class CollectorEngine:
             fallback.events
             or fallback.score_home is not None
             or fallback.score_away is not None
-            or fallback.status is MatchStatus.FINISHED
+            or _is_terminal(fallback.status)
         )
 
     @staticmethod
@@ -1421,58 +1467,79 @@ class CollectorEngine:
         return False
 
     @staticmethod
-    def _richest_fallback(old: NormalizedMatch | None, new: NormalizedMatch) -> NormalizedMatch:
-        """Score-monotonic comparator picking the richer of two fallbacks (R1).
+    def _accrue_fallback(old: NormalizedMatch | None, new: NormalizedMatch) -> NormalizedMatch:
+        """Field-wise ACCUMULATOR of the best-known fallback state (M1).
 
-        Replaces the old rank-tuple-with-new-wins-on-ties, which let a later
-        SCORE-REGRESSED board (a 0-0 provider reset over a durable 2-0) or a
-        merely-fresher-but-poorer snapshot overwrite the incumbent. Decision, in
-        order:
+        The fallback is no longer "one chosen snapshot" but the accumulated
+        best-known state across every non-live observation seen for the match —
+        replacing the old ``_richest_fallback`` SELECTION comparator, which
+        picked one whole snapshot and so was inherently lossy (a fresh FINISHED
+        board carrying a NULL score would win outright over a 2-0 incumbent and
+        drop the score; a bare higher-score board would win and drop the
+        incumbent's captured events). Each field is merged independently:
 
-        (a) SCORE MONOTONICITY (cumulative facts, the strongest signal): a known
-            per-side score never legitimately drops. If ``new`` is strictly LOWER
-            than ``old`` on EITHER side, keep ``old`` (a 0-0 reset never replaces
-            a 2-0). If ``new`` is strictly HIGHER on a side with no regression on
-            the other, adopt ``new`` (a 2-0 detail supersedes a 1-0 fallback).
-            ``None`` on either side is "unknown", not lower/higher.
-        (b) EVENTS: otherwise prefer the one carrying events (an events-bearing
-            live snapshot can win over a bare terminal board — its live clock is
-            nulled at emission by G0, so nothing leaks).
-        (c) TERMINAL: else prefer a genuinely terminal status.
-        (d) STABILITY: on a full tie keep the INCUMBENT, except adopt ``new`` when
-            it is strictly richer in payload/clock completeness (a known-score
-            count, a present clock, or a larger payload the incumbent lacks).
+        * SCORES: per side the MAX of the known values; a ``None`` NEVER replaces
+          a known value (a FINISHED None-0 board over a 2-0 incumbent yields 2-0).
+        * EVENTS: keep the non-empty list; if both are non-empty keep the LONGER
+          (events accumulate — a later detail is a superset in practice), so a
+          bare board never drops captured events.
+        * STATUS + CLOCK: prefer the genuinely-terminal side's status; the clock
+          (minute/display_clock) follows that status winner when non-null, else
+          fills from the other side's non-null value. If neither side is terminal
+          the newer side's status/clock win.
+        * IDENTITY (home_team/away_team/kickoff_utc): fill ``None``s from either
+          side (the newer value wins when both are present).
+        * PAYLOAD: preserve-richer merge (:func:`is_empty_payload_value`) — a new
+          value wins unless it is empty over a non-empty incumbent value.
         """
         if old is None:
             return new
-        home = CollectorEngine._score_delta(new.score_home, old.score_home)
-        away = CollectorEngine._score_delta(new.score_away, old.score_away)
-        if home < 0 or away < 0:
-            return old
-        if home > 0 or away > 0:
-            return new
-
-        def rank(m: NormalizedMatch) -> tuple[bool, bool, int, bool, int]:
-            return (
-                bool(m.events),
-                _is_terminal(m.status),
-                (m.score_home is not None) + (m.score_away is not None),
-                m.minute is not None or m.display_clock is not None,
-                len(m.payload),
-            )
-
-        return new if rank(new) > rank(old) else old
+        score_home = CollectorEngine._max_known(old.score_home, new.score_home)
+        score_away = CollectorEngine._max_known(old.score_away, new.score_away)
+        if not new.events:
+            events = old.events
+        elif not old.events:
+            events = new.events
+        else:
+            events = new.events if len(new.events) >= len(old.events) else old.events
+        if _is_terminal(new.status) and not _is_terminal(old.status):
+            winner, other = new, old
+        elif _is_terminal(old.status) and not _is_terminal(new.status):
+            winner, other = old, new
+        else:
+            # Both terminal or neither terminal: the newer side wins.
+            winner, other = new, old
+        status = winner.status
+        minute = winner.minute if winner.minute is not None else other.minute
+        display_clock = (
+            winner.display_clock if winner.display_clock is not None else other.display_clock
+        )
+        payload = dict(old.payload)
+        for key, value in new.payload.items():
+            if key not in payload or not is_empty_payload_value(value):
+                payload[key] = value
+        return replace(
+            new,
+            status=status,
+            minute=minute,
+            score_home=score_home,
+            score_away=score_away,
+            display_clock=display_clock,
+            events=events,
+            home_team=new.home_team if new.home_team is not None else old.home_team,
+            away_team=new.away_team if new.away_team is not None else old.away_team,
+            kickoff_utc=new.kickoff_utc if new.kickoff_utc is not None else old.kickoff_utc,
+            payload=payload,
+        )
 
     @staticmethod
-    def _score_delta(new_score: int | None, old_score: int | None) -> int:
-        """+1 if ``new`` strictly exceeds ``old``, -1 if strictly below, else 0.
-
-        ``None`` (unknown) on either side yields 0 — an unknown score is neither a
-        regression nor an advance, so it never vetoes or forces adoption.
-        """
-        if new_score is None or old_score is None:
-            return 0
-        return (new_score > old_score) - (new_score < old_score)
+    def _max_known(a: int | None, b: int | None) -> int | None:
+        """Per-side score max where ``None`` (unknown) never replaces a known value."""
+        if a is None:
+            return b
+        if b is None:
+            return a
+        return max(a, b)
 
     def _transition_base(
         self, match_id: str, tracker: _TransitionTracker
@@ -1585,49 +1652,55 @@ class CollectorEngine:
     ) -> NormalizedMatch | None:
         """Best-known terminal snapshot at give-up — merged, never raw.
 
-        Candidate order: a fresh same-poll TERMINAL scoreboard snapshot, else the
-        tracker's fallback (accepted as the candidate whatever its status; a
-        non-terminal reset is coerced terminal at emission below), else whatever
-        fresh non-terminal snapshot this poll produced, else the in-memory
-        baseline, else the stored row. The candidate is merged over the best base
-        (baseline → fallback → stored row) so known identity and scores are never
-        NULLed by a sparse snapshot; the merge leaves the candidate's own
-        status/clock intact for the decision table to rule on.
+        M2: emission is monotonic across the fresh same-poll snapshot, the
+        tracker's accumulated fallback, AND the stored row — no lossy SELECTION
+        of one. The fresh snapshot and the tracker fallback are accumulated
+        field-wise (:meth:`_accrue_fallback`) into ONE candidate, so a fresh
+        terminal 1-0 board at the cap can never regress a 2-0 that exists only in
+        fallback memory (the old code picked the fresh terminal candidate INSTEAD
+        of the fallback and only maxed against the stored row). When neither
+        exists the candidate falls back to the in-memory baseline, else the stored
+        row. The candidate is then merged over the best remaining base
+        (baseline → fallback → stored row) so known identity/payload are never
+        NULLed by a sparse snapshot; ``_merge_over_base`` only fills ``None``s, so
+        it never regresses the accumulated scores.
 
         The single emission choke point is :meth:`_nonregress_over_stored`, which
-        applies the round-11 give-up decision table (G0 terminality + clock null,
-        G1 score monotonicity, G2 terminal-status precedence, G3 clock
-        monotonicity) against the DURABLY-STORED row — coercing a still-live or
-        reset candidate to a terminal, clock-null close and never regressing a
-        higher already-stored score. That makes ANY upstream retention policy
-        safe by construction; the detection-time and post-apply supersession
-        checks remain only as best-effort hygiene.
+        applies the give-up decision table (G0 terminality + clock null, G1 score
+        monotonicity, G2 terminal-status precedence, G3 clock monotonicity)
+        against the DURABLY-STORED row (fetched once here and threaded through,
+        M7) — coercing a still-live or reset candidate to a terminal, clock-null
+        close and never regressing a higher already-stored score.
         """
         baseline = self._last.get(match_id)
-        stored: NormalizedMatch | None = None
-        if fresh is not None and _is_terminal(fresh.status):
-            snap = fresh
-        elif tracker.fallback is not None:
-            snap = tracker.fallback
-        elif fresh is not None:
-            snap = fresh
-        elif baseline is not None:
-            snap = baseline
-        else:
-            stored = self._stored_match_snapshot(match_id)
-            snap = stored
-        if snap is None:
+        stored = self._stored_match_snapshot(match_id)
+        # M2: accumulate the fresh same-poll snapshot and the tracker fallback
+        # into ONE monotonic candidate — the give-up must not regress below
+        # either. Order (fallback, then fresh) is immaterial to the field-wise
+        # max/terminal-wins merge.
+        candidate = tracker.fallback
+        if fresh is not None:
+            candidate = self._accrue_fallback(candidate, fresh) if candidate is not None else fresh
+        if candidate is None:
+            candidate = baseline
+        if candidate is None:
+            candidate = stored
+        if candidate is None:
             return None
         base = next(
-            (c for c in (baseline, tracker.fallback) if c is not None and c is not snap),
+            (
+                c
+                for c in (baseline, tracker.fallback, stored)
+                if c is not None and c is not candidate
+            ),
             None,
         )
-        if base is None and stored is None:
-            base = self._stored_match_snapshot(match_id)
-        candidate = _merge_over_base(base, snap) if base is not None else snap
-        return self._nonregress_over_stored(match_id, candidate)
+        merged = _merge_over_base(base, candidate) if base is not None else candidate
+        return self._nonregress_over_stored(match_id, merged, stored)
 
-    def _nonregress_over_stored(self, match_id: str, snap: NormalizedMatch) -> NormalizedMatch:
+    def _nonregress_over_stored(
+        self, match_id: str, snap: NormalizedMatch, stored: NormalizedMatch | None = _UNSET
+    ) -> NormalizedMatch:
         """Round-11 give-up decision table: emit a terminal, score/clock-monotonic close.
 
         The single emission choke point. Combines the candidate ``snap`` with the
@@ -1650,13 +1723,19 @@ class CollectorEngine:
            even over a stored terminal (fresher terminal knowledge repairs stale
            stored state); a COERCED candidate defers to a stored TERMINAL status
            (the store knew the real terminal kind).
-        G3 CLOCK: a coerced candidate (clock nulled by G0) fills its clock from a
-           stored TERMINAL row's non-null minute/display_clock; a genuinely-
-           terminal candidate's non-null clock always wins (repairs a stale stored
-           clock). A non-null clock is never overwritten with the other side's
-           null; both null emits null.
+        G3 CLOCK: a null candidate clock fills from a stored TERMINAL row's
+           non-null minute/display_clock — in BOTH branches (M3): a coerced
+           candidate whose clock G0 nulled, AND a genuinely-terminal candidate
+           whose detail nulled the clock (a FINISHED null-clock candidate must
+           not erase a stored terminal row's real 90/FT clock). A non-null
+           candidate clock always stands (repairs a stale stored clock) and is
+           never overwritten with the other side's null; both null emits null.
+
+        ``stored`` is threaded in from :meth:`_build_give_up_snapshot` (M7,
+        fetched once per emission); direct callers omit it and it is fetched here.
         """
-        stored = self._stored_match_snapshot(match_id)
+        if stored is _UNSET:
+            stored = self._stored_match_snapshot(match_id)
         coerced = not _is_terminal(snap.status)
         if coerced:
             status = MatchStatus.FINISHED  # G0
@@ -1670,11 +1749,15 @@ class CollectorEngine:
         stored_away = stored.score_away if stored is not None else None
         score_home = self._non_regressing_score(snap.score_home, stored_home)  # G1
         score_away = self._non_regressing_score(snap.score_away, stored_away)  # G1
-        if coerced and stored is not None and _is_terminal(stored.status):
-            status = stored.status  # G2: stored terminal kind wins over a coerced close
-            if stored.minute is not None:  # G3: fill the nulled clock from stored terminal
+        if stored is not None and _is_terminal(stored.status):
+            if coerced:
+                status = stored.status  # G2: stored terminal kind wins over a coerced close
+            # G3: a null candidate clock (coerced, or a genuinely-terminal
+            # candidate whose detail nulled it) fills from the stored terminal
+            # row; a non-null candidate clock stands.
+            if minute is None and stored.minute is not None:
                 minute = stored.minute
-            if stored.display_clock is not None:
+            if display_clock is None and stored.display_clock is not None:
                 display_clock = stored.display_clock
         return replace(
             snap,

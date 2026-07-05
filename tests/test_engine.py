@@ -4157,39 +4157,54 @@ def test_two_canonical_rank_zero_rows_tied_on_updated_at_resolve_by_match_id(tmp
 # --------------------------------------------------------------------------- #
 
 
-def test_richest_fallback_r1_score_reset_never_replaces_higher_incumbent():
-    """Round-11 R1(a): scores are cumulative facts — a later 0-0 provider reset
-    board must NEVER replace a 2-0 incumbent fallback, even though the reset board
-    is "fresher". The comparator vetoes any per-side regression."""
+def test_accrue_fallback_score_reset_never_regresses_known_incumbent_score():
+    """M1 (was R1(a), updated to ACCUMULATOR semantics): scores are cumulative
+    facts merged field-wise as a per-side MAX — a later 0-0 provider reset board
+    must never drop a 2-0 incumbent. The old SELECTION comparator returned the
+    incumbent whole; the accumulator instead maxes each side (2-0) and, since the
+    incumbent is the terminal side, keeps FINISHED. The result is a fresh merged
+    object, so identity (`is incumbent`) no longer holds — the score is what
+    matters."""
     from gamecollect.engine import CollectorEngine
 
     incumbent = nm("m1", (), status=MatchStatus.FINISHED, minute=None, score_home=2, score_away=0)
     reset_board = nm(
         "m1", (), status=MatchStatus.SCHEDULED, minute=None, score_home=0, score_away=0
     )
-    assert CollectorEngine._richest_fallback(incumbent, reset_board) is incumbent, (
-        "a 0-0 reset must not replace a 2-0 fallback (R1 score monotonicity)"
+    merged = CollectorEngine._accrue_fallback(incumbent, reset_board)
+    assert (merged.score_home, merged.score_away) == (2, 0), (
+        "a 0-0 reset must not regress the 2-0 known score (M1 per-side max)"
+    )
+    assert merged.status is MatchStatus.FINISHED, (
+        "the genuinely-terminal side's status wins the accumulation (M1)"
     )
 
 
-def test_richest_fallback_r1_strictly_higher_score_supersedes():
-    """Round-11 R1(a): a strictly higher known score on a side (with no regression
-    on the other) is a cumulative advance and supersedes the incumbent — a 2-0
-    detail replaces a 1-0 fallback."""
+def test_accrue_fallback_strictly_higher_score_advances_via_max():
+    """M1 (was R1(a), updated): a higher known score on a side advances the
+    accumulated fallback — the per-side max lifts 1-0 to 2-0. With neither side
+    terminal the newer side's status/clock win (IN_PLAY, minute 52)."""
     from gamecollect.engine import CollectorEngine
 
     old = nm("m1", (), status=MatchStatus.IN_PLAY, minute=40, score_home=1, score_away=0)
     new = nm("m1", (), status=MatchStatus.IN_PLAY, minute=52, score_home=2, score_away=0)
-    assert CollectorEngine._richest_fallback(old, new) is new, (
-        "a strictly higher score must supersede the incumbent fallback (R1)"
+    merged = CollectorEngine._accrue_fallback(old, new)
+    assert (merged.score_home, merged.score_away) == (2, 0), (
+        "the per-side max must advance the score to 2-0 (M1)"
+    )
+    assert merged.status is MatchStatus.IN_PLAY and merged.minute == 52, (
+        "with neither side terminal the newer status/clock win (M1)"
     )
 
 
-def test_richest_fallback_r1_prefers_events_without_clock_leakage(tmp_path):
-    """Round-11 R1(b): at equal scores an events-carrying live snapshot is
-    preferred over a bare terminal board (events rank before terminal). And there
-    is NO live-clock leakage: when that live fallback becomes the give-up
-    candidate, G0 coerces it terminal and nulls the clock at emission."""
+def test_accrue_fallback_keeps_events_from_either_side_and_terminal_status():
+    """M1 (was R1(b), updated to ACCUMULATOR semantics): events are merged
+    field-wise, not selected whole. Accumulating a bare terminal board with an
+    events-carrying live board keeps the events (the non-empty list) AND the
+    per-side score max AND the genuinely-terminal side's status — none of the
+    three is dropped, which the old SELECTION comparator could not guarantee (it
+    returned one snapshot and lost the other's contributions). The clock follows
+    the M1 rule: the terminal winner's null clock fills from the other side."""
     from gamecollect.engine import CollectorEngine
 
     bare_ft = nm(
@@ -4210,25 +4225,263 @@ def test_richest_fallback_r1_prefers_events_without_clock_leakage(tmp_path):
         score_away=0,
         display_clock="48'",
     )
-    chosen = CollectorEngine._richest_fallback(bare_ft, live_with_events)
-    assert chosen is live_with_events, (
-        "an events-carrying snapshot beats a bare terminal board (R1 b)"
+    merged = CollectorEngine._accrue_fallback(bare_ft, live_with_events)
+    assert merged.events == list(live_with_events.events), (
+        "the captured events must survive accumulation with a bare board (M1)"
+    )
+    assert (merged.score_home, merged.score_away) == (1, 0), "scores maxed per side (M1)"
+    assert merged.status is MatchStatus.FINISHED, (
+        "the genuinely-terminal side's status wins over the live side (M1)"
+    )
+    assert merged.minute == 48 and merged.display_clock == "48'", (
+        "the terminal winner's null clock fills from the other side's non-null (M1)"
     )
 
-    # No clock leakage: emit through the decision table against an empty store.
+
+# --------------------------------------------------------------------------- #
+# Round-12 field-wise fallback accumulator (M1) + give-up monotonic across
+# candidate/fallback/stored (M2) + G3 null-clock fill both branches (M3) +
+# sparse-vs-merged accrual (M4) + superseded cooldown fallback drop (M5)
+# --------------------------------------------------------------------------- #
+
+
+def test_accrue_fallback_finished_null_score_never_replaces_known_incumbent():
+    """M1 reviewer probe: an ``old`` 2-0 incumbent vs a ``new`` FINISHED board
+    whose home score is NULL (a terminal board that lost the home tally) must
+    yield 2-0, not None-0 — a ``None`` never replaces a known per-side value. The
+    terminal side's status/clock win (FINISHED / FT)."""
+    from gamecollect.engine import CollectorEngine
+
+    incumbent = nm(
+        "m1",
+        (),
+        status=MatchStatus.IN_PLAY,
+        minute=52,
+        score_home=2,
+        score_away=0,
+        display_clock="52'",
+    )
+    finished_null = nm(
+        "m1",
+        (),
+        status=MatchStatus.FINISHED,
+        minute=None,
+        score_home=None,
+        score_away=0,
+        display_clock="FT",
+    )
+    merged = CollectorEngine._accrue_fallback(incumbent, finished_null)
+    assert (merged.score_home, merged.score_away) == (2, 0), (
+        "a NULL new home score must not erase the known 2 (M1 per-side max)"
+    )
+    assert merged.status is MatchStatus.FINISHED and merged.display_clock == "FT", (
+        "the genuinely-terminal side's status and clock win (M1)"
+    )
+
+
+def test_accrue_fallback_bare_higher_board_advances_score_and_keeps_events():
+    """M1 reviewer probe: an events-bearing 1-0 incumbent accumulated with a bare
+    (event-less) higher 2-0 board must yield 2-0 WITH the captured events — the
+    score advances via per-side max AND the events survive (the bare board's empty
+    list never drops them)."""
+    from gamecollect.engine import CollectorEngine
+
+    events_incumbent = nm(
+        "m1",
+        (ev(0, "goal", minute=30),),
+        status=MatchStatus.IN_PLAY,
+        minute=40,
+        score_home=1,
+        score_away=0,
+    )
+    bare_higher = nm(
+        "m1",
+        (),
+        status=MatchStatus.IN_PLAY,
+        minute=70,
+        score_home=2,
+        score_away=0,
+    )
+    merged = CollectorEngine._accrue_fallback(events_incumbent, bare_higher)
+    assert (merged.score_home, merged.score_away) == (2, 0), "score advances to 2-0 (M1)"
+    assert merged.events == list(events_incumbent.events), (
+        "the bare board must not drop the incumbent's captured events (M1)"
+    )
+
+
+def test_m2_give_up_monotonic_across_fresh_terminal_candidate_and_fallback(tmp_path):
+    """M2 reviewer probe: a fresh same-poll TERMINAL 1-0 board at the cap combined
+    with a 2-0 that exists only in fallback memory must emit 2-0 — the give-up
+    accumulates the fresh candidate WITH the fallback (not selecting the fresh
+    candidate INSTEAD of it, which the old code did, losing the fallback's 2-0)."""
+    from gamecollect.engine import CollectorEngine, _TransitionTracker
+
     db = tmp_path / "engine.db"
     provider = ScriptedDetailProvider([])
     engine = CollectorEngine(make_pack(provider), str(db), SOURCE, 0.01, provider=provider)
+    fallback_2_0 = nm(
+        "m1",
+        (),
+        status=MatchStatus.IN_PLAY,
+        minute=80,
+        score_home=2,
+        score_away=0,
+    )
+    fresh_terminal_1_0 = nm(
+        "m1",
+        (),
+        status=MatchStatus.FINISHED,
+        minute=None,
+        score_home=1,
+        score_away=0,
+        display_clock="FT",
+    )
+    tracker = _TransitionTracker(fallback=fallback_2_0)
     try:
-        emitted = engine._nonregress_over_stored("m1", chosen)
+        give_up = engine._build_give_up_snapshot("m1", tracker, fresh=fresh_terminal_1_0)
     finally:
         engine.close()
-    assert emitted.status is MatchStatus.FINISHED, (
-        "the live fallback is coerced terminal at emission"
+    assert give_up is not None and give_up.score_home == 2, (
+        "the fresh terminal 1-0 must not regress the fallback-only 2-0 (M2)"
     )
-    assert emitted.minute is None and emitted.display_clock is None, (
-        "the live 48' clock must NOT leak into the emitted give-up (G0)"
+    assert give_up.status is MatchStatus.FINISHED, "the emission is terminal (G0/G2)"
+
+
+def test_m3_genuine_terminal_null_clock_candidate_keeps_stored_terminal_clock(tmp_path):
+    """M3 reviewer probe: a stored FINISHED 90/FT row and a genuinely-terminal
+    candidate with NULL minute/display_clock must emit 90/FT — a null candidate
+    clock fills from the stored terminal row in the NON-coerced branch too (the
+    old code only filled in the coerced branch, so a null-clock terminal candidate
+    erased the stored 90/FT)."""
+    from gamecollect.db.connection import connect
+    from gamecollect.engine import CollectorEngine
+
+    db = tmp_path / "engine.db"
+    conn = connect(str(db), side_table_ddl=FAKE_SIDE_TABLE_DDL)
+    try:
+        with conn:
+            _full_stored_row(
+                conn,
+                "m1",
+                status=MatchStatus.FINISHED,
+                minute=90,
+                score_home=2,
+                score_away=1,
+                display_clock="FT",
+            )
+    finally:
+        conn.close()
+
+    provider = ScriptedDetailProvider([])
+    engine = CollectorEngine(
+        make_pack(provider, seed_match=default_seed_match), str(db), SOURCE, 0.01, provider=provider
     )
+    candidate = nm(
+        "m1",
+        (),
+        status=MatchStatus.FINISHED,
+        minute=None,
+        score_home=2,
+        score_away=1,
+        display_clock=None,
+    )
+    try:
+        emitted = engine._nonregress_over_stored("m1", candidate)
+    finally:
+        engine.close()
+    assert emitted.status is MatchStatus.FINISHED
+    assert emitted.minute == 90 and emitted.display_clock == "FT", (
+        "a null candidate clock must fill from the stored terminal row, not erase it (M3)"
+    )
+
+
+def test_m4_non_cooling_hydration_accrues_detail_merged_not_sparse_slate_board(tmp_path):
+    """M4 reviewer probe: on a non-cooling live→non-terminal (SCHEDULED reset)
+    hydration the fallback must accrue the detail-MERGED snapshot, not the sparse
+    slate board. Here the slate board carries no score but the detail reports 2-0;
+    the accrued fallback (and thus the give-up) must carry the 2-0."""
+    from gamecollect.engine import CollectorEngine
+
+    db = tmp_path / "engine.db"
+    baseline_live = nm("m1", (), status=MatchStatus.IN_PLAY, minute=40, score_home=1, score_away=0)
+    slate_reset = nm(
+        "m1", (), status=MatchStatus.SCHEDULED, minute=None, score_home=None, score_away=None
+    )
+    detail_2_0 = nm("m1", (), status=MatchStatus.SCHEDULED, minute=None, score_home=2, score_away=0)
+    provider = ScriptedDetailProvider([([slate_reset], {"m1": detail_2_0})])
+    engine = CollectorEngine(make_pack(provider), str(db), SOURCE, 0.01, provider=provider)
+    engine._restart_scan_done = True
+    engine._last["m1"] = baseline_live  # was_live → in_transition, NOT cooling
+    try:
+        engine._fetch_poll_snapshots()
+        tracker = engine._transitions["m1"]
+        assert tracker.fallback is not None and tracker.fallback.score_home == 2, (
+            "the detail-merged 2-0 must be accrued, not the sparse slate board (M4)"
+        )
+        give_up = engine._build_give_up_snapshot("m1", tracker, fresh=None)
+    finally:
+        engine.close()
+    assert give_up is not None and give_up.score_home == 2, (
+        "the 2-0 detail observed on the SCHEDULED reset must survive to give-up (M4)"
+    )
+
+
+def test_m5_durable_live_apply_drops_superseded_cooldown_terminal_fallback(tmp_path):
+    """M5 reviewer probe: a bogus pre-recovery terminal fallback (FINISHED 1-0 min
+    88) on a cooldown entry must be DROPPED when a durable IN_PLAY 2-1 apply clears
+    the gate — the live state supersedes it (per-side scores >= the fallback's),
+    so it cannot later seed a tracker whose stale terminal status/clock wins at
+    give-up. A live apply that does NOT reach the fallback's score keeps it."""
+    from gamecollect.engine import CollectorEngine, _Cooldown
+
+    db = tmp_path / "engine.db"
+    provider = ScriptedDetailProvider([])
+    engine = CollectorEngine(make_pack(provider), str(db), SOURCE, 0.01, provider=provider)
+    stale_terminal = nm(
+        "m1",
+        (),
+        status=MatchStatus.FINISHED,
+        minute=88,
+        score_home=1,
+        score_away=0,
+        display_clock="88'",
+    )
+    try:
+        engine._cooldowns["m1"] = _Cooldown(remaining=8, epoch=1, fallback=stale_terminal)
+        applied_live = nm(
+            "m1", (), status=MatchStatus.IN_PLAY, minute=70, score_home=2, score_away=1
+        )
+        engine._on_durable_snapshot(
+            "m1", applied_live, live_resumptions={"m1"}, state_advanced=True
+        )
+        cooldown = engine._cooldowns["m1"]
+        assert cooldown.fallback is None, (
+            "a durable live apply at/beyond the fallback's scores must drop the stale "
+            "terminal fallback (M5)"
+        )
+        assert not engine._cooling_down("m1") and cooldown.epoch == 1, (
+            "the gate is still cleared and the epoch/backoff memory preserved (L1)"
+        )
+
+        # A live apply that does NOT reach the fallback's known score keeps it.
+        engine._cooldowns["m2"] = _Cooldown(
+            remaining=8,
+            epoch=1,
+            fallback=nm(
+                "m2", (), status=MatchStatus.FINISHED, minute=88, score_home=3, score_away=0
+            ),
+        )
+        engine._on_durable_snapshot(
+            "m2",
+            nm("m2", (), status=MatchStatus.IN_PLAY, minute=70, score_home=1, score_away=0),
+            live_resumptions={"m2"},
+            state_advanced=True,
+        )
+        assert engine._cooldowns["m2"].fallback is not None, (
+            "a live apply below the fallback's score must NOT drop it (M5)"
+        )
+    finally:
+        engine.close()
 
 
 def test_r2_slate_board_on_fetch_failure_branch_survives_into_post_cooldown_give_up(tmp_path):
