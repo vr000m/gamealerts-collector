@@ -426,6 +426,76 @@ class TestSeedOrReconcileMatch:
             "canonical schedule name must win over the raw provider payload key"
         )
 
+    def test_reversed_provider_orientation_flips_home_away_indexed_fields(self, db):
+        import json
+        from dataclasses import replace
+
+        conn, writer = db
+        self._seed_schedule_row(writer)
+        match = replace(
+            _match(home="Turkey", away="Australia"),
+            score_home=2,
+            score_away=3,
+            payload={
+                "score_ht_home": 1,
+                "score_ht_away": 0,
+                "score_pen_home": 4,
+                "score_pen_away": 5,
+                "pen_winner_side": "away",
+                "stats": [{"team": "Turkey", "shots": 9}],
+            },
+        )
+
+        seeded = seed_or_reconcile_match(conn, writer, match, PROVIDER)
+        assert seeded == self.CANONICAL
+
+        row = get_state(conn, self.CANONICAL)
+        assert row["score_home"] == 3
+        assert row["score_away"] == 2
+        payload = json.loads(row["payload"])
+        assert payload["home_team"] == "Australia"
+        assert payload["away_team"] == "Turkey"
+        assert payload["score_ht_home"] == 0
+        assert payload["score_ht_away"] == 1
+        assert payload["score_pen_home"] == 5
+        assert payload["score_pen_away"] == 4
+        assert payload["pen_winner_side"] == "home"
+        assert payload["stats"] == [{"team": "Turkey", "shots": 9}]
+
+    def test_aligned_provider_orientation_keeps_home_away_indexed_fields(self, db):
+        import json
+        from dataclasses import replace
+
+        conn, writer = db
+        self._seed_schedule_row(writer)
+        match = replace(
+            _match(home="Australia", away="Türkiye"),
+            score_home=3,
+            score_away=2,
+            payload={
+                "score_ht_home": 2,
+                "score_ht_away": 1,
+                "score_pen_home": 5,
+                "score_pen_away": 4,
+                "pen_winner_side": "home",
+            },
+        )
+
+        seeded = seed_or_reconcile_match(conn, writer, match, PROVIDER)
+        assert seeded == self.CANONICAL
+
+        row = get_state(conn, self.CANONICAL)
+        assert row["score_home"] == 3
+        assert row["score_away"] == 2
+        payload = json.loads(row["payload"])
+        assert payload["home_team"] == "Australia"
+        assert payload["away_team"] == "Turkey"
+        assert payload["score_ht_home"] == 2
+        assert payload["score_ht_away"] == 1
+        assert payload["score_pen_home"] == 5
+        assert payload["score_pen_away"] == 4
+        assert payload["pen_winner_side"] == "home"
+
     def test_falls_back_to_unreconciled_strip_row(self, db):
         conn, writer = db
         seeded = seed_or_reconcile_match(conn, writer, _match(), PROVIDER)
@@ -729,6 +799,48 @@ class TestAdoptionPreservesStubPayload:
         assert payload["round_name"] == "Group B", "canonical schedule-owned keys win"
         assert payload["home_team"] == "Australia"
         assert payload["away_team"] == "Turkey", "canonical team names win over stub names"
+
+    def test_reversed_stub_payload_is_flipped_when_adopted(self, db):
+        import json
+        from dataclasses import replace
+
+        conn, writer = db
+        rich = replace(
+            _match(home="Turkey", away="Australia"),
+            score_home=2,
+            score_away=3,
+            payload={
+                "score_ht_home": 1,
+                "score_ht_away": 0,
+                "score_pen_home": 4,
+                "score_pen_away": 5,
+                "pen_winner_side": "away",
+            },
+        )
+        assert seed_or_reconcile_match(conn, writer, rich, PROVIDER) == self.STUB
+
+        writer.upsert_match(
+            {
+                "match_id": self.CANONICAL,
+                "status": "SCHEDULED",
+                "kickoff_utc": "2026-06-14T04:00:00+00:00",
+                "payload": {"home_team": "Australia", "away_team": "Turkey"},
+            }
+        )
+        sparse = replace(rich, payload={})
+        assert seed_or_reconcile_match(conn, writer, sparse, PROVIDER) == self.CANONICAL
+
+        row = get_state(conn, self.CANONICAL)
+        assert row["score_home"] == 3
+        assert row["score_away"] == 2
+        payload = json.loads(row["payload"])
+        assert payload["home_team"] == "Australia"
+        assert payload["away_team"] == "Turkey"
+        assert payload["score_ht_home"] == 0
+        assert payload["score_ht_away"] == 1
+        assert payload["score_pen_home"] == 5
+        assert payload["score_pen_away"] == 4
+        assert payload["pen_winner_side"] == "home"
 
 
 class TestAdoptionRefusalClearsMap:

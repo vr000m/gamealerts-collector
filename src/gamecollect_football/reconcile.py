@@ -53,6 +53,11 @@ log = logging.getLogger(__name__)
 # Default ±window (minutes) for the kickoff-instant reconciliation.
 _KICKOFF_WINDOW_MINUTES = 180.0
 
+_HOME_AWAY_PAYLOAD_PAIRS = (
+    ("score_ht_home", "score_ht_away"),
+    ("score_pen_home", "score_pen_away"),
+)
+
 # ---------------------------------------------------------------------------
 # Team-name aliasing
 # ---------------------------------------------------------------------------
@@ -478,6 +483,57 @@ def _merge_preserving_richer(stored: dict[str, Any], incoming: dict[str, Any]) -
             stored[key] = value
 
 
+def _is_reverse_oriented(
+    match: NormalizedMatch, schedule_home: str | None, schedule_away: str | None
+) -> bool:
+    if not schedule_home or not schedule_away or not match.home_team or not match.away_team:
+        return False
+
+    schedule_home_key = canonical_team_name(schedule_home)
+    schedule_away_key = canonical_team_name(schedule_away)
+    if schedule_home_key == schedule_away_key:
+        return False
+
+    provider_home_key = canonical_team_name(match.home_team)
+    provider_away_key = canonical_team_name(match.away_team)
+    return provider_home_key == schedule_away_key and provider_away_key == schedule_home_key
+
+
+def _flip_home_away_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    flipped = dict(payload)
+    for home_key, away_key in _HOME_AWAY_PAYLOAD_PAIRS:
+        home_present = home_key in flipped
+        away_present = away_key in flipped
+        if not home_present and not away_present:
+            continue
+
+        home_value = flipped[home_key] if home_present else None
+        away_value = flipped[away_key] if away_present else None
+        if away_present:
+            flipped[home_key] = away_value
+        else:
+            flipped.pop(home_key, None)
+        if home_present:
+            flipped[away_key] = home_value
+        else:
+            flipped.pop(away_key, None)
+
+    side = flipped.get("pen_winner_side")
+    if side == "home":
+        flipped["pen_winner_side"] = "away"
+    elif side == "away":
+        flipped["pen_winner_side"] = "home"
+    return flipped
+
+
+def _home_away_view(
+    match: NormalizedMatch, reverse_oriented: bool
+) -> tuple[Any, Any, dict[str, Any]]:
+    if not reverse_oriented:
+        return match.score_home, match.score_away, dict(match.payload)
+    return match.score_away, match.score_home, _flip_home_away_payload(match.payload)
+
+
 def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
     row = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
@@ -491,7 +547,12 @@ _MIGRATABLE_SIDE_TABLES = ("football_stats", "football_lineups")
 
 
 def _adopt_stub_rows(
-    conn: sqlite3.Connection, source: str, stub_id: str, canonical_id: str
+    conn: sqlite3.Connection,
+    source: str,
+    stub_id: str,
+    canonical_id: str,
+    *,
+    reverse_oriented: bool = False,
 ) -> bool:
     """Migrate a source-qualified stub's child rows onto the canonical id.
 
@@ -556,7 +617,10 @@ def _adopt_stub_rows(
     # with preserve-richer — canonical non-empty values (schedule-owned keys,
     # canonical team names) win, while stub-collected keys the canonical row
     # lacks (or holds empty) survive the adoption.
-    merged_payload = dict(reader.get_stored_payload(conn, stub_id))
+    stub_payload = reader.get_stored_payload(conn, stub_id)
+    if reverse_oriented:
+        stub_payload = _flip_home_away_payload(stub_payload)
+    merged_payload = dict(stub_payload)
     _merge_preserving_richer(merged_payload, reader.get_stored_payload(conn, canonical_id))
     with conn:
         conn.execute(
@@ -632,6 +696,12 @@ def seed_or_reconcile_match(
     if canonical_id is None:
         return register_unreconciled_match(conn, writer, match)
 
+    stored_payload = reader.get_stored_payload(conn, canonical_id)
+    schedule_home = stored_payload.get("home_team")
+    schedule_away = stored_payload.get("away_team")
+    reverse_oriented = _is_reverse_oriented(match, schedule_home, schedule_away)
+    score_home, score_away, match_payload = _home_away_view(match, reverse_oriented)
+
     # Late canonical reconciliation: if early polls collected on a
     # source-qualified stub (schedule row absent then) and the canonical row
     # appeared later, adopt the stub's events/mappings/side-table rows onto
@@ -639,7 +709,13 @@ def seed_or_reconcile_match(
     # both-have-events conflict, _adopt_stub_rows logs ERROR and we keep
     # collecting on the stub (never corrupt two timelines).
     stub_id = f"{writer.source}:{match.match_id}"
-    if canonical_id != stub_id and not _adopt_stub_rows(conn, writer.source, stub_id, canonical_id):
+    if canonical_id != stub_id and not _adopt_stub_rows(
+        conn,
+        writer.source,
+        stub_id,
+        canonical_id,
+        reverse_oriented=reverse_oriented,
+    ):
         # Split-brain guard: collection is staying on the stub, so NO
         # provider_match_map entry may exist — a canonical entry would point
         # map-following readers at a frozen timeline while live history lands
@@ -671,13 +747,11 @@ def seed_or_reconcile_match(
         writer.map_provider_match(provider, match.match_id, canonical_id)
 
     payload = reader.get_stored_payload(conn, canonical_id)
-    schedule_home = payload.get("home_team")
-    schedule_away = payload.get("away_team")
     # One merge policy everywhere: preserve-richer, same as
     # register_unreconciled_match. A plain dict.update here would let a
     # sparse snapshot clobber richer stored values on every poll after the
     # first (the register-side guard only protects the registration path).
-    _merge_preserving_richer(payload, match.payload)
+    _merge_preserving_richer(payload, match_payload)
     # Schedule-seeded canonical names win over any provider-supplied payload
     # keys; fill from the (display-folded) snapshot names only when the
     # resolved row lacks them (e.g. a direct-seed row without payload names).
@@ -696,8 +770,8 @@ def seed_or_reconcile_match(
             "payload": payload,
             "status": match.status.value,
             "minute": match.minute,
-            "score_home": match.score_home,
-            "score_away": match.score_away,
+            "score_home": score_home,
+            "score_away": score_away,
             "display_clock": match.display_clock,
         }
     )
