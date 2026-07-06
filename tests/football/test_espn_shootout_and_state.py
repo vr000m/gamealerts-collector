@@ -99,6 +99,23 @@ class TestPenScore:
         assert _pen_score({"shootoutScore": True}) is None
         assert _pen_score({"shootoutScore": "4"}) is None
 
+    def test_non_integral_float_rejected_not_truncated(self):
+        # int(2.9) == 2 would silently persist a wrong tally — treat as absent.
+        assert _pen_score({"shootoutScore": 2.9}) is None
+        assert _pen_score({"shootoutScore": 2.5}) is None
+
+    def test_negative_rejected(self):
+        assert _pen_score({"shootoutScore": -1}) is None
+        assert _pen_score({"shootoutScore": -1.0}) is None
+
+    def test_non_finite_rejected_not_raised(self):
+        # int(nan) raises ValueError and int(inf) raises OverflowError — neither
+        # is mapped to ShapeDriftError by the fetch wrappers, so they must be
+        # rejected here rather than escaping the provider seam and crashing.
+        assert _pen_score({"shootoutScore": float("nan")}) is None
+        assert _pen_score({"shootoutScore": float("inf")}) is None
+        assert _pen_score({"shootoutScore": float("-inf")}) is None
+
 
 # ---------------------------------------------------------------------------
 # _extract_shootout: both-sides gate, winner derivation, disagreement logging
@@ -271,6 +288,17 @@ class TestAdapterEndToEnd:
         assert match.payload["score_pen_home"] == 2  # 2.0 float → int
         assert match.payload["score_pen_away"] == 4
         assert match.payload["pen_winner_side"] == "away"
+
+    def test_malformed_pen_score_degrades_without_crashing_the_seam(self):
+        # A non-finite shootoutScore must not escape as ValueError/OverflowError
+        # through the fetch wrapper; the both-sides gate suppresses the shootout.
+        data = _summary_shootout()
+        data["header"]["competitions"][0]["competitors"][0]["shootoutScore"] = float("nan")
+        adapter = ESPNAdapter(http_get=lambda url, params=None: data)
+        match = adapter.fetch_match_detail("760499")  # must not raise
+        assert match.payload["score_pen_home"] is None
+        assert match.payload["score_pen_away"] is None
+        assert match.payload["pen_winner_side"] is None
 
     def test_non_shootout_summary_emits_none_pen_keys(self):
         data = _summary_shootout()

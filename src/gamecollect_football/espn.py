@@ -24,6 +24,7 @@ from __future__ import annotations
 import http.client
 import json
 import logging
+import math
 import urllib.error
 import urllib.request
 from collections.abc import Callable
@@ -213,11 +214,24 @@ def _pen_score(competitor: dict) -> int | None:
     ESPN exposes it as ``competitor.shootoutScore``: a float in the summary
     endpoint (``2.0``/``4.0``), an int in the scoreboard endpoint (``2``/``4``),
     and ABSENT on non-shootout matches (never ``0.0``). Accept both int and
-    float, guard None/bool/non-numeric, and cast to int. Returns None when
-    absent or malformed so the "shootout present" gate is presence-based.
+    float, guard None/bool/non-numeric.
+
+    A pen tally is a non-negative WHOLE number, so numeric drift that is not one
+    is treated as absent (``None``) rather than cast blindly — the same posture
+    the sibling ``int(competitor["score"])`` parse takes for a malformed score:
+    ``int(2.9)`` would silently persist a truncated ``2``, and ``int(nan)`` /
+    ``int(inf)`` raise ``ValueError``/``OverflowError`` that the fetch wrappers do
+    NOT map to ``ShapeDriftError`` (they catch only KeyError/IndexError/TypeError/
+    AttributeError), so an unguarded cast could escape the provider seam and crash
+    the poll. Returning None here lets the both-sides presence gate suppress the
+    half/garbage shootout instead.
     """
     raw = competitor.get("shootoutScore")
     if raw is None or isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    if isinstance(raw, float) and (not math.isfinite(raw) or not raw.is_integer()):
+        return None
+    if raw < 0:
         return None
     return int(raw)
 
