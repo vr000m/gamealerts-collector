@@ -184,15 +184,39 @@ def _is_terminal(status: MatchStatus) -> bool:
     return status in _TERMINAL_STATUSES
 
 
+def _merge_payload_preserving_richer(base: dict, incoming: dict) -> dict:
+    """Merge ``incoming`` over ``base`` with the preserve-richer rule.
+
+    A non-empty ``incoming`` value always wins, and a key absent from ``base`` is
+    always added, but an explicitly-empty ``incoming`` value
+    (:func:`is_empty_payload_value` — ``None``/``""``/``[]``/``{}``) NEVER clobbers
+    a key ``base`` already carries with a non-empty value. Shared by
+    :func:`_merge_detail` (same-poll scoreboard→detail) and
+    :func:`_merge_over_base` (cross-poll base→snapshot) so a cumulative sport-extra
+    the scoreboard populated (e.g. a live penalty-shootout score the summary
+    endpoint has not caught up on) is not lost when the other snapshot omits it.
+    """
+    merged = dict(base)
+    for key, value in incoming.items():
+        if key not in merged or not is_empty_payload_value(value):
+            merged[key] = value
+    return merged
+
+
 def _merge_detail(scoreboard: NormalizedMatch, detail: NormalizedMatch) -> NormalizedMatch:
     """Merge a detail snapshot over its scoreboard snapshot, field by field.
 
-    Payload keys merge with detail winning; identity fields and scores take
-    the detail value unless it is ``None``, in which case the scoreboard value
-    fills it — a detail endpoint omitting ``kickoff_utc``/``home_team``/
-    ``away_team`` must not wipe stored identity to NULL (or make ``seed_match``
-    return ``None`` and drop the poll's events), and a detail omitting
-    ``score_home``/``score_away`` must not null a known score (scores are
+    Payload keys merge PRESERVE-RICHER (:func:`_merge_payload_preserving_richer`):
+    a detail value wins whenever it is non-empty, but a detail that supplies an
+    empty value for a key the scoreboard already populated does NOT wipe it — a
+    cumulative sport-extra like a live penalty-shootout score, read on the
+    scoreboard path, must survive a summary poll that has not yet caught up (or a
+    version-skewed detail that omits ``shootoutScore``). Identity fields and
+    scores take the detail value unless it is ``None``, in which case the
+    scoreboard value fills it — a detail endpoint omitting ``kickoff_utc``/
+    ``home_team``/``away_team`` must not wipe stored identity to NULL (or make
+    ``seed_match`` return ``None`` and drop the poll's events), and a detail
+    omitting ``score_home``/``score_away`` must not null a known score (scores are
     cumulative facts; only ``minute``/``display_clock`` are legitimately
     nulled at HT/FT, so those stay detail-wins including ``None``).
 
@@ -202,8 +226,7 @@ def _merge_detail(scoreboard: NormalizedMatch, detail: NormalizedMatch) -> Norma
     by definition) and its non-``None`` scores. The detail's events/payload
     are still taken — that is the whole point of hydrating the transition poll.
     """
-    payload = dict(scoreboard.payload)
-    payload.update(detail.payload)
+    payload = _merge_payload_preserving_richer(scoreboard.payload, detail.payload)
     fills = {
         name: getattr(scoreboard, name)
         for name in _MERGE_FILL_FIELDS
@@ -235,21 +258,18 @@ def _merge_over_base(base: NormalizedMatch, snapshot: NormalizedMatch) -> Normal
     give-up). The base underlays the payload and fills identity and score
     ``None``s, exactly like the scoreboard does in :func:`_merge_detail`.
 
-    The payload merge is PRESERVE-RICHER, not last-wins: an incoming key only
-    overwrites the base when its value is non-empty, or the base doesn't have
-    the key at all — an explicitly-present empty value (``""``/``None``/``[]``/
-    ``{}``) in a sparse snapshot must not clobber a richer base payload value.
-    This mirrors the DB-side ``_merge_preserving_richer`` in
-    ``gamecollect_football.reconcile`` (which protects the stored row); this
-    in-memory baseline needs the same guarantee independently, since a
-    baseline/fallback carried between polls is not read back through that DB
-    path. (:func:`_merge_detail` stays last-wins by design — detail-wins is
-    intentional there and is NOT touched by this rule.)
+    The payload merge is PRESERVE-RICHER, not last-wins
+    (:func:`_merge_payload_preserving_richer`): an incoming key only overwrites
+    the base when its value is non-empty, or the base doesn't have the key at all
+    — an explicitly-present empty value (``""``/``None``/``[]``/``{}``) in a
+    sparse snapshot must not clobber a richer base payload value. This mirrors the
+    DB-side ``_merge_preserving_richer`` in ``gamecollect_football.reconcile``
+    (which protects the stored row); this in-memory baseline needs the same
+    guarantee independently, since a baseline/fallback carried between polls is
+    not read back through that DB path. (:func:`_merge_detail` shares the same
+    preserve-richer helper for its payload merge.)
     """
-    payload = dict(base.payload)
-    for key, value in snapshot.payload.items():
-        if key not in payload or not is_empty_payload_value(value):
-            payload[key] = value
+    payload = _merge_payload_preserving_richer(base.payload, snapshot.payload)
     fills = {
         name: getattr(base, name) for name in _MERGE_FILL_FIELDS if getattr(snapshot, name) is None
     }

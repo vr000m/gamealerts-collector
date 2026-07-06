@@ -60,9 +60,12 @@ def default_seed_match(
 
     payload = reader.get_stored_payload(conn, match.match_id)
     # Preserve-richer merge (NOT plain dict.update): a sparse snapshot's empty
-    # value must never clobber a richer stored value. _merge_detail upstream is
-    # last-wins, so an empty payload value can legitimately reach here; the
-    # football reconciler guards the same way via _merge_preserving_richer.
+    # value must never clobber a richer STORED value. Even though the in-memory
+    # merges (_merge_detail/_merge_over_base) already preserve-richer, a provider
+    # can still emit a genuinely-empty payload value for a key an earlier poll
+    # stored non-empty, so this DB-write guard backstops the stored row across
+    # polls independently; the football reconciler guards the same way via
+    # _merge_preserving_richer.
     for key, value in match.payload.items():
         if key not in payload or not is_empty_payload_value(value):
             payload[key] = value

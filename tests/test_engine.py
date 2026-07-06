@@ -2129,9 +2129,9 @@ def test_default_seed_persists_identity_and_payload_corrections(tmp_path):
 def test_default_seed_empty_payload_value_does_not_clobber_richer_stored(tmp_path):
     """Preserve-richer regression: default_seed_match must merge like the football
     reconciler, not with a plain dict.update(). A first poll stores a rich payload
-    value; a later sparse poll carrying an EMPTY value for the same key (reachable
-    because _merge_detail upstream is last-wins) must NOT overwrite the stored
-    non-empty value. A non-empty later value still wins (correction path above)."""
+    value; a later sparse poll carrying an EMPTY value for the same key (a provider
+    can emit one for a key an earlier poll stored non-empty) must NOT overwrite the
+    stored non-empty value. A non-empty later value still wins (correction path above)."""
     from dataclasses import replace
 
     from gamecollect.engine import CollectorEngine
@@ -3530,6 +3530,77 @@ def test_merge_over_base_non_empty_snapshot_value_still_wins():
 
     assert merged.payload["venue"] == "Lumen Field"
     assert merged.payload["possession"] == {"home": 55}
+
+
+# --------------------------------------------------------------------------- #
+# Adversarial-review finding: _merge_detail must not lose a scoreboard-carried
+# cumulative sport-extra (live penalty-shootout score) when the same-poll detail
+# snapshot omits it — the scoreboard path reads shootoutScore, and a summary that
+# has not caught up emits score_pen_* = None, which last-wins would have wiped.
+# --------------------------------------------------------------------------- #
+
+
+def test_merge_detail_preserves_scoreboard_shootout_when_detail_omits_it():
+    """Live-shootout data loss regression. The scoreboard snapshot carries a
+    penalty-shootout result; the same-poll detail (summary) omits shootoutScore
+    and so emits score_pen_* = None. The merged payload MUST keep the scoreboard
+    pens — a plain dict.update() would convert {2, 4, 'away'} to all None and the
+    first DB write would seed the row without the shootout result."""
+    from dataclasses import replace as dc_replace
+
+    from gamecollect.engine import _merge_detail
+
+    scoreboard = dc_replace(
+        nm("m1", ()),
+        payload={
+            "score_pen_home": 2,
+            "score_pen_away": 4,
+            "pen_winner_side": "away",
+            "round_name": "Round Of 16",
+        },
+    )
+    detail = dc_replace(
+        nm("m1", ()),
+        payload={
+            "score_pen_home": None,
+            "score_pen_away": None,
+            "pen_winner_side": None,
+            "commentary": ["120' Shootout"],
+        },
+    )
+
+    merged = _merge_detail(scoreboard, detail)
+
+    assert merged.payload["score_pen_home"] == 2
+    assert merged.payload["score_pen_away"] == 4
+    assert merged.payload["pen_winner_side"] == "away"
+    # Scoreboard-only key survives (detail lacks it), and detail-only key lands.
+    assert merged.payload["round_name"] == "Round Of 16"
+    assert merged.payload["commentary"] == ["120' Shootout"]
+
+
+def test_merge_detail_non_empty_detail_value_still_wins():
+    """Preserve-richer only guards EMPTY-clobbers-richer: a detail that DOES carry
+    a shootout result (the finished-match case) still overwrites the scoreboard,
+    and detail's real HT scores still win over the scoreboard's None placeholders."""
+    from dataclasses import replace as dc_replace
+
+    from gamecollect.engine import _merge_detail
+
+    scoreboard = dc_replace(
+        nm("m1", ()),
+        payload={"score_pen_home": 1, "score_pen_away": 3, "score_ht_home": None},
+    )
+    detail = dc_replace(
+        nm("m1", ()),
+        payload={"score_pen_home": 2, "score_pen_away": 4, "score_ht_home": 1},
+    )
+
+    merged = _merge_detail(scoreboard, detail)
+
+    assert merged.payload["score_pen_home"] == 2
+    assert merged.payload["score_pen_away"] == 4
+    assert merged.payload["score_ht_home"] == 1
 
 
 # --------------------------------------------------------------------------- #
