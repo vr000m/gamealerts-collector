@@ -188,6 +188,7 @@ def serialize_knockout(match) -> dict:
             "score_pen_home": payload.get("score_pen_home"),
             "score_pen_away": payload.get("score_pen_away"),
             "pen_winner_side": payload.get("pen_winner_side"),
+            "result_type": payload.get("result_type"),
         },
         "events": [
             {

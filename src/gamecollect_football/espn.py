@@ -208,6 +208,29 @@ def _status_from_comp(comp: dict) -> MatchStatus:
     return status
 
 
+def _result_type_from_comp(comp: dict) -> str | None:
+    """How a finished match was decided: ``"regulation"``, ``"extra_time"``, or
+    ``"penalties"`` — ``None`` while the match is unfinished.
+
+    :func:`_status_from_comp` deliberately collapses all three finishes to
+    ``FINISHED`` (a new MatchStatus value would break ``LIVE_STATUSES`` and every
+    consumer switching on status), so this preserves the knockout distinction in
+    payload for downstream consumers alongside ``pen_winner_side``. ESPN encodes
+    it in ``status.type.description`` — "Full Time" / "… After Extra Time" /
+    "… After Penalties" (substring-matched to tolerate the "Final Score - "
+    prefix). A penalty shootout implies extra time was played first.
+    """
+    type_ = (comp.get("status") or {}).get("type") or {}
+    desc = type_.get("description") or ""
+    if "Penalt" in desc:
+        return "penalties"
+    if "Extra Time" in desc:
+        return "extra_time"
+    if type_.get("state") == "post":
+        return "regulation"
+    return None
+
+
 def _pen_score(competitor: dict) -> int | None:
     """Read a competitor's penalty-shootout score.
 
@@ -912,6 +935,7 @@ class ESPNAdapter(MatchDataProvider):
                 "score_pen_home": score_pen_home,
                 "score_pen_away": score_pen_away,
                 "pen_winner_side": pen_winner_side,
+                "result_type": _result_type_from_comp(comp),
             },
         )
 
@@ -1037,5 +1061,6 @@ class ESPNAdapter(MatchDataProvider):
                 "score_pen_home": score_pen_home,
                 "score_pen_away": score_pen_away,
                 "pen_winner_side": pen_winner_side,
+                "result_type": _result_type_from_comp(comp),
             },
         )

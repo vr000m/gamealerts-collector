@@ -209,6 +209,7 @@
     "match_id": "760500",
     "minute": null,
     "pen_winner_side": null,
+    "result_type": "extra_time",
     "score_away": 2,
     "score_home": 3,
     "score_ht_away": 0,

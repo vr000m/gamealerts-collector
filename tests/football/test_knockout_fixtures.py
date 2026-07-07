@@ -74,6 +74,7 @@ class TestScenarioInvariants:
         assert (match.score_home, match.score_away) == (1, 1)
         assert (p["score_pen_home"], p["score_pen_away"]) == (3, 4)
         assert p["pen_winner_side"] == "away"
+        assert p["result_type"] == "penalties"
 
     def test_extra_time_win_has_no_shootout(self):
         # 760500: Argentina win 3-2 in extra time — no penalties taken.
@@ -83,6 +84,7 @@ class TestScenarioInvariants:
         assert p["score_pen_home"] is None
         assert p["score_pen_away"] is None
         assert p["pen_winner_side"] is None
+        assert p["result_type"] == "extra_time"
 
     def test_regulation_win_has_no_shootout(self):
         # 760506: Spain win 0-1 in regulation (stoppage-time goal).
@@ -91,6 +93,7 @@ class TestScenarioInvariants:
         assert (match.score_home, match.score_away) == (0, 1)
         assert p["score_pen_home"] is None
         assert p["pen_winner_side"] is None
+        assert p["result_type"] == "regulation"
 
 
 def _replay(match_id: str):

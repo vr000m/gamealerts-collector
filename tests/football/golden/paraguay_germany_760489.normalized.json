@@ -209,6 +209,7 @@
     "match_id": "760489",
     "minute": null,
     "pen_winner_side": "away",
+    "result_type": "penalties",
     "score_away": 1,
     "score_home": 1,
     "score_ht_away": 1,
