@@ -1,0 +1,783 @@
+{
+  "events": [
+    {
+      "assist": null,
+      "detail": null,
+      "event_type": "kickoff",
+      "importance": 3,
+      "minute": null,
+      "player": null,
+      "seq": 0,
+      "team": null
+    },
+    {
+      "assist": "Lisandro Martínez",
+      "detail": "Goal! Argentina 1, Cabo Verde 0. Lionel Messi (Argentina) left footed shot from the right side of the six yard box to the top right corner. Assisted by Lisandro Martínez with a through ball.",
+      "event_type": "goal",
+      "importance": 1,
+      "minute": 29,
+      "player": "Lionel Messi",
+      "seq": 1,
+      "team": "Argentina"
+    },
+    {
+      "assist": null,
+      "detail": "First Half ends, Argentina 1, Cabo Verde 0.",
+      "event_type": "half_time",
+      "importance": 3,
+      "minute": 45,
+      "player": null,
+      "seq": 2,
+      "team": null
+    },
+    {
+      "assist": "Ryan Mendes",
+      "detail": "Goal! Argentina 1, Cabo Verde 1. Deroy Duarte (Cabo Verde) right footed shot from a difficult angle on the right to the bottom left corner. Assisted by Ryan Mendes.",
+      "event_type": "goal",
+      "importance": 1,
+      "minute": 59,
+      "player": "Deroy Duarte",
+      "seq": 3,
+      "team": "Cape Verde"
+    },
+    {
+      "assist": "Lautaro Martínez",
+      "detail": "Substitution, Argentina. Julián Alvarez replaces Lautaro Martínez.",
+      "event_type": "sub",
+      "importance": 4,
+      "minute": 63,
+      "player": "Julián Álvarez",
+      "seq": 4,
+      "team": "Argentina"
+    },
+    {
+      "assist": "Thiago Almada",
+      "detail": "Substitution, Argentina. Nico González replaces Thiago Almada.",
+      "event_type": "sub",
+      "importance": 4,
+      "minute": 64,
+      "player": "Nico González",
+      "seq": 5,
+      "team": "Argentina"
+    },
+    {
+      "assist": "Laros Duarte",
+      "detail": "Substitution, Cabo Verde. Jamiro Monteiro replaces Laros Duarte.",
+      "event_type": "sub",
+      "importance": 4,
+      "minute": 67,
+      "player": "Jamiro Monteiro",
+      "seq": 6,
+      "team": "Cape Verde"
+    },
+    {
+      "assist": "Nuno da Costa",
+      "detail": "Substitution, Cabo Verde. Dailon Livramento replaces Nuno da Costa.",
+      "event_type": "sub",
+      "importance": 4,
+      "minute": 67,
+      "player": "Dailon Livramento",
+      "seq": 7,
+      "team": "Cape Verde"
+    },
+    {
+      "assist": null,
+      "detail": "Kevin Pina (Cabo Verde) is shown the yellow card for a bad foul.",
+      "event_type": "yellow",
+      "importance": 3,
+      "minute": 68,
+      "player": "Kevin Pina",
+      "seq": 8,
+      "team": "Cape Verde"
+    },
+    {
+      "assist": "Ryan Mendes",
+      "detail": "Substitution, Cabo Verde. Willy Semedo replaces Ryan Mendes.",
+      "event_type": "sub",
+      "importance": 4,
+      "minute": 80,
+      "player": "Willy Semedo",
+      "seq": 9,
+      "team": "Cape Verde"
+    },
+    {
+      "assist": "Jovane Cabral",
+      "detail": "Substitution, Cabo Verde. Hélio Varela replaces Jovane Cabral.",
+      "event_type": "sub",
+      "importance": 4,
+      "minute": 80,
+      "player": "Hélio Varela",
+      "seq": 10,
+      "team": "Cape Verde"
+    },
+    {
+      "assist": "Rodrigo De Paul",
+      "detail": "Substitution, Argentina. Leandro Paredes replaces Rodrigo De Paul.",
+      "event_type": "sub",
+      "importance": 4,
+      "minute": 84,
+      "player": "Leandro Paredes",
+      "seq": 11,
+      "team": "Argentina"
+    },
+    {
+      "assist": "Facundo Medina",
+      "detail": "Substitution, Argentina. Nicolás Tagliafico replaces Facundo Medina because of an injury.",
+      "event_type": "sub",
+      "importance": 4,
+      "minute": 86,
+      "player": "Nicolás Tagliafico",
+      "seq": 12,
+      "team": "Argentina"
+    },
+    {
+      "assist": "Alexis Mac Allister",
+      "detail": "Goal! Argentina 2, Cabo Verde 1. Lisandro Martínez (Argentina) left footed shot from the right side of the box to the top right corner. Assisted by Alexis Mac Allister with a headed pass following a corner.",
+      "event_type": "goal",
+      "importance": 1,
+      "minute": 92,
+      "player": "Lisandro Martínez",
+      "seq": 13,
+      "team": "Argentina"
+    },
+    {
+      "assist": "Deroy Duarte",
+      "detail": "Substitution, Cabo Verde. Yannick Semedo replaces Deroy Duarte.",
+      "event_type": "sub",
+      "importance": 4,
+      "minute": 100,
+      "player": "Yannick Semedo",
+      "seq": 14,
+      "team": "Cape Verde"
+    },
+    {
+      "assist": "Kevin Pina",
+      "detail": "Substitution, Cabo Verde. Gilson Benchimol replaces Kevin Pina.",
+      "event_type": "sub",
+      "importance": 4,
+      "minute": 100,
+      "player": "Gilson Benchimol",
+      "seq": 15,
+      "team": "Cape Verde"
+    },
+    {
+      "assist": "Yannick Semedo",
+      "detail": "Goal! Argentina 2, Cabo Verde 2. Sidny Cabral (Cabo Verde) right footed shot from the left side of the box to the top right corner. Assisted by Yannick Semedo.",
+      "event_type": "goal",
+      "importance": 1,
+      "minute": 103,
+      "player": "Sidny Lopes Cabral",
+      "seq": 16,
+      "team": "Cape Verde"
+    },
+    {
+      "assist": "Nahuel Molina",
+      "detail": "Substitution, Argentina. Gonzalo Montiel replaces Nahuel Molina.",
+      "event_type": "sub",
+      "importance": 4,
+      "minute": 104,
+      "player": "Gonzalo Montiel",
+      "seq": 17,
+      "team": "Argentina"
+    },
+    {
+      "assist": null,
+      "detail": "Own Goal by Diney Borges, Cabo Verde. Argentina 3, Cabo Verde 2.",
+      "event_type": "own_goal",
+      "importance": 1,
+      "minute": 111,
+      "player": "Diney Borges",
+      "seq": 18,
+      "team": "Argentina"
+    },
+    {
+      "assist": null,
+      "detail": "Gonzalo Montiel (Argentina) is shown the yellow card for a bad foul.",
+      "event_type": "yellow",
+      "importance": 3,
+      "minute": 115,
+      "player": "Gonzalo Montiel",
+      "seq": 19,
+      "team": "Argentina"
+    }
+  ],
+  "match": {
+    "away_team": "Cape Verde",
+    "display_clock": null,
+    "home_team": "Argentina",
+    "kickoff_utc": "2026-07-03T22:00Z",
+    "match_id": "760500",
+    "minute": null,
+    "pen_winner_side": null,
+    "score_away": 2,
+    "score_home": 3,
+    "score_ht_away": 0,
+    "score_ht_home": 1,
+    "score_pen_away": null,
+    "score_pen_home": null,
+    "status": "FINISHED"
+  },
+  "side_tables": {
+    "commentary_count": 140,
+    "lineups": [
+      {
+        "formation": "4-4-2",
+        "home_away": "home",
+        "players": [
+          {
+            "athlete_id": "158626",
+            "display_name": "Emiliano Martínez",
+            "formation_place": 1,
+            "jersey": "23",
+            "position": "G",
+            "starter": true,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "233937",
+            "display_name": "Lisandro Martínez",
+            "formation_place": 6,
+            "jersey": "6",
+            "position": "CD-L",
+            "starter": true,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "96970",
+            "display_name": "Cristian Romero",
+            "formation_place": 5,
+            "jersey": "13",
+            "position": "CD-R",
+            "starter": true,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "249663",
+            "display_name": "Facundo Medina",
+            "formation_place": 3,
+            "jersey": "25",
+            "position": "LB",
+            "starter": true,
+            "subbed_in": false,
+            "subbed_out": true
+          },
+          {
+            "athlete_id": "164826",
+            "display_name": "Nahuel Molina",
+            "formation_place": 2,
+            "jersey": "26",
+            "position": "RB",
+            "starter": true,
+            "subbed_in": false,
+            "subbed_out": true
+          },
+          {
+            "athlete_id": "285450",
+            "display_name": "Enzo Fernández",
+            "formation_place": 8,
+            "jersey": "24",
+            "position": "CM-L",
+            "starter": true,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "249299",
+            "display_name": "Alexis Mac Allister",
+            "formation_place": 4,
+            "jersey": "20",
+            "position": "CM-R",
+            "starter": true,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "277208",
+            "display_name": "Thiago Almada",
+            "formation_place": 11,
+            "jersey": "16",
+            "position": "LM",
+            "starter": true,
+            "subbed_in": false,
+            "subbed_out": true
+          },
+          {
+            "athlete_id": "174466",
+            "display_name": "Rodrigo De Paul",
+            "formation_place": 7,
+            "jersey": "7",
+            "position": "RM",
+            "starter": true,
+            "subbed_in": false,
+            "subbed_out": true
+          },
+          {
+            "athlete_id": "219713",
+            "display_name": "Lautaro Martínez",
+            "formation_place": 9,
+            "jersey": "22",
+            "position": "CF-L",
+            "starter": true,
+            "subbed_in": false,
+            "subbed_out": true
+          },
+          {
+            "athlete_id": "45843",
+            "display_name": "Lionel Messi",
+            "formation_place": 10,
+            "jersey": "10",
+            "position": "CF-R",
+            "starter": true,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "145190",
+            "display_name": "Nicolás Tagliafico",
+            "formation_place": 0,
+            "jersey": "3",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": true,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "320760",
+            "display_name": "Valentín Barco",
+            "formation_place": 0,
+            "jersey": "8",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "228393",
+            "display_name": "Exequiel Palacios",
+            "formation_place": 0,
+            "jersey": "14",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "228262",
+            "display_name": "Gonzalo Montiel",
+            "formation_place": 0,
+            "jersey": "4",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": true,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "337970",
+            "display_name": "Nico Paz",
+            "formation_place": 0,
+            "jersey": "18",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "311743",
+            "display_name": "José Manuel López",
+            "formation_place": 0,
+            "jersey": "21",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "207343",
+            "display_name": "Giovani Lo Celso",
+            "formation_place": 0,
+            "jersey": "11",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "323838",
+            "display_name": "Giuliano Simeone",
+            "formation_place": 0,
+            "jersey": "17",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "277206",
+            "display_name": "Julián Álvarez",
+            "formation_place": 0,
+            "jersey": "9",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": true,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "76017",
+            "display_name": "Nico González",
+            "formation_place": 0,
+            "jersey": "15",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": true,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "177927",
+            "display_name": "Juan Musso",
+            "formation_place": 0,
+            "jersey": "1",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "167192",
+            "display_name": "Gerónimo Rulli",
+            "formation_place": 0,
+            "jersey": "12",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "153115",
+            "display_name": "Leandro Paredes",
+            "formation_place": 0,
+            "jersey": "5",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": true,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "119289",
+            "display_name": "Nicolás Otamendi",
+            "formation_place": 0,
+            "jersey": "19",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "233945",
+            "display_name": "Marcos Senesi",
+            "formation_place": 0,
+            "jersey": "2",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": false,
+            "subbed_out": false
+          }
+        ],
+        "team": "Argentina"
+      },
+      {
+        "formation": "4-1-4-1",
+        "home_away": "away",
+        "players": [
+          {
+            "athlete_id": "181330",
+            "display_name": "Vozinha",
+            "formation_place": 1,
+            "jersey": "1",
+            "position": "G",
+            "starter": true,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "214683",
+            "display_name": "Diney Borges",
+            "formation_place": 6,
+            "jersey": "3",
+            "position": "CD-L",
+            "starter": true,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "257716",
+            "display_name": "Pico Lopes",
+            "formation_place": 5,
+            "jersey": "4",
+            "position": "CD-R",
+            "starter": true,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "327173",
+            "display_name": "Kevin Pina",
+            "formation_place": 4,
+            "jersey": "6",
+            "position": "DM",
+            "starter": true,
+            "subbed_in": false,
+            "subbed_out": true
+          },
+          {
+            "athlete_id": "332394",
+            "display_name": "Sidny Lopes Cabral",
+            "formation_place": 3,
+            "jersey": "13",
+            "position": "LB",
+            "starter": true,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "180113",
+            "display_name": "Steven Moreira",
+            "formation_place": 2,
+            "jersey": "22",
+            "position": "RB",
+            "starter": true,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "246442",
+            "display_name": "Deroy Duarte",
+            "formation_place": 10,
+            "jersey": "14",
+            "position": "CM-L",
+            "starter": true,
+            "subbed_in": false,
+            "subbed_out": true
+          },
+          {
+            "athlete_id": "222236",
+            "display_name": "Laros Duarte",
+            "formation_place": 8,
+            "jersey": "15",
+            "position": "CM-R",
+            "starter": true,
+            "subbed_in": false,
+            "subbed_out": true
+          },
+          {
+            "athlete_id": "250059",
+            "display_name": "Jovane Cabral",
+            "formation_place": 11,
+            "jersey": "7",
+            "position": "LM",
+            "starter": true,
+            "subbed_in": false,
+            "subbed_out": true
+          },
+          {
+            "athlete_id": "135216",
+            "display_name": "Ryan Mendes",
+            "formation_place": 7,
+            "jersey": "20",
+            "position": "RM",
+            "starter": true,
+            "subbed_in": false,
+            "subbed_out": true
+          },
+          {
+            "athlete_id": "224798",
+            "display_name": "Nuno da Costa",
+            "formation_place": 9,
+            "jersey": "21",
+            "position": "F",
+            "starter": true,
+            "subbed_in": false,
+            "subbed_out": true
+          },
+          {
+            "athlete_id": "304076",
+            "display_name": "Telmo Arcanjo",
+            "formation_place": 0,
+            "jersey": "18",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "260758",
+            "display_name": "Márcio Rosa",
+            "formation_place": 0,
+            "jersey": "12",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "101251",
+            "display_name": "Yannick Semedo",
+            "formation_place": 0,
+            "jersey": "16",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": true,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "148146",
+            "display_name": "Stopira",
+            "formation_place": 0,
+            "jersey": "2",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "271129",
+            "display_name": "Logan Costa",
+            "formation_place": 0,
+            "jersey": "5",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "175012",
+            "display_name": "Garry Rodrigues",
+            "formation_place": 0,
+            "jersey": "11",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "378479",
+            "display_name": "Kelvin Pires",
+            "formation_place": 0,
+            "jersey": "25",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "366092",
+            "display_name": "Hélio Varela",
+            "formation_place": 0,
+            "jersey": "26",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": true,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "330211",
+            "display_name": "Dailon Livramento",
+            "formation_place": 0,
+            "jersey": "19",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": true,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "227441",
+            "display_name": "Jamiro Monteiro",
+            "formation_place": 0,
+            "jersey": "10",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": true,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "318631",
+            "display_name": "João Paulo",
+            "formation_place": 0,
+            "jersey": "8",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "271675",
+            "display_name": "Willy Semedo",
+            "formation_place": 0,
+            "jersey": "17",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": true,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "365810",
+            "display_name": "Wagner Pina",
+            "formation_place": 0,
+            "jersey": "24",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "310261",
+            "display_name": "Gilson Benchimol",
+            "formation_place": 0,
+            "jersey": "9",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": true,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "265874",
+            "display_name": "CJ dos Santos",
+            "formation_place": 0,
+            "jersey": "23",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": false,
+            "subbed_out": false
+          }
+        ],
+        "team": "Cape Verde"
+      }
+    ],
+    "stats": [
+      {
+        "corners": null,
+        "fouls": 13,
+        "offsides": 3,
+        "possession": 63.6,
+        "red_cards": 0,
+        "shots": 22,
+        "shots_on_target": 10,
+        "team": "Argentina",
+        "yellow_cards": 1
+      },
+      {
+        "corners": null,
+        "fouls": 12,
+        "offsides": 2,
+        "possession": 36.4,
+        "red_cards": 0,
+        "shots": 16,
+        "shots_on_target": 5,
+        "team": "Cape Verde",
+        "yellow_cards": 1
+      }
+    ]
+  }
+}
