@@ -118,3 +118,20 @@ plane. Commentary, alerts, and voice live in consuming applications.
 - In-process consumers skip the subprocess entirely and use the client library —
   the CLI is a thin `main()` around it. The contract is the library API + the
   CLI's JSON output schemas; an MCP server is an optional adapter, not the contract.
+
+## Writing a new collector
+
+New sports/leagues (Champions League, F1, cricket, …) are added as **sport
+packs** — pip-installable packages that register under the `gamecollect.packs`
+entry point, no core changes required. See
+[`docs/ADDING_A_COLLECTOR.md`](docs/ADDING_A_COLLECTOR.md) for the step-by-step
+guide (football as the worked example).
+
+## Contributing
+
+You can **publish your own collector package** or **propose one into this repo** —
+[`CONTRIBUTING.md`](CONTRIBUTING.md) explains both paths and the dev workflow.
+
+## License
+
+MIT — see [`LICENSE`](LICENSE).
