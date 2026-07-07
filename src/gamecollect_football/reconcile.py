@@ -57,6 +57,8 @@ _HOME_AWAY_PAYLOAD_PAIRS = (
     ("score_ht_home", "score_ht_away"),
     ("score_pen_home", "score_pen_away"),
 )
+_HOME_AWAY_NESTED_PAYLOAD_KEYS = ("stats", "lineups", "formations")
+_HOME_AWAY_TAG_KEYS = ("home_away", "homeAway")
 
 # ---------------------------------------------------------------------------
 # Team-name aliasing
@@ -523,6 +525,47 @@ def _flip_home_away_payload(payload: dict[str, Any]) -> dict[str, Any]:
         flipped["pen_winner_side"] = "away"
     elif side == "away":
         flipped["pen_winner_side"] = "home"
+
+    for key in _HOME_AWAY_NESTED_PAYLOAD_KEYS:
+        if key in flipped:
+            flipped[key] = _flip_nested_home_away(flipped[key])
+    return flipped
+
+
+def _flip_side_value(value: Any) -> Any:
+    if value == "home":
+        return "away"
+    if value == "away":
+        return "home"
+    return value
+
+
+def _flip_nested_home_away(value: Any) -> Any:
+    if isinstance(value, list):
+        return [_flip_nested_home_away(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+
+    flipped = {key: _flip_nested_home_away(item) for key, item in value.items()}
+
+    home_present = "home" in flipped
+    away_present = "away" in flipped
+    if home_present or away_present:
+        home_value = flipped["home"] if home_present else None
+        away_value = flipped["away"] if away_present else None
+        if away_present:
+            flipped["home"] = away_value
+        else:
+            flipped.pop("home", None)
+        if home_present:
+            flipped["away"] = home_value
+        else:
+            flipped.pop("away", None)
+
+    for key in _HOME_AWAY_TAG_KEYS:
+        if key in flipped:
+            flipped[key] = _flip_side_value(flipped[key])
+
     return flipped
 
 
@@ -623,6 +666,16 @@ def _adopt_stub_rows(
     merged_payload = dict(stub_payload)
     _merge_preserving_richer(merged_payload, reader.get_stored_payload(conn, canonical_id))
     with conn:
+        if reverse_oriented and _table_exists(conn, "football_lineups"):
+            conn.execute(
+                "UPDATE football_lineups "
+                "SET home_away = CASE home_away "
+                "WHEN 'home' THEN 'away' "
+                "WHEN 'away' THEN 'home' "
+                "ELSE home_away END "
+                "WHERE source = ? AND match_id = ?",
+                (source, stub_id),
+            )
         conn.execute(
             "UPDATE events SET match_id = ? WHERE source = ? AND match_id = ?",
             (canonical_id, source, stub_id),

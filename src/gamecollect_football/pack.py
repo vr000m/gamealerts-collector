@@ -15,6 +15,7 @@ import re
 import sqlite3
 from decimal import Decimal
 
+from gamecollect.db import reader
 from gamecollect.db.writer import PartitionWriter
 from gamecollect.fold import fold
 from gamecollect.packs.spec import SportPack
@@ -362,7 +363,11 @@ def persist_football_side_tables(
     provider glitch must not raise out of the hook), compared against the
     stored rows, and rewritten (DELETE + reinsert, correct for removals) only
     when it actually changed."""
-    payload = match.payload or {}
+    payload = dict(match.payload or {})
+    stored_payload = reader.get_stored_payload(conn, seeded_match_id)
+    for key in ("stats", "lineups"):
+        if key in stored_payload:
+            payload[key] = stored_payload[key]
     stats = payload.get("stats")
     lineups = payload.get("lineups")
 

@@ -61,6 +61,37 @@ def _match(
     )
 
 
+def _reversed_lineups_payload() -> dict:
+    return {
+        "lineups": [
+            {
+                "team": "Turkey",
+                "home_away": "home",
+                "formation": "4-3-3",
+                "players": [
+                    {
+                        "athlete_id": "tur-1",
+                        "display_name": "Turkey Starter",
+                        "formation_place": 1,
+                    }
+                ],
+            },
+            {
+                "team": "Australia",
+                "home_away": "away",
+                "formation": "4-2-3-1",
+                "players": [
+                    {
+                        "athlete_id": "aus-1",
+                        "display_name": "Australia Starter",
+                        "formation_place": 1,
+                    }
+                ],
+            },
+        ]
+    }
+
+
 @pytest.fixture
 def db(tmp_path):
     conn = connect(tmp_path / "reconcile.db")
@@ -462,6 +493,33 @@ class TestSeedOrReconcileMatch:
         assert payload["pen_winner_side"] == "home"
         assert payload["stats"] == [{"team": "Turkey", "shots": 9}]
 
+    def test_reversed_provider_orientation_persists_oriented_lineups(self, tmp_path):
+        from dataclasses import replace
+
+        from gamecollect_football.operations import get_squad
+        from gamecollect_football.pack import FOOTBALL_SIDE_TABLE_DDL, persist_football_side_tables
+
+        conn = connect(tmp_path / "reversed-lineups.db", side_table_ddl=FOOTBALL_SIDE_TABLE_DDL)
+        try:
+            writer = PartitionWriter(conn, SOURCE_A)
+            self._seed_schedule_row(writer)
+            match = replace(
+                _match(home="Turkey", away="Australia"),
+                payload=_reversed_lineups_payload(),
+            )
+
+            seeded = seed_or_reconcile_match(conn, writer, match, PROVIDER)
+            assert seeded == self.CANONICAL
+            persist_football_side_tables(conn, writer, match, seeded)
+
+            sides = {member.team: member.home_away for member in get_squad(conn, self.CANONICAL)}
+            assert sides == {
+                "Australia": "home",
+                "Turkey": "away",
+            }, "get_squad home_away values must match the canonical schedule orientation"
+        finally:
+            conn.close()
+
     def test_aligned_provider_orientation_keeps_home_away_indexed_fields(self, db):
         import json
         from dataclasses import replace
@@ -841,6 +899,45 @@ class TestAdoptionPreservesStubPayload:
         assert payload["score_pen_home"] == 5
         assert payload["score_pen_away"] == 4
         assert payload["pen_winner_side"] == "home"
+
+    def test_reversed_stub_adoption_persists_oriented_lineups(self, tmp_path):
+        from dataclasses import replace
+
+        from gamecollect_football.operations import get_squad
+        from gamecollect_football.pack import FOOTBALL_SIDE_TABLE_DDL, persist_football_side_tables
+
+        conn = connect(
+            tmp_path / "reversed-stub-lineups.db",
+            side_table_ddl=FOOTBALL_SIDE_TABLE_DDL,
+        )
+        try:
+            writer = PartitionWriter(conn, SOURCE_A)
+            rich = replace(
+                _match(home="Turkey", away="Australia"),
+                payload=_reversed_lineups_payload(),
+            )
+            assert seed_or_reconcile_match(conn, writer, rich, PROVIDER) == self.STUB
+            persist_football_side_tables(conn, writer, rich, self.STUB)
+
+            writer.upsert_match(
+                {
+                    "match_id": self.CANONICAL,
+                    "status": "SCHEDULED",
+                    "kickoff_utc": "2026-06-14T04:00:00+00:00",
+                    "payload": {"home_team": "Australia", "away_team": "Turkey"},
+                }
+            )
+            sparse = replace(rich, payload={})
+            assert seed_or_reconcile_match(conn, writer, sparse, PROVIDER) == self.CANONICAL
+            persist_football_side_tables(conn, writer, sparse, self.CANONICAL)
+
+            sides = {member.team: member.home_away for member in get_squad(conn, self.CANONICAL)}
+            assert sides == {
+                "Australia": "home",
+                "Turkey": "away",
+            }, "adopted stub get_squad home_away values must match canonical orientation"
+        finally:
+            conn.close()
 
 
 class TestAdoptionRefusalClearsMap:
