@@ -960,6 +960,10 @@ class ESPNAdapter(MatchDataProvider):
         score_pen_home: int | None = None
         score_pen_away: int | None = None
         pen_winner_side: str | None = None
+        # regulation/extra_time/penalties, derived from the first competition.
+        # Defaulted here so a headerless / empty-competitions summary normalizes
+        # to None rather than reading an unbound loop variable below.
+        result_type: str | None = None
 
         # Try to get status from header competitions
         header = data.get("header", {})
@@ -996,6 +1000,7 @@ class ESPNAdapter(MatchDataProvider):
             score_pen_home, score_pen_away, pen_winner_side = _extract_shootout(
                 comp.get("competitors", []), match_id
             )
+            result_type = _result_type_from_comp(comp)
             break  # Only need first competition
 
         # keyEvents → NormalizedEvent list. A keyEvent may expand to two events
@@ -1061,6 +1066,6 @@ class ESPNAdapter(MatchDataProvider):
                 "score_pen_home": score_pen_home,
                 "score_pen_away": score_pen_away,
                 "pen_winner_side": pen_winner_side,
-                "result_type": _result_type_from_comp(comp),
+                "result_type": result_type,
             },
         )
