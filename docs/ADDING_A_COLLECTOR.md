@@ -89,6 +89,17 @@ Optional fields (default to safe no-ops):
 2. **Write the provider adapter** (`espn.py` is the football example). Subclass
    `MatchDataProvider`; translate your wire format into `NormalizedMatch`.
 
+   **Payload vs side tables.** Sport-specific facts split two ways. Small
+   scalar extras that belong with the match row travel in
+   `NormalizedMatch.payload` (a JSON-serializable dict) — the football adapter
+   carries half-time scores, penalty-shootout results, and `result_type`
+   (`regulation`/`extra_time`/`penalties`) there; see how `_normalize_summary`
+   in `gamecollect_football/espn.py` assembles the `payload` dict. Bulk,
+   row-structured data (per-player stats, lineups) instead goes to **side
+   tables** the pack owns, written by `persist_football_side_tables` in
+   `gamecollect_football/pack.py` (see step 4). Rule of thumb: a handful of
+   scalars per match → payload; repeating rows → a side table.
+
 3. **Declare the taxonomy** (`taxonomy.py`) — one `EventTypeDecl(display_name,
    importance_default)` per event type. Importance uses the small-is-critical
    scale (1=critical … 4=low).
