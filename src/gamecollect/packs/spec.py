@@ -13,7 +13,11 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from gamecollect.provider import MatchDataProvider, NormalizedMatch, is_empty_payload_value
+from gamecollect.provider import (
+    MatchDataProvider,
+    NormalizedMatch,
+    merge_payload_preserving_richer,
+)
 
 if TYPE_CHECKING:
     from gamecollect.db.writer import PartitionWriter
@@ -66,9 +70,7 @@ def default_seed_match(
     # stored non-empty, so this DB-write guard backstops the stored row across
     # polls independently; the football reconciler guards the same way via
     # _merge_preserving_richer.
-    for key, value in match.payload.items():
-        if key not in payload or not is_empty_payload_value(value):
-            payload[key] = value
+    payload = merge_payload_preserving_richer(payload, match.payload)
     if match.home_team is not None:
         payload["home_team"] = match.home_team
     if match.away_team is not None:

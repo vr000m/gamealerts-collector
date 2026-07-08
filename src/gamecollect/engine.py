@@ -66,7 +66,7 @@ from gamecollect.provider import (
     NormalizedMatch,
     ProviderUnavailableError,
     ShapeDriftError,
-    is_empty_payload_value,
+    merge_payload_preserving_richer,
 )
 
 __all__ = ["CollectorEngine"]
@@ -195,12 +195,12 @@ def _merge_payload_preserving_richer(base: dict, incoming: dict) -> dict:
     :func:`_merge_over_base` (cross-poll base→snapshot) so a cumulative sport-extra
     the scoreboard populated (e.g. a live penalty-shootout score the summary
     endpoint has not caught up on) is not lost when the other snapshot omits it.
+
+    Thin wrapper over :func:`gamecollect.provider.merge_payload_preserving_richer`
+    (the single source of truth for the rule); kept for the local call-site
+    docstring cross-references.
     """
-    merged = dict(base)
-    for key, value in incoming.items():
-        if key not in merged or not is_empty_payload_value(value):
-            merged[key] = value
-    return merged
+    return merge_payload_preserving_richer(base, incoming)
 
 
 def _merge_detail(scoreboard: NormalizedMatch, detail: NormalizedMatch) -> NormalizedMatch:
@@ -1652,15 +1652,9 @@ class CollectorEngine:
         if winner_authoritative:
             # Authoritative-winner payload precedence — winner's non-empty values win,
             # the other side only fills keys the winner lacks (or where it is empty).
-            payload = dict(other.payload)
-            for key, value in winner.payload.items():
-                if key not in payload or not is_empty_payload_value(value):
-                    payload[key] = value
+            payload = merge_payload_preserving_richer(other.payload, winner.payload)
         else:
-            payload = dict(old.payload)
-            for key, value in new.payload.items():
-                if key not in payload or not is_empty_payload_value(value):
-                    payload[key] = value
+            payload = merge_payload_preserving_richer(old.payload, new.payload)
         if winner_authoritative:
             # Identity fields also keep the authoritative winner's values, filling
             # only where the winner has None.

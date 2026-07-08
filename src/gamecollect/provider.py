@@ -127,6 +127,25 @@ def is_empty_payload_value(value: Any) -> bool:
     return False
 
 
+def merge_payload_preserving_richer(base: dict, incoming: dict) -> dict:
+    """Merge ``incoming`` over ``base`` with the preserve-richer rule; return a new dict.
+
+    A non-empty ``incoming`` value always wins, and a key absent from ``base`` is
+    always added, but an explicitly-empty ``incoming`` value
+    (:func:`is_empty_payload_value` — ``None``/``""``/``[]``/``{}``) NEVER clobbers
+    a key ``base`` already carries. This is the single source of truth for the
+    preserve-richer rule; every payload-merge site (core's in-memory ``_merge_detail``
+    / ``_merge_over_base``, the football pack's DB-side ``_merge_preserving_richer``,
+    and ``default_seed_match``) routes through here so the rule can't drift. Callers
+    needing in-place mutation do ``base.update(merge_payload_preserving_richer(base, incoming))``.
+    """
+    merged = dict(base)
+    for key, value in incoming.items():
+        if key not in merged or not is_empty_payload_value(value):
+            merged[key] = value
+    return merged
+
+
 # ---------------------------------------------------------------------------
 # Exceptions
 # ---------------------------------------------------------------------------

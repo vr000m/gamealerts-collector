@@ -36,7 +36,7 @@ from typing import Any
 from gamecollect.db import reader
 from gamecollect.db.writer import PartitionWriter
 from gamecollect.fold import fold
-from gamecollect.provider import NormalizedMatch, is_empty_payload_value
+from gamecollect.provider import NormalizedMatch, merge_payload_preserving_richer
 
 __all__ = [
     "TEAM_ALIASES",
@@ -479,10 +479,11 @@ def _merge_preserving_richer(stored: dict[str, Any], incoming: dict[str, Any]) -
     snapshot cannot clobber detail-derived stats/lineups the strip row
     already carries. Emptiness is :func:`gamecollect.provider.is_empty_payload_value`,
     shared with core's in-memory :func:`~gamecollect.engine._merge_over_base`
-    so the rule can't drift between the two merge paths."""
-    for key, value in incoming.items():
-        if key not in stored or not is_empty_payload_value(value):
-            stored[key] = value
+    so the rule can't drift between the two merge paths.
+
+    In-place adapter over the single-source-of-truth
+    :func:`gamecollect.provider.merge_payload_preserving_richer`."""
+    stored.update(merge_payload_preserving_richer(stored, incoming))
 
 
 def _is_reverse_oriented(
