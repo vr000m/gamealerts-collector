@@ -2200,11 +2200,13 @@ def test_close_flush_failure_closes_conn_and_is_idempotent(tmp_path):
         engine.close()
     assert engine._conn is None, "connection must be closed even when the flush fails"
     # The recorded session survives the failed flush — it is NOT destroyed.
-    assert engine._record, "a failed flush must preserve the record buffer, not clear it"
+    assert engine._recorder._record, "a failed flush must preserve the record buffer, not clear it"
 
     # A second close() must not re-run the failing flush.
     engine.close()
-    assert engine._record, "the preserved record buffer must survive the idempotent re-close"
+    assert engine._recorder._record, (
+        "the preserved record buffer must survive the idempotent re-close"
+    )
 
 
 def test_record_existing_non_json_file_fails_fast_at_construction(tmp_path):
