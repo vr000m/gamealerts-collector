@@ -180,25 +180,25 @@ Context lifecycle:
 ## Testing Notes
 
 ### Test Approach
-- [ ] Engine loop against scripted fake provider (temp DB, no network) — incl. `ShapeDriftError` posture, `SequenceError` drift, seed/`None`-skip branches
-- [ ] Client library ops against seeded temp DB; read-while-write under WAL with explicit commit-boundary interleaving
-- [ ] CLI golden-file tests (manifest + per-op sample output from a `PartitionWriter`-seeded synthetic DB) + registry-derivation equality test
-- [ ] Replay determinism: same fixture twice ⇒ identical canonical row dumps of matches/events/entities (`updated_at` pinned or excluded; never raw file bytes)
-- [ ] End-to-end: replay canada-qatar fixture through the real engine, assert ground truth via client library
-- [ ] Importer against both known gamealerts schema shapes via checked-in synthetic mini-DBs (CI-runnable; live DBs used only for the one-time seed import)
+- [x] Engine loop against scripted fake provider (temp DB, no network) — incl. `ShapeDriftError` posture, `SequenceError` drift, seed/`None`-skip branches
+- [x] Client library ops against seeded temp DB; read-while-write under WAL with explicit commit-boundary interleaving
+- [x] CLI golden-file tests (manifest + per-op sample output from a `PartitionWriter`-seeded synthetic DB) + registry-derivation equality test
+- [x] Replay determinism: same fixture twice ⇒ identical canonical row dumps of matches/events/entities (`updated_at` pinned or excluded; never raw file bytes)
+- [x] End-to-end: replay canada-qatar fixture through the real engine, assert ground truth via client library
+- [x] Importer against both known gamealerts schema shapes via checked-in synthetic mini-DBs (CI-runnable; live DBs used only for the one-time seed import)
 
 ### Test Results
-- [ ] All tests pass (`uv run pytest -q`)
-- [ ] Lint clean; CI green
+- [x] All tests pass (`uv run pytest -q`)
+- [x] Lint clean; CI green
 
 ### Edge Cases Tested
-- [ ] Provider unavailable mid-run → backoff, loop survives
-- [ ] `ShapeDriftError` mid-run → loud log + backoff, loop survives
-- [ ] Re-sent seq with mutated fingerprint (`SequenceError`) → per-match skip/re-sync, other matches unaffected, daemon stays up
-- [ ] `seed_match` returns `None` (missing identity) → child writes skipped, no `UnseededMatchError`
-- [ ] `get_events_since` with `since_seq` beyond head → empty list, not error
-- [ ] Fixture with zero events (scheduled match, synthesized via `write_fixture` in-test) → replay terminates cleanly
-- [ ] Record-then-replay round trip equals original fixture
+- [x] Provider unavailable mid-run → backoff, loop survives
+- [x] `ShapeDriftError` mid-run → loud log + backoff, loop survives
+- [x] Re-sent seq with mutated fingerprint (`SequenceError`) → per-match skip/re-sync, other matches unaffected, daemon stays up
+- [x] `seed_match` returns `None` (missing identity) → child writes skipped, no `UnseededMatchError`
+- [x] `get_events_since` with `since_seq` beyond head → empty list, not error
+- [x] Fixture with zero events (scheduled match, synthesized via `write_fixture` in-test) → replay terminates cleanly
+- [x] Record-then-replay round trip equals original fixture
 
 ## Acceptance Criteria
 
