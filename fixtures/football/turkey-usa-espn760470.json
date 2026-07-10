@@ -1,0 +1,206 @@
+{
+  "entities": [],
+  "events": [
+    {
+      "assist": null,
+      "detail": null,
+      "event_type": "kickoff",
+      "importance": 3,
+      "minute": null,
+      "player": null,
+      "seq": 0,
+      "team": null
+    },
+    {
+      "assist": "Sebastian Berhalter",
+      "detail": "Goal! Türkiye 0, USA 1. Auston Trusty (USA) left footed shot from a difficult angle on the right to the bottom right corner. Assisted by Sebastian Berhalter with a cross following a corner.",
+      "event_type": "goal",
+      "importance": 1,
+      "minute": 3,
+      "player": "Auston Trusty",
+      "seq": 1,
+      "team": "USA"
+    },
+    {
+      "assist": null,
+      "detail": "Goal! Türkiye 1, USA 1. Arda Güler (Türkiye) left footed shot from the centre of the box.",
+      "event_type": "goal",
+      "importance": 1,
+      "minute": 10,
+      "player": "Arda Güler",
+      "seq": 2,
+      "team": "Turkey"
+    },
+    {
+      "assist": null,
+      "detail": "Sebastian Berhalter (United States) Yellow Card at 19'",
+      "event_type": "yellow",
+      "importance": 3,
+      "minute": 19,
+      "player": "Sebastian Berhalter",
+      "seq": 3,
+      "team": "USA"
+    },
+    {
+      "assist": "Eren Elmali",
+      "detail": "Goal! Türkiye 2, USA 1. Orkun Kökçü (Türkiye) right footed shot from very close range to the top right corner. Assisted by Eren Elmali.",
+      "event_type": "goal",
+      "importance": 1,
+      "minute": 31,
+      "player": "Orkun Kökçü",
+      "seq": 4,
+      "team": "Turkey"
+    },
+    {
+      "assist": null,
+      "detail": "First Half ends, Türkiye 2, USA 1.",
+      "event_type": "half_time",
+      "importance": 3,
+      "minute": 45,
+      "player": null,
+      "seq": 5,
+      "team": null
+    },
+    {
+      "assist": null,
+      "detail": "Goal! Türkiye 2, USA 2. Sebastian Berhalter (USA) right footed shot from outside the box to the bottom left corner.",
+      "event_type": "goal",
+      "importance": 1,
+      "minute": 49,
+      "player": "Sebastian Berhalter",
+      "seq": 6,
+      "team": "USA"
+    },
+    {
+      "assist": "Timothy Weah",
+      "detail": "Substitution, USA. Christian Pulisic replaces Timothy Weah.",
+      "event_type": "sub",
+      "importance": 4,
+      "minute": 58,
+      "player": "Christian Pulisic",
+      "seq": 7,
+      "team": "USA"
+    },
+    {
+      "assist": "Giovanni Reyna",
+      "detail": "Sergiño Dest (United States) Substitution at 76'",
+      "event_type": "sub",
+      "importance": 4,
+      "minute": 76,
+      "player": "Sergiño Dest",
+      "seq": 8,
+      "team": "USA"
+    },
+    {
+      "assist": "Brenden Aaronson",
+      "detail": "Alejandro Zendejas (United States) Substitution at 77'",
+      "event_type": "sub",
+      "importance": 4,
+      "minute": 77,
+      "player": "Alejandro Zendejas",
+      "seq": 9,
+      "team": "USA"
+    },
+    {
+      "assist": "Joe Scally",
+      "detail": "Alex Freeman (United States) Substitution at 77'",
+      "event_type": "sub",
+      "importance": 4,
+      "minute": 77,
+      "player": "Alex Freeman",
+      "seq": 10,
+      "team": "USA"
+    },
+    {
+      "assist": "Zeki Çelik",
+      "detail": "Substitution, Türkiye. Çaglar Söyüncü replaces Zeki Çelik.",
+      "event_type": "sub",
+      "importance": 4,
+      "minute": 84,
+      "player": "Çaglar Söyüncü",
+      "seq": 11,
+      "team": "Turkey"
+    },
+    {
+      "assist": "Kenan Yildiz",
+      "detail": "Substitution, Türkiye. Can Uzun replaces Kenan Yildiz.",
+      "event_type": "sub",
+      "importance": 4,
+      "minute": 84,
+      "player": "Can Uzun",
+      "seq": 12,
+      "team": "Turkey"
+    },
+    {
+      "assist": "Weston McKennie",
+      "detail": "Substitution, USA. Malik Tillman replaces Weston McKennie.",
+      "event_type": "sub",
+      "importance": 4,
+      "minute": 86,
+      "player": "Malik Tillman",
+      "seq": 13,
+      "team": "USA"
+    },
+    {
+      "assist": "Orkun Kökçü",
+      "detail": "Substitution, Türkiye. Kaan Ayhan replaces Orkun Kökçü.",
+      "event_type": "sub",
+      "importance": 4,
+      "minute": 88,
+      "player": "Kaan Ayhan",
+      "seq": 14,
+      "team": "Turkey"
+    },
+    {
+      "assist": "Oguz Aydin",
+      "detail": "Substitution, Türkiye. Mert Müldür replaces Oguz Aydin.",
+      "event_type": "sub",
+      "importance": 4,
+      "minute": 90,
+      "player": "Mert Müldür",
+      "seq": 15,
+      "team": "Turkey"
+    },
+    {
+      "assist": "Baris Alper Yilmaz",
+      "detail": "Substitution, Türkiye. Irfan Can Kahveci replaces Baris Alper Yilmaz.",
+      "event_type": "sub",
+      "importance": 4,
+      "minute": 90,
+      "player": "Irfan Can Kahveci",
+      "seq": 16,
+      "team": "Turkey"
+    },
+    {
+      "assist": null,
+      "detail": "Kaan Ayhan (Türkiye) Goal at 90'+8'",
+      "event_type": "goal",
+      "importance": 1,
+      "minute": 90,
+      "player": "Kaan Ayhan",
+      "seq": 17,
+      "team": "Turkey"
+    }
+  ],
+  "format_version": 1,
+  "match": {
+    "away_team": "USA",
+    "display_clock": null,
+    "home_team": "Turkey",
+    "kickoff_utc": "2026-06-26T02:00Z",
+    "match_id": "espn:760470",
+    "minute": 90,
+    "payload": {
+      "city": null,
+      "group_name": null,
+      "round_name": null,
+      "score_ht_away": null,
+      "score_ht_home": null,
+      "stadium": null
+    },
+    "score_away": 2,
+    "score_home": 3,
+    "status": "FINISHED"
+  },
+  "standings": []
+}

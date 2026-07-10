@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import http.client
 import json
+import logging
+import math
 import urllib.error
 import urllib.request
 from collections.abc import Callable
@@ -37,6 +39,8 @@ from gamecollect.provider import (
     ShapeDriftError,
 )
 from gamecollect_football.taxonomy import EVENT_IMPORTANCE
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "ESPNAdapter",
@@ -171,6 +175,158 @@ def normalize_status(raw: str | None) -> MatchStatus:
         return _ESPN_DESCRIPTION_STATUS[raw]
 
     return MatchStatus.UNKNOWN
+
+
+# ESPN's ``status.type.state`` is the authoritative coarse lifecycle enum
+# ("pre" → not started, "in" → in progress, "post" → finished). The granular
+# ``status.type.description`` has MANY in-progress variants we do not enumerate —
+# "End of Extra Time", "First/Second Half Extra Time", "Penalty Shootout", … — so a
+# knockout match in extra time or a shootout normalizes to UNKNOWN via the description
+# table alone, which drops it out of LIVE_STATUSES: a live consumer stops showing it live
+# AND a per-match collector treats it as "no longer live" and self-reaps mid-match. We
+# therefore fall back to ``state`` whenever the description does not map, so an
+# in-progress match is never misclassified as UNKNOWN regardless of ESPN's wording.
+_ESPN_STATE_STATUS: dict[str, MatchStatus] = {
+    "pre": MatchStatus.SCHEDULED,
+    "in": MatchStatus.IN_PLAY,
+    "post": MatchStatus.FINISHED,
+}
+
+
+def _status_from_comp(comp: dict) -> MatchStatus:
+    """Resolve a competition's status: the granular ``description`` table first, then
+    ESPN's coarse ``state`` enum as a catch-all so extra-time / penalty-shootout states
+    (unmapped descriptions) resolve to IN_PLAY/FINISHED instead of UNKNOWN.
+
+    A mapped description still wins over ``state`` (e.g. ``Half Time`` → PAUSED keeps its
+    granularity); only the description-fall-through case consults ``state``.
+    """
+    type_ = (comp.get("status") or {}).get("type") or {}
+    status = normalize_status(type_.get("description"))
+    if status is MatchStatus.UNKNOWN:
+        status = _ESPN_STATE_STATUS.get(type_.get("state"), MatchStatus.UNKNOWN)
+    return status
+
+
+def _result_type_from_comp(comp: dict) -> str | None:
+    """How a finished match was decided: ``"regulation"``, ``"extra_time"``, or
+    ``"penalties"`` — ``None`` while the match is unfinished.
+
+    :func:`_status_from_comp` deliberately collapses all three finishes to
+    ``FINISHED`` (a new MatchStatus value would break ``LIVE_STATUSES`` and every
+    consumer switching on status), so this preserves the knockout distinction in
+    payload for downstream consumers alongside ``pen_winner_side``. ESPN encodes
+    it in ``status.type.description`` — "Full Time" / "… After Extra Time" /
+    "… After Penalties" (substring-matched to tolerate the "Final Score - "
+    prefix). A penalty shootout implies extra time was played first.
+    """
+    type_ = (comp.get("status") or {}).get("type") or {}
+    desc = type_.get("description") or ""
+    if "Penalt" in desc:
+        return "penalties"
+    if "Extra Time" in desc:
+        return "extra_time"
+    if type_.get("state") == "post":
+        return "regulation"
+    return None
+
+
+def _pen_score(competitor: dict) -> int | None:
+    """Read a competitor's penalty-shootout score.
+
+    ESPN exposes it as ``competitor.shootoutScore``: a float in the summary
+    endpoint (``2.0``/``4.0``), an int in the scoreboard endpoint (``2``/``4``),
+    and ABSENT on non-shootout matches (never ``0.0``). Accept both int and
+    float, guard None/bool/non-numeric.
+
+    A pen tally is a non-negative WHOLE number, so numeric drift that is not one
+    is treated as absent (``None``) rather than cast blindly — the same posture
+    the sibling ``int(competitor["score"])`` parse takes for a malformed score:
+    ``int(2.9)`` would silently persist a truncated ``2``, and ``int(nan)`` /
+    ``int(inf)`` raise ``ValueError``/``OverflowError`` that the fetch wrappers do
+    NOT map to ``ShapeDriftError`` (they catch only KeyError/IndexError/TypeError/
+    AttributeError), so an unguarded cast could escape the provider seam and crash
+    the poll. Returning None here lets the both-sides presence gate suppress the
+    half/garbage shootout instead.
+    """
+    raw = competitor.get("shootoutScore")
+    if raw is None or isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    if isinstance(raw, float) and (not math.isfinite(raw) or not raw.is_integer()):
+        return None
+    if raw < 0:
+        return None
+    return int(raw)
+
+
+def _extract_shootout(
+    competitors: list[dict], match_id: str
+) -> tuple[int | None, int | None, str | None]:
+    """Extract home/away pen scores + winning side from a ``competitors[]`` list.
+
+    Shared by both the summary and scoreboard normalizers so the two paths stay
+    identical (avoid drift). Returns ``(score_pen_home, score_pen_away,
+    pen_winner_side)`` in ESPN home/away terms (``pen_winner_side`` ∈
+    {"home", "away", None}) — the rest of the normalized match is home/away
+    oriented too; a consumer resolves the side to an entity the same way it does
+    for ``score_home``/``score_away``.
+
+    ``competitor.winner`` also marks the regulation/ET winner, so the winning
+    side is derived from ``winner`` ONLY when BOTH competitors carry a numeric
+    ``shootoutScore`` — that gate is the correctness boundary. When zero or two
+    sides carry ``winner=True`` in a shootout, ``pen_winner_side`` is left None
+    and logged. A disagreement between ``winner`` and the higher pen score is
+    logged but ESPN's ``winner`` value is stored.
+    """
+    score_pen_home: int | None = None
+    score_pen_away: int | None = None
+    home_winner = False
+    away_winner = False
+    for competitor in competitors:
+        side = competitor.get("homeAway")
+        pen = _pen_score(competitor)
+        winner = bool(competitor.get("winner"))
+        if side == "home":
+            score_pen_home = pen
+            home_winner = winner
+        elif side == "away":
+            score_pen_away = pen
+            away_winner = winner
+
+    # Gate: only a real shootout carries a numeric pen score on BOTH sides. A
+    # one-sided (malformed) shootoutScore yields all None — no half a pens
+    # string ever reaches the store or wire.
+    if score_pen_home is None or score_pen_away is None:
+        return None, None, None
+
+    winner_sides = [s for s, w in (("home", home_winner), ("away", away_winner)) if w]
+    if len(winner_sides) != 1:
+        logger.warning(
+            "ESPN shootout %s has %d competitors flagged winner=True (expected 1); "
+            "leaving pen_winner_side=None",
+            match_id,
+            len(winner_sides),
+        )
+        return score_pen_home, score_pen_away, None
+
+    pen_winner_side = winner_sides[0]
+
+    # Sanity-check: winner should agree with the higher pen score. Store ESPN's
+    # value regardless, but log a disagreement (ties are inconclusive, not
+    # disagreements).
+    if score_pen_home != score_pen_away:
+        higher_side = "home" if score_pen_home > score_pen_away else "away"
+        if higher_side != pen_winner_side:
+            logger.warning(
+                "ESPN shootout %s: winner=%s disagrees with higher pen score "
+                "(home=%d away=%d); storing ESPN winner",
+                match_id,
+                pen_winner_side,
+                score_pen_home,
+                score_pen_away,
+            )
+
+    return score_pen_home, score_pen_away, pen_winner_side
 
 
 # ---------------------------------------------------------------------------
@@ -705,11 +861,21 @@ class ESPNAdapter(MatchDataProvider):
 
     def _normalize_scoreboard_event(self, ev: dict) -> NormalizedMatch:
         """Normalize one ESPN scoreboard event into a NormalizedMatch (score only)."""
-        match_id = str(ev.get("id", ""))
+        # The event id is the canonical/provider match identity downstream. A
+        # missing, null, or blank id would collapse malformed events into the
+        # same source-qualified row, so fail closed at the provider seam rather
+        # than persist a collision-prone identity.
+        raw_id = ev.get("id")
+        if (
+            isinstance(raw_id, bool)
+            or not isinstance(raw_id, (str, int))
+            or (isinstance(raw_id, str) and not raw_id.strip())
+        ):
+            raise ShapeDriftError(f"ESPN scoreboard event has missing or blank id: {raw_id!r}")
+        match_id = str(raw_id).strip()
         comp = ev["competitions"][0]
 
-        status_desc = comp["status"]["type"].get("description")
-        status = normalize_status(status_desc)
+        status = _status_from_comp(comp)
 
         display_clock = comp["status"].get("displayClock") or None
 
@@ -732,6 +898,14 @@ class ESPNAdapter(MatchDataProvider):
             elif competitor.get("homeAway") == "away":
                 score_away = score_val
                 away_team = team_name
+
+        # Penalty-shootout result (knockout matches). Reads competitor.shootoutScore
+        # + competitor.winner, gated on shootoutScore present on both sides; all None
+        # for a non-shootout match. Carried in payload alongside the HT scores — core
+        # NormalizedMatch columns stay sport-agnostic (DESIGN.md §5).
+        score_pen_home, score_pen_away, pen_winner_side = _extract_shootout(
+            comp.get("competitors", []), match_id
+        )
 
         kickoff_utc = ev.get("date") or comp.get("date") or None
 
@@ -769,6 +943,10 @@ class ESPNAdapter(MatchDataProvider):
                 "city": city,
                 "round_name": round_name,
                 "group_name": None,
+                "score_pen_home": score_pen_home,
+                "score_pen_away": score_pen_away,
+                "pen_winner_side": pen_winner_side,
+                "result_type": _result_type_from_comp(comp),
             },
         )
 
@@ -788,12 +966,20 @@ class ESPNAdapter(MatchDataProvider):
         away_team: str | None = None
         kickoff_utc: str | None = None
 
+        # Penalty-shootout result (knockout matches). Defaults None; set from the
+        # first competition's competitors[] below.
+        score_pen_home: int | None = None
+        score_pen_away: int | None = None
+        pen_winner_side: str | None = None
+        # regulation/extra_time/penalties, derived from the first competition.
+        # Defaulted here so a headerless / empty-competitions summary normalizes
+        # to None rather than reading an unbound loop variable below.
+        result_type: str | None = None
+
         # Try to get status from header competitions
         header = data.get("header", {})
         for comp in header.get("competitions", []):
-            status_desc = comp.get("status", {}).get("type", {}).get("description")
-            if status_desc:
-                status = normalize_status(status_desc)
+            status = _status_from_comp(comp)
             display_clock = comp.get("status", {}).get("displayClock") or None
             minute = _parse_minute(display_clock)
             kickoff_utc = comp.get("date") or None
@@ -820,6 +1006,12 @@ class ESPNAdapter(MatchDataProvider):
                     score_away = score_val
                     away_team = team_name
                     score_ht_away = ht_val
+            # Reads competitor.shootoutScore + competitor.winner, gated on
+            # shootoutScore present on both sides; all None for a non-shootout match.
+            score_pen_home, score_pen_away, pen_winner_side = _extract_shootout(
+                comp.get("competitors", []), match_id
+            )
+            result_type = _result_type_from_comp(comp)
             break  # Only need first competition
 
         # keyEvents → NormalizedEvent list. A keyEvent may expand to two events
@@ -882,5 +1074,9 @@ class ESPNAdapter(MatchDataProvider):
                 "stats": [asdict(s) for s in stats],
                 "lineups": [asdict(lu) for lu in lineups],
                 "commentary": commentary,
+                "score_pen_home": score_pen_home,
+                "score_pen_away": score_pen_away,
+                "pen_winner_side": pen_winner_side,
+                "result_type": result_type,
             },
         )

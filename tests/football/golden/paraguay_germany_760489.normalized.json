@@ -1,0 +1,764 @@
+{
+  "events": [
+    {
+      "assist": null,
+      "detail": null,
+      "event_type": "kickoff",
+      "importance": 3,
+      "minute": null,
+      "player": null,
+      "seq": 0,
+      "team": null
+    },
+    {
+      "assist": "Matías Galarza",
+      "detail": "Goal! Germany 0, Paraguay 1. Julio Enciso (Paraguay) header from the centre of the box to the bottom left corner. Assisted by Matías Galarza with a cross following a corner.",
+      "event_type": "goal",
+      "importance": 1,
+      "minute": 42,
+      "player": "Julio Enciso",
+      "seq": 1,
+      "team": "Paraguay"
+    },
+    {
+      "assist": null,
+      "detail": null,
+      "event_type": "half_time",
+      "importance": 3,
+      "minute": 45,
+      "player": null,
+      "seq": 2,
+      "team": null
+    },
+    {
+      "assist": "Felix Nmecha",
+      "detail": "Substitution, Germany. Leon Goretzka replaces Felix Nmecha.",
+      "event_type": "sub",
+      "importance": 4,
+      "minute": 45,
+      "player": "Leon Goretzka",
+      "seq": 3,
+      "team": "Germany"
+    },
+    {
+      "assist": "Florian Wirtz",
+      "detail": "Goal! Germany 1, Paraguay 1. Kai Havertz (Germany) header from the centre of the box to the bottom right corner. Assisted by Florian Wirtz with a cross.",
+      "event_type": "goal",
+      "importance": 1,
+      "minute": 54,
+      "player": "Kai Havertz",
+      "seq": 4,
+      "team": "Germany"
+    },
+    {
+      "assist": "Gabriel Ávalos",
+      "detail": "Substitution, Paraguay. Gustavo Caballero replaces Gabriel Ávalos.",
+      "event_type": "sub",
+      "importance": 4,
+      "minute": 55,
+      "player": "Gustavo Caballero",
+      "seq": 5,
+      "team": "Paraguay"
+    },
+    {
+      "assist": "Julio Enciso",
+      "detail": "Substitution, Paraguay. Mauricio replaces Julio Enciso because of an injury.",
+      "event_type": "sub",
+      "importance": 4,
+      "minute": 57,
+      "player": "Maurício",
+      "seq": 6,
+      "team": "Paraguay"
+    },
+    {
+      "assist": "Deniz Undav",
+      "detail": "Substitution, Germany. Jamal Musiala replaces Deniz Undav.",
+      "event_type": "sub",
+      "importance": 4,
+      "minute": 63,
+      "player": "Jamal Musiala",
+      "seq": 7,
+      "team": "Germany"
+    },
+    {
+      "assist": null,
+      "detail": "Andrés Cubas (Paraguay) is shown the yellow card for a bad foul.",
+      "event_type": "yellow",
+      "importance": 3,
+      "minute": 65,
+      "player": "Andrés Cubas",
+      "seq": 8,
+      "team": "Paraguay"
+    },
+    {
+      "assist": "Aleksandar Pavlovic",
+      "detail": "Substitution, Germany. Waldemar Anton replaces Aleksandar Pavlovic.",
+      "event_type": "sub",
+      "importance": 4,
+      "minute": 79,
+      "player": "Waldemar Anton",
+      "seq": 9,
+      "team": "Germany"
+    },
+    {
+      "assist": "Leroy Sané",
+      "detail": "Substitution, Germany. Nick Woltemade replaces Leroy Sané.",
+      "event_type": "sub",
+      "importance": 4,
+      "minute": 88,
+      "player": "Nick Woltemade",
+      "seq": 10,
+      "team": "Germany"
+    },
+    {
+      "assist": "Miguel Almirón",
+      "detail": "Substitution, Paraguay. Gustavo Velázquez replaces Miguel Almirón.",
+      "event_type": "sub",
+      "importance": 4,
+      "minute": 90,
+      "player": "Gustavo Velázquez",
+      "seq": 11,
+      "team": "Paraguay"
+    },
+    {
+      "assist": "Juan Jose Cáceres",
+      "detail": "Substitution, Paraguay. Braian Ojeda replaces Juan José Cáceres.",
+      "event_type": "sub",
+      "importance": 4,
+      "minute": 99,
+      "player": "Braian Ojeda",
+      "seq": 12,
+      "team": "Paraguay"
+    },
+    {
+      "assist": "Damián Bobadilla",
+      "detail": "Substitution, Paraguay. Antonio Sanabria replaces Damián Bobadilla.",
+      "event_type": "sub",
+      "importance": 4,
+      "minute": 99,
+      "player": "Antonio Sanabria",
+      "seq": 13,
+      "team": "Paraguay"
+    },
+    {
+      "assist": null,
+      "detail": "Kai Havertz (Germany) is shown the yellow card for a bad foul.",
+      "event_type": "yellow",
+      "importance": 3,
+      "minute": 106,
+      "player": "Kai Havertz",
+      "seq": 14,
+      "team": "Germany"
+    },
+    {
+      "assist": "Florian Wirtz",
+      "detail": "Substitution, Germany. Nadiem Amiri replaces Florian Wirtz.",
+      "event_type": "sub",
+      "importance": 4,
+      "minute": 110,
+      "player": "Nadiem Amiri",
+      "seq": 15,
+      "team": "Germany"
+    },
+    {
+      "assist": "Antonio Rüdiger",
+      "detail": "Substitution, Germany. Malick Thiaw replaces Antonio Rüdiger.",
+      "event_type": "sub",
+      "importance": 4,
+      "minute": 110,
+      "player": "Malick Thiaw",
+      "seq": 16,
+      "team": "Germany"
+    },
+    {
+      "assist": null,
+      "detail": "Jamal Musiala (Germany) is shown the yellow card for a bad foul.",
+      "event_type": "yellow",
+      "importance": 3,
+      "minute": 115,
+      "player": "Jamal Musiala",
+      "seq": 17,
+      "team": "Germany"
+    },
+    {
+      "assist": null,
+      "detail": "Matías Galarza (Paraguay) is shown the yellow card for a bad foul.",
+      "event_type": "yellow",
+      "importance": 3,
+      "minute": 117,
+      "player": "Matías Galarza",
+      "seq": 18,
+      "team": "Paraguay"
+    },
+    {
+      "assist": "Júnior Alonso",
+      "detail": "Substitution, Paraguay. Fabián Balbuena replaces Júnior Alonso.",
+      "event_type": "sub",
+      "importance": 4,
+      "minute": 120,
+      "player": "Fabián Balbuena",
+      "seq": 19,
+      "team": "Paraguay"
+    }
+  ],
+  "match": {
+    "away_team": "Paraguay",
+    "display_clock": null,
+    "home_team": "Germany",
+    "kickoff_utc": "2026-06-29T20:30Z",
+    "match_id": "760489",
+    "minute": null,
+    "pen_winner_side": "away",
+    "result_type": "penalties",
+    "score_away": 1,
+    "score_home": 1,
+    "score_ht_away": 1,
+    "score_ht_home": 0,
+    "score_pen_away": 4,
+    "score_pen_home": 3,
+    "status": "FINISHED"
+  },
+  "side_tables": {
+    "commentary_count": 174,
+    "lineups": [
+      {
+        "formation": "4-4-2",
+        "home_away": "home",
+        "players": [
+          {
+            "athlete_id": "84774",
+            "display_name": "Manuel Neuer",
+            "formation_place": 1,
+            "jersey": "1",
+            "position": "G",
+            "starter": true,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "169438",
+            "display_name": "Antonio Rüdiger",
+            "formation_place": 6,
+            "jersey": "2",
+            "position": "CD-L",
+            "starter": true,
+            "subbed_in": false,
+            "subbed_out": true
+          },
+          {
+            "athlete_id": "188052",
+            "display_name": "Jonathan Tah",
+            "formation_place": 5,
+            "jersey": "4",
+            "position": "CD-R",
+            "starter": true,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "120829",
+            "display_name": "Nathaniel Brown",
+            "formation_place": 3,
+            "jersey": "18",
+            "position": "LB",
+            "starter": true,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "190161",
+            "display_name": "Joshua Kimmich",
+            "formation_place": 2,
+            "jersey": "6",
+            "position": "RB",
+            "starter": true,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "359370",
+            "display_name": "Aleksandar Pavlovic",
+            "formation_place": 8,
+            "jersey": "5",
+            "position": "CM-L",
+            "starter": true,
+            "subbed_in": false,
+            "subbed_out": true
+          },
+          {
+            "athlete_id": "281122",
+            "display_name": "Felix Nmecha",
+            "formation_place": 4,
+            "jersey": "23",
+            "position": "CM-R",
+            "starter": true,
+            "subbed_in": false,
+            "subbed_out": true
+          },
+          {
+            "athlete_id": "303748",
+            "display_name": "Florian Wirtz",
+            "formation_place": 11,
+            "jersey": "17",
+            "position": "LM",
+            "starter": true,
+            "subbed_in": false,
+            "subbed_out": true
+          },
+          {
+            "athlete_id": "202641",
+            "display_name": "Leroy Sané",
+            "formation_place": 7,
+            "jersey": "19",
+            "position": "RM",
+            "starter": true,
+            "subbed_in": false,
+            "subbed_out": true
+          },
+          {
+            "athlete_id": "273300",
+            "display_name": "Deniz Undav",
+            "formation_place": 9,
+            "jersey": "26",
+            "position": "CF-L",
+            "starter": true,
+            "subbed_in": false,
+            "subbed_out": true
+          },
+          {
+            "athlete_id": "231182",
+            "display_name": "Kai Havertz",
+            "formation_place": 10,
+            "jersey": "7",
+            "position": "CF-R",
+            "starter": true,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "249548",
+            "display_name": "David Raum",
+            "formation_place": 0,
+            "jersey": "22",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "290811",
+            "display_name": "Jamie Leweling",
+            "formation_place": 0,
+            "jersey": "9",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "220714",
+            "display_name": "Waldemar Anton",
+            "formation_place": 0,
+            "jersey": "3",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": true,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "210818",
+            "display_name": "Nadiem Amiri",
+            "formation_place": 0,
+            "jersey": "20",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": true,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "205750",
+            "display_name": "Alexander Nübel",
+            "formation_place": 0,
+            "jersey": "21",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "290232",
+            "display_name": "Angelo Stiller",
+            "formation_place": 0,
+            "jersey": "16",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "303821",
+            "display_name": "Jamal Musiala",
+            "formation_place": 0,
+            "jersey": "10",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": true,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "303444",
+            "display_name": "Malick Thiaw",
+            "formation_place": 0,
+            "jersey": "24",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": true,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "298349",
+            "display_name": "Nick Woltemade",
+            "formation_place": 0,
+            "jersey": "11",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": true,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "132659",
+            "display_name": "Pascal Gross",
+            "formation_place": 0,
+            "jersey": "13",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "364897",
+            "display_name": "Assan Ouédraogo",
+            "formation_place": 0,
+            "jersey": "25",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "290639",
+            "display_name": "Maximilian Beier",
+            "formation_place": 0,
+            "jersey": "14",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "138213",
+            "display_name": "Oliver Baumann",
+            "formation_place": 0,
+            "jersey": "12",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "174550",
+            "display_name": "Leon Goretzka",
+            "formation_place": 0,
+            "jersey": "8",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": true,
+            "subbed_out": false
+          }
+        ],
+        "team": "Germany"
+      },
+      {
+        "formation": "4-4-2",
+        "home_away": "away",
+        "players": [
+          {
+            "athlete_id": "301648",
+            "display_name": "Orlando Gill",
+            "formation_place": 1,
+            "jersey": "12",
+            "position": "G",
+            "starter": true,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "227682",
+            "display_name": "José Canale",
+            "formation_place": 6,
+            "jersey": "13",
+            "position": "CD-L",
+            "starter": true,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "118395",
+            "display_name": "Gustavo Gómez",
+            "formation_place": 5,
+            "jersey": "15",
+            "position": "CD-R",
+            "starter": true,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "181657",
+            "display_name": "Júnior Alonso",
+            "formation_place": 3,
+            "jersey": "6",
+            "position": "LB",
+            "starter": true,
+            "subbed_in": false,
+            "subbed_out": true
+          },
+          {
+            "athlete_id": "84295",
+            "display_name": "Juan Jose Cáceres",
+            "formation_place": 2,
+            "jersey": "4",
+            "position": "RB",
+            "starter": true,
+            "subbed_in": false,
+            "subbed_out": true
+          },
+          {
+            "athlete_id": "202501",
+            "display_name": "Andrés Cubas",
+            "formation_place": 8,
+            "jersey": "14",
+            "position": "CM-L",
+            "starter": true,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "301516",
+            "display_name": "Damián Bobadilla",
+            "formation_place": 4,
+            "jersey": "16",
+            "position": "CM-R",
+            "starter": true,
+            "subbed_in": false,
+            "subbed_out": true
+          },
+          {
+            "athlete_id": "297328",
+            "display_name": "Matías Galarza",
+            "formation_place": 11,
+            "jersey": "23",
+            "position": "LM",
+            "starter": true,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "48128",
+            "display_name": "Miguel Almirón",
+            "formation_place": 7,
+            "jersey": "10",
+            "position": "RM",
+            "starter": true,
+            "subbed_in": false,
+            "subbed_out": true
+          },
+          {
+            "athlete_id": "20975",
+            "display_name": "Julio Enciso",
+            "formation_place": 9,
+            "jersey": "19",
+            "position": "CF-L",
+            "starter": true,
+            "subbed_in": false,
+            "subbed_out": true
+          },
+          {
+            "athlete_id": "208421",
+            "display_name": "Gabriel Ávalos",
+            "formation_place": 10,
+            "jersey": "21",
+            "position": "CF-R",
+            "starter": true,
+            "subbed_in": false,
+            "subbed_out": true
+          },
+          {
+            "athlete_id": "164262",
+            "display_name": "Gatito Fernández",
+            "formation_place": 0,
+            "jersey": "1",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "257754",
+            "display_name": "Alex Arce",
+            "formation_place": 0,
+            "jersey": "18",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "301653",
+            "display_name": "Ramón Sosa",
+            "formation_place": 0,
+            "jersey": "7",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "190375",
+            "display_name": "Gastón Olveira",
+            "formation_place": 0,
+            "jersey": "22",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "192162",
+            "display_name": "Antonio Sanabria",
+            "formation_place": 0,
+            "jersey": "9",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": true,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "399687",
+            "display_name": "Alexandro Maidana",
+            "formation_place": 0,
+            "jersey": "26",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "287035",
+            "display_name": "Isidro Pitta",
+            "formation_place": 0,
+            "jersey": "25",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "119413",
+            "display_name": "Gustavo Velázquez",
+            "formation_place": 0,
+            "jersey": "2",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": true,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "215401",
+            "display_name": "Omar Alderete",
+            "formation_place": 0,
+            "jersey": "3",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "265977",
+            "display_name": "Braian Ojeda",
+            "formation_place": 0,
+            "jersey": "20",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": true,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "199101",
+            "display_name": "Fabián Balbuena",
+            "formation_place": 0,
+            "jersey": "5",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": true,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "188160",
+            "display_name": "Alejandro Romero Gamarra",
+            "formation_place": 0,
+            "jersey": "17",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "154853",
+            "display_name": "Gustavo Caballero",
+            "formation_place": 0,
+            "jersey": "24",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": true,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "289046",
+            "display_name": "Maurício",
+            "formation_place": 0,
+            "jersey": "11",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": true,
+            "subbed_out": false
+          }
+        ],
+        "team": "Paraguay"
+      }
+    ],
+    "stats": [
+      {
+        "corners": null,
+        "fouls": 18,
+        "offsides": 4,
+        "possession": 75.6,
+        "red_cards": 0,
+        "shots": 21,
+        "shots_on_target": 6,
+        "team": "Germany",
+        "yellow_cards": 2
+      },
+      {
+        "corners": null,
+        "fouls": 12,
+        "offsides": 1,
+        "possession": 24.4,
+        "red_cards": 0,
+        "shots": 7,
+        "shots_on_target": 3,
+        "team": "Paraguay",
+        "yellow_cards": 2
+      }
+    ]
+  }
+}

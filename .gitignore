@@ -29,3 +29,4 @@ htmlcov/
 
 # deep-review local state (skein deep-review skill)
 .deep-review/
+.conduct/

@@ -70,19 +70,38 @@ A pack is a Python package (entry-point registered) supplying:
 - display metadata (replaces the menubar's baked-in `teams.json`),
 - compaction boundaries (half-time, innings, stints — used by workers to
   compact context).
+- a `seed_match(conn, writer, match) -> str | None` hook: the collection engine
+  is sport-agnostic and never imports a pack, so it reaches a pack's
+  seed/reconcile logic only through this hook. It must ensure a `matches` row
+  exists (owned by `writer.source`) before the engine appends the match's
+  events and return the canonical `match_id` to write children against; `None`
+  means the match could not be seeded (e.g. missing identity fields) and the
+  engine skips its child writes for that poll. Football wires
+  `register_unreconciled_match` (source-qualified strip rows); packs emitting
+  already-canonical ids can rely on the core `default_seed_match`.
 
 First pack: football / FIFA World Cup 2026 (ported from gamealerts). A second
 tournament (e.g. Champions League) should be ~configuration on that pack.
 
 ## 6. Interfaces
 
-- **Client library** (canonical): `list_matches`, `get_state`,
-  `get_events_since`, `get_standings`, `get_squad`, `get_player_stats`,
-  historical lookups. Sync, typed returns.
+- **Client library** (canonical): the four **core** ops `list_matches`,
+  `get_state`, `get_events_since`, `get_standings` (plus historical lookups,
+  later) live in `gamecollect.client`. Sync, typed returns. Packs contribute
+  further read ops over their side tables — football adds `get_squad` and
+  `get_player_stats`, implemented in `gamecollect_football` — so core never
+  imports a pack module.
+- **Operation registry** (`gamecollect.registry`): the single source of truth.
+  Every operation — core or pack-contributed — is declared once (name, params,
+  summary, output JSON Schema); the CLI's argparse subcommands and the tools
+  manifest are both generated from the merged registry, so the CLI surface,
+  the library, and the manifest cannot drift (a registry-derivation equality
+  test pins this).
 - **CLI** `gamecollect`: thin `main()` over the library, `--json` output whose
-  schemas ARE the public contract. `gamecollect tools --json` emits a manifest
-  (commands + output JSON schemas) for runtime discovery; consuming agents
-  generate function-calling tool definitions from it.
+  schemas ARE the public contract (versioned via the manifest's
+  `contract_version`, golden-file tested). `gamecollect tools --json` emits a
+  manifest (commands + output JSON schemas) for runtime discovery; consuming
+  agents generate function-calling tool definitions from it.
 - **MCP wrapper**: optional, later, generated from the manifest. Never the
   contract.
 
@@ -92,16 +111,61 @@ live state — upstream provider coverage for these must be verified per pack.
 
 ## 7. Record/replay is a provider, not test scaffolding
 
-`ReplayProvider` implements the same provider ABC, reading recorded events with
-original (or accelerated) timing. It ships in the core library because it is
-the eval/hardening harness for any consumer: replay a recorded match, assert
-consumer behavior against ground truth (facts-only checks against the event
-log are the strongest hallucination guard). Recording is symmetric: any live
-session can be captured as a replayable fixture.
+`ReplayProvider` (`gamecollect.replay`) implements the same provider ABC,
+reading recorded events with original (or accelerated) timing. It ships in the
+core library because it is the eval/hardening harness for any consumer: replay a
+recorded match, assert consumer behavior against ground truth (facts-only checks
+against the event log are the strongest hallucination guard). Recording is
+symmetric: any live session can be captured as a replayable fixture.
 
-Seed fixtures to import from gamealerts' DBs: Morocco–Haiti 4–2 (21 events +
-21 commentary rows, real DB), Canada–Qatar 6–0 (fictional DB; Jonathan David
-hat-trick — the brace/hat-trick context test), NZ–Belgium 1–5, Turkey–USA 3–2.
+`ReplayProvider(fixture, speed=1.0)` streams a fixture's recorded events out over
+successive polls. Two pacing modes: **paced** (finite `speed`) reveals an event
+recorded at game-minute *m* once `m*60/speed` wall-clock seconds have elapsed
+(`speed=60` replays 90 minutes in ~90 seconds); **step** (`speed=math.inf`)
+reveals exactly one more event per `fetch_live_matches`, deterministically and
+with no clock — the mode the determinism/e2e tests use, driving the engine by
+polling and watching `exhausted`. Because the sport-agnostic core cannot
+recompute a running score (a goal incrementing the score is football knowledge),
+every replay snapshot carries the fixture's recorded *final* header state
+verbatim while the event list grows; the fully-revealed (terminal) snapshot
+equals the fixture header exactly, which is what makes a record→replay round trip
+reproduce the original fixture and makes `updated_at` the only field a
+determinism check must exclude (the writer auto-stamps it wall-clock; the replay
+path has no clock injection into `upsert_match`).
+
+Fixture format (`gamecollect.fixture_io`, one match per file, checked into git
+as JSON): a `format_version` field, a `match` header (id, status, minute,
+score, clock, team names, kickoff, payload), an `events` list in seq order
+carrying the full `NormalizedEvent` shape, and nullable `entities`/`standings`
+snapshots (a live `--record` session only sees `NormalizedMatch` state, so it
+records those empty; the importer fills them from the source DB). The engine's
+`--record` flag writes fixtures through the same module a replay reads.
+
+Seed fixtures, imported by `scripts/import_gamealerts_fixtures.py`. **Fixture
+locations (correcting an earlier ambiguity here about which DB holds what):** the
+three real matches live in `~/.local/share/gamealerts/gamealerts.db` — Morocco–
+Haiti `espn:760464` 4–2 FINISHED (21 events), NZ–Belgium `espn:760477` 1–5
+FINISHED (20 events), Turkey–USA `espn:760470` 3–2 FINISHED (18 events); Canada–
+Qatar `2026-06-18_canada_vs_qatar_9` 6–0 FINISHED (6 events, Jonathan David
+hat-trick — the brace/hat-trick context test) lives in the separate
+`gamealerts-fictional.db`, whose **older schema shape** lacks
+`rosters.player_name_folded` and has no `lineups` table. Commentary rows are NOT
+imported (prose is out of scope, §3).
+
+The importer opens each source DB READ-ONLY (the live DBs are mutable, with
+active WAL) and tolerates both schema shapes (and both column namings — the
+`matches`/`lineups` column names are not plan-pinned, so `team1`/`home_team`,
+`score_home`/`home_score` etc. are read tolerantly). Event-field mapping
+(gamealerts → collector): `type` → the football taxonomy key, `importance` from
+the pack taxonomy default, `minute`/`detail`/`team`/`player`/`assist` preserved;
+the derived collector columns are computed downstream from these preserved
+fields (`period` from `minute`; `actor_entity`/`target_entity` from
+`player`/`assist`; entity `parent` from `team`) — the `NormalizedEvent` fixture
+shape has no slots for them, so the fixture is the faithful source record. At
+import time it re-asserts the pinned ground truth (event count/score/status) and
+fails loudly on drift, and fails if any distinct gamealerts `type` has no
+taxonomy entry. `--check <dir>` re-validates that checked-in fixtures parse and
+replay deterministically (CI-safe; never touches `~/.local/share`).
 
 ## 8. Sequencing (relative to gamealerts)
 

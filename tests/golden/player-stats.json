@@ -1,0 +1,15 @@
+[
+  {
+    "source": "wc2026-test",
+    "match_id": "wc2026-test:golden",
+    "team": "Canada",
+    "possession": 61.5,
+    "shots": 15,
+    "shots_on_target": 9,
+    "corners": 7,
+    "fouls": null,
+    "yellow_cards": null,
+    "red_cards": null,
+    "offsides": null
+  }
+]

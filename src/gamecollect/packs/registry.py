@@ -14,6 +14,7 @@ from importlib.metadata import entry_points
 
 from gamecollect.packs.spec import EventTypeDecl, SportPack
 from gamecollect.provider import MatchDataProvider
+from gamecollect.registry import Operation
 
 __all__ = [
     "ENTRY_POINT_GROUP",
@@ -161,6 +162,15 @@ def validate_pack(pack: object, *, entry_point_name: str | None = None) -> Sport
     ):
         raise PackValidationError(
             f"pack {name!r}: 'side_table_ddl' must be a tuple of non-empty SQL strings"
+        )
+
+    # Contributed operations are optional, but when supplied must be a tuple of
+    # Operation objects (the registry merges them onto the core ops at load).
+    if not isinstance(pack.operations, tuple) or not all(
+        isinstance(op, Operation) for op in pack.operations
+    ):
+        raise PackValidationError(
+            f"pack {name!r}: 'operations' must be a tuple of registry Operation objects"
         )
 
     return pack

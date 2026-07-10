@@ -1,12 +1,12 @@
 # Task: Collector foundation — scaffold, schema v1, sport-pack SDK, football pack
 
-**Status**: In Review
+**Status**: Shipped
 **Component**: collector
 **Assigned to**: Claude
 **Priority**: High
 **Branch**: feature/collector-scaffold
 **Created**: 2026-07-02
-**Completed**:
+**Completed**: 2026-07-03
 
 ## Objective
 

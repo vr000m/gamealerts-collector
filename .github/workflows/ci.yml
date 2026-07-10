@@ -49,7 +49,9 @@ jobs:
       - name: Scaffold smoke (import + console script)
         run: |
           /tmp/smoke-venv/bin/python -c "import gamecollect; print(gamecollect.__version__)"
-          /tmp/smoke-venv/bin/gamecollect
+          # --help builds the full parser (incl. registry-derived subcommands)
+          # and exits 0; bare `gamecollect` exits 2 by design (subcommand is required).
+          /tmp/smoke-venv/bin/gamecollect --help
 
       # Phase 4 extension of the clean-venv smoke: the installed wheel (no dev
       # deps) must load the football pack via its entry point, normalize the

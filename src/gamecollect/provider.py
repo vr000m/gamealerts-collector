@@ -22,6 +22,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import Any
 
 __all__ = [
     "MatchStatus",
@@ -29,6 +30,7 @@ __all__ = [
     "LIVE_STATUS_VALUES",
     "NormalizedEvent",
     "NormalizedMatch",
+    "is_empty_payload_value",
     "ProviderError",
     "ShapeDriftError",
     "ProviderUnavailableError",
@@ -109,6 +111,41 @@ class NormalizedMatch:
     payload: dict = field(default_factory=dict)
 
 
+def is_empty_payload_value(value: Any) -> bool:
+    """True for the "carries no information" payload values: None/""/[]/{}.
+
+    Shared by every payload-merge site that must not let a sparse snapshot's
+    explicitly-present empty value clobber a richer stored value — core's
+    in-memory :func:`~gamecollect.engine._merge_over_base` and the football
+    pack's DB-side ``_merge_preserving_richer`` both call this so the rule
+    can't drift between the two merge paths. ``0``/``0.0``/``False`` are real
+    data (a nil score, an unset flag) and are NOT empty."""
+    if value is None:
+        return True
+    if isinstance(value, (str, list, dict, tuple)) and len(value) == 0:
+        return True
+    return False
+
+
+def merge_payload_preserving_richer(base: dict, incoming: dict) -> dict:
+    """Merge ``incoming`` over ``base`` with the preserve-richer rule; return a new dict.
+
+    A non-empty ``incoming`` value always wins, and a key absent from ``base`` is
+    always added, but an explicitly-empty ``incoming`` value
+    (:func:`is_empty_payload_value` — ``None``/``""``/``[]``/``{}``) NEVER clobbers
+    a key ``base`` already carries. This is the single source of truth for the
+    preserve-richer rule; every payload-merge site (core's in-memory ``_merge_detail``
+    / ``_merge_over_base``, the football pack's DB-side ``_merge_preserving_richer``,
+    and ``default_seed_match``) routes through here so the rule can't drift. Callers
+    needing in-place mutation do ``base.update(merge_payload_preserving_richer(base, incoming))``.
+    """
+    merged = dict(base)
+    for key, value in incoming.items():
+        if key not in merged or not is_empty_payload_value(value):
+            merged[key] = value
+    return merged
+
+
 # ---------------------------------------------------------------------------
 # Exceptions
 # ---------------------------------------------------------------------------
@@ -132,12 +169,27 @@ class ProviderUnavailableError(ProviderError):
 
 
 class MatchDataProvider(ABC):
-    """Abstract provider for live match data."""
+    """Abstract provider for live match data.
+
+    ``fetch_live_matches`` returns the current provider slate: enough match state
+    for the engine to decide which matches are in progress and seed/update core
+    match rows (identity, status, clock, score, and any scoreboard-level
+    payload). Providers may return partial event lists here; ESPN scoreboard
+    snapshots, for example, intentionally carry ``events=[]``.
+
+    ``fetch_match_detail(match_id)`` returns the full current snapshot for one
+    match id, including all provider-normalized events currently known and any
+    sport-specific payload extras that belong to detail/summary endpoints. The
+    engine calls it for in-progress matches before diffing/writing, so live,
+    replay, and fake providers must make this method a pure read of the same
+    logical provider state unless their documented provider API requires
+    otherwise. In particular, replay detail reads must not advance replay time.
+    """
 
     @abstractmethod
     def fetch_live_matches(self) -> list[NormalizedMatch]:
-        """Return all currently live/in-play matches."""
+        """Return the current live slate; event lists may be partial or empty."""
 
     @abstractmethod
     def fetch_match_detail(self, match_id: str) -> NormalizedMatch:
-        """Return full detail (events + payload extras) for a single match."""
+        """Return full current detail (events + payload extras) for one match."""

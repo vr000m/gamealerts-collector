@@ -21,6 +21,7 @@ typed views belong to the client library layered on top (interfaces plan).
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import urllib.parse
 from pathlib import Path
@@ -36,6 +37,7 @@ __all__ = [
     "open_reader",
     "list_matches",
     "get_state",
+    "get_stored_payload",
     "get_events_since",
     "get_standings",
     "get_entity",
@@ -117,6 +119,40 @@ def get_state(conn: sqlite3.Connection, match_id: str) -> dict[str, Any] | None:
     """Return the current matches row for ``match_id``, or None if unknown."""
     rows = _query(conn, "SELECT * FROM matches WHERE match_id = ?", (match_id,))
     return rows[0] if rows else None
+
+
+def decode_payload(raw: Any) -> dict[str, Any]:
+    """Decode a stored ``matches.payload`` value to a dict.
+
+    Returns ``{}`` when *raw* is empty, unparseable, or not a JSON object.
+    Accepts either the raw JSON text (the DB column shape) or an
+    already-decoded value, so callers holding a fetched row and callers
+    re-reading by id share one decode-or-empty-dict rule (the drift-free
+    single source for :func:`get_stored_payload`, the reconciler's
+    candidate-name resolver, and the engine's stored-snapshot reader).
+    """
+    if not raw:
+        return {}
+    if isinstance(raw, dict):
+        return raw
+    try:
+        decoded = json.loads(raw)
+    except (TypeError, ValueError):
+        return {}
+    return decoded if isinstance(decoded, dict) else {}
+
+
+def get_stored_payload(conn: sqlite3.Connection, match_id: str) -> dict[str, Any]:
+    """Decode the stored ``matches.payload`` JSON for ``match_id`` (``{}`` when
+    the row is absent or the payload is empty/unparseable/not an object).
+
+    The one deliberate exception to this module's raw-JSON-text rule: write
+    paths (core ``default_seed_match``, pack reconcilers) must read-merge-write
+    because ``upsert_match`` replaces ``payload`` wholesale, and they all need
+    the identical decode-or-empty-dict semantics.
+    """
+    existing = get_state(conn, match_id)
+    return decode_payload(existing["payload"]) if existing is not None else {}
 
 
 def get_events_since(

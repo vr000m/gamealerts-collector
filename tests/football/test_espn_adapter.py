@@ -183,6 +183,80 @@ def test_malformed_later_scoreboard_event_raises_shape_drift():
         adapter.fetch_live_matches()
 
 
+def test_scoreboard_event_missing_id_raises_shape_drift():
+    """Codex adversarial fix: a scoreboard event with a missing, null, or blank
+    id must fail closed at the provider seam. Otherwise it normalizes to an empty
+    match_id, collapsing malformed events into one collision-prone identity.
+
+    The event must otherwise satisfy assert_espn_scoreboard_shape (displayClock +
+    competitors[0].score) so the shape check doesn't fire first and mask whether
+    the id check itself works — a bare status.type-only event is shape-invalid on
+    its own and would raise "displayClock missing" before ever reaching the id
+    validation in _normalize_scoreboard_event, making the test pass for the wrong
+    reason."""
+    import copy
+
+    import pytest
+
+    from gamecollect.provider import ShapeDriftError
+    from gamecollect_football.espn import ESPNAdapter
+
+    good_event = {
+        "id": "1",
+        "competitions": [
+            {
+                "status": {"type": {"description": "In Progress"}, "displayClock": "12'"},
+                "competitors": [
+                    {"score": "1", "homeAway": "home"},
+                    {"score": "0", "homeAway": "away"},
+                ],
+            }
+        ],
+    }
+    for bad_id in ({}, {"id": None}, {"id": ""}, {"id": "   "}):
+        event = copy.deepcopy(good_event)
+        event.pop("id")
+        event.update(bad_id)
+        data = {"events": [event]}
+        adapter = ESPNAdapter(http_get=lambda url, params=None, _d=data: _d)
+        with pytest.raises(ShapeDriftError, match="missing or blank id"):
+            adapter.fetch_live_matches()
+
+
+def test_scoreboard_event_boolean_id_raises_shape_drift():
+    """Same shape-validity note as test_scoreboard_event_missing_id_raises_shape_drift
+    above: displayClock + competitors[0].score must be present so the id check —
+    not the shape assertion — is what raises."""
+    import pytest
+
+    from gamecollect.provider import ShapeDriftError
+    from gamecollect_football.espn import ESPNAdapter
+
+    for bad_id in (False, True):
+        data = {
+            "events": [
+                {
+                    "id": bad_id,
+                    "competitions": [
+                        {
+                            "status": {
+                                "type": {"description": "In Progress"},
+                                "displayClock": "12'",
+                            },
+                            "competitors": [
+                                {"score": "1", "homeAway": "home"},
+                                {"score": "0", "homeAway": "away"},
+                            ],
+                        }
+                    ],
+                }
+            ]
+        }
+        adapter = ESPNAdapter(http_get=lambda url, params=None, _d=data: _d)
+        with pytest.raises(ShapeDriftError, match="missing or blank id"):
+            adapter.fetch_live_matches()
+
+
 def test_null_athlete_in_key_event_does_not_crash():
     """ESPN emits present-but-null nested values; normalization must not
     raise raw AttributeError (it previously escaped the ProviderError seam)."""

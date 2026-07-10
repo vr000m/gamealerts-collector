@@ -1,0 +1,20 @@
+[
+  {
+    "match_id": "wc2026-test:golden",
+    "source": "wc2026-test",
+    "kickoff_utc": "2026-06-18T19:00:00+00:00",
+    "home_entity": "t-can",
+    "away_entity": "t-qat",
+    "status": "FINISHED",
+    "minute": 90,
+    "period": 2,
+    "score_home": 6,
+    "score_away": 0,
+    "display_clock": "90'",
+    "payload": {
+      "round": "group",
+      "venue": "BC Place"
+    },
+    "updated_at": "2026-06-18T20:45:00+00:00"
+  }
+]

@@ -1,0 +1,734 @@
+{
+  "events": [
+    {
+      "assist": null,
+      "detail": "First Half begins.",
+      "event_type": "kickoff",
+      "importance": 3,
+      "minute": null,
+      "player": null,
+      "seq": 0,
+      "team": null
+    },
+    {
+      "assist": null,
+      "detail": "First Half ends, Portugal 0, Spain 0.",
+      "event_type": "half_time",
+      "importance": 3,
+      "minute": 45,
+      "player": null,
+      "seq": 1,
+      "team": null
+    },
+    {
+      "assist": "Nuno Mendes",
+      "detail": "Substitution, Portugal. Nélson Semedo replaces Nuno Mendes because of an injury.",
+      "event_type": "sub",
+      "importance": 4,
+      "minute": 56,
+      "player": "Nélson Semedo",
+      "seq": 2,
+      "team": "Portugal"
+    },
+    {
+      "assist": "João Cancelo",
+      "detail": "Substitution, Portugal. Diogo Dalot replaces João Cancelo.",
+      "event_type": "sub",
+      "importance": 4,
+      "minute": 71,
+      "player": "Diogo Dalot",
+      "seq": 3,
+      "team": "Portugal"
+    },
+    {
+      "assist": "João Félix",
+      "detail": "Substitution, Portugal. Rafael Leão replaces João Félix.",
+      "event_type": "sub",
+      "importance": 4,
+      "minute": 71,
+      "player": "Rafael Leão",
+      "seq": 4,
+      "team": "Portugal"
+    },
+    {
+      "assist": "Álex Baena",
+      "detail": "Substitution, Spain. Ferran Torres replaces Álex Baena.",
+      "event_type": "sub",
+      "importance": 4,
+      "minute": 75,
+      "player": "Ferran Torres",
+      "seq": 5,
+      "team": "Spain"
+    },
+    {
+      "assist": "Pedro Neto",
+      "detail": "Substitution, Portugal. Francisco Conceição replaces Pedro Neto.",
+      "event_type": "sub",
+      "importance": 4,
+      "minute": 83,
+      "player": "Francisco Conceição",
+      "seq": 6,
+      "team": "Portugal"
+    },
+    {
+      "assist": "Vitinha",
+      "detail": "Substitution, Portugal. Bernardo Silva replaces Vitinha.",
+      "event_type": "sub",
+      "importance": 4,
+      "minute": 83,
+      "player": "Bernardo Silva",
+      "seq": 7,
+      "team": "Portugal"
+    },
+    {
+      "assist": "Pedri",
+      "detail": "Substitution, Spain. Fabián Ruiz replaces Pedri.",
+      "event_type": "sub",
+      "importance": 4,
+      "minute": 85,
+      "player": "Fabián Ruiz",
+      "seq": 8,
+      "team": "Spain"
+    },
+    {
+      "assist": "Dani Olmo",
+      "detail": "Substitution, Spain. Mikel Merino replaces Dani Olmo.",
+      "event_type": "sub",
+      "importance": 4,
+      "minute": 85,
+      "player": "Mikel Merino",
+      "seq": 9,
+      "team": "Spain"
+    },
+    {
+      "assist": null,
+      "detail": "Bernardo Silva (Portugal) is shown the yellow card for a bad foul.",
+      "event_type": "yellow",
+      "importance": 3,
+      "minute": 89,
+      "player": "Bernardo Silva",
+      "seq": 10,
+      "team": "Portugal"
+    },
+    {
+      "assist": "Ferran Torres",
+      "detail": "Goal! Portugal 0, Spain 1. Mikel Merino (Spain) left footed shot from the centre of the box to the bottom left corner. Assisted by Ferran Torres with a through ball.",
+      "event_type": "goal",
+      "importance": 1,
+      "minute": 90,
+      "player": "Mikel Merino",
+      "seq": 11,
+      "team": "Spain"
+    },
+    {
+      "assist": null,
+      "detail": "Renato Veiga (Portugal) is shown the yellow card for a bad foul.",
+      "event_type": "yellow",
+      "importance": 3,
+      "minute": 90,
+      "player": "Renato Veiga",
+      "seq": 12,
+      "team": "Portugal"
+    },
+    {
+      "assist": "Mikel Oyarzabal",
+      "detail": "Substitution, Spain. Borja Iglesias replaces Mikel Oyarzabal.",
+      "event_type": "sub",
+      "importance": 4,
+      "minute": 90,
+      "player": "Borja Iglesias",
+      "seq": 13,
+      "team": "Spain"
+    },
+    {
+      "assist": null,
+      "detail": "Ferran Torres (Spain) is shown the yellow card for a bad foul.",
+      "event_type": "yellow",
+      "importance": 3,
+      "minute": 90,
+      "player": "Ferran Torres",
+      "seq": 14,
+      "team": "Spain"
+    }
+  ],
+  "match": {
+    "away_team": "Spain",
+    "display_clock": null,
+    "home_team": "Portugal",
+    "kickoff_utc": "2026-07-06T19:00Z",
+    "match_id": "760506",
+    "minute": null,
+    "pen_winner_side": null,
+    "result_type": "regulation",
+    "score_away": 1,
+    "score_home": 0,
+    "score_ht_away": 0,
+    "score_ht_home": 0,
+    "score_pen_away": null,
+    "score_pen_home": null,
+    "status": "FINISHED"
+  },
+  "side_tables": {
+    "commentary_count": 108,
+    "lineups": [
+      {
+        "formation": "4-2-3-1",
+        "home_away": "home",
+        "players": [
+          {
+            "athlete_id": "238903",
+            "display_name": "Diogo Costa",
+            "formation_place": 1,
+            "jersey": "1",
+            "position": "G",
+            "starter": true,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "337011",
+            "display_name": "Renato Veiga",
+            "formation_place": 6,
+            "jersey": "13",
+            "position": "CD-L",
+            "starter": true,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "234878",
+            "display_name": "Rúben Dias",
+            "formation_place": 5,
+            "jersey": "3",
+            "position": "CD-R",
+            "starter": true,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "290591",
+            "display_name": "Nuno Mendes",
+            "formation_place": 3,
+            "jersey": "25",
+            "position": "LB",
+            "starter": true,
+            "subbed_in": false,
+            "subbed_out": true
+          },
+          {
+            "athlete_id": "176399",
+            "display_name": "João Cancelo",
+            "formation_place": 2,
+            "jersey": "20",
+            "position": "RB",
+            "starter": true,
+            "subbed_in": false,
+            "subbed_out": true
+          },
+          {
+            "athlete_id": "124091",
+            "display_name": "Bruno Fernandes",
+            "formation_place": 10,
+            "jersey": "8",
+            "position": "AM",
+            "starter": true,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "355061",
+            "display_name": "João Neves",
+            "formation_place": 4,
+            "jersey": "15",
+            "position": "LM",
+            "starter": true,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "288897",
+            "display_name": "Vitinha",
+            "formation_place": 8,
+            "jersey": "23",
+            "position": "RM",
+            "starter": true,
+            "subbed_in": false,
+            "subbed_out": true
+          },
+          {
+            "athlete_id": "22774",
+            "display_name": "Cristiano Ronaldo",
+            "formation_place": 9,
+            "jersey": "7",
+            "position": "F",
+            "starter": true,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "276350",
+            "display_name": "João Félix",
+            "formation_place": 11,
+            "jersey": "11",
+            "position": "AM-L",
+            "starter": true,
+            "subbed_in": false,
+            "subbed_out": true
+          },
+          {
+            "athlete_id": "256115",
+            "display_name": "Pedro Neto",
+            "formation_place": 7,
+            "jersey": "18",
+            "position": "AM-R",
+            "starter": true,
+            "subbed_in": false,
+            "subbed_out": true
+          },
+          {
+            "athlete_id": "304106",
+            "display_name": "Gonçalo Inácio",
+            "formation_place": 0,
+            "jersey": "14",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "213141",
+            "display_name": "Gonçalo Guedes",
+            "formation_place": 0,
+            "jersey": "19",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "303785",
+            "display_name": "Matheus Nunes",
+            "formation_place": 0,
+            "jersey": "6",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "238902",
+            "display_name": "Diogo Dalot",
+            "formation_place": 0,
+            "jersey": "5",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": true,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "181278",
+            "display_name": "José Sá",
+            "formation_place": 0,
+            "jersey": "12",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "199833",
+            "display_name": "Bernardo Silva",
+            "formation_place": 0,
+            "jersey": "10",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": true,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "222670",
+            "display_name": "Nélson Semedo",
+            "formation_place": 0,
+            "jersey": "2",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": true,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "312659",
+            "display_name": "Francisco Conceição",
+            "formation_place": 0,
+            "jersey": "26",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": true,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "288896",
+            "display_name": "Gonçalo Ramos",
+            "formation_place": 0,
+            "jersey": "9",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "258917",
+            "display_name": "Rafael Leão",
+            "formation_place": 0,
+            "jersey": "17",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": true,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "177898",
+            "display_name": "Rui Silva",
+            "formation_place": 0,
+            "jersey": "22",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "329691",
+            "display_name": "Tomás Araújo",
+            "formation_place": 0,
+            "jersey": "4",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "183466",
+            "display_name": "Samú Costa",
+            "formation_place": 0,
+            "jersey": "24",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "274159",
+            "display_name": "Francisco Trincão",
+            "formation_place": 0,
+            "jersey": "16",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "208128",
+            "display_name": "Rúben Neves",
+            "formation_place": 0,
+            "jersey": "21",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": false,
+            "subbed_out": false
+          }
+        ],
+        "team": "Portugal"
+      },
+      {
+        "formation": "4-2-3-1",
+        "home_away": "away",
+        "players": [
+          {
+            "athlete_id": "222375",
+            "display_name": "Unai Simón",
+            "formation_place": 1,
+            "jersey": "23",
+            "position": "G",
+            "starter": true,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "159317",
+            "display_name": "Aymeric Laporte",
+            "formation_place": 6,
+            "jersey": "14",
+            "position": "CD-L",
+            "starter": true,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "368992",
+            "display_name": "Pau Cubarsí",
+            "formation_place": 5,
+            "jersey": "22",
+            "position": "CD-R",
+            "starter": true,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "259910",
+            "display_name": "Marc Cucurella",
+            "formation_place": 3,
+            "jersey": "24",
+            "position": "LB",
+            "starter": true,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "268533",
+            "display_name": "Pedro Porro",
+            "formation_place": 2,
+            "jersey": "12",
+            "position": "RB",
+            "starter": true,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "227765",
+            "display_name": "Dani Olmo",
+            "formation_place": 10,
+            "jersey": "10",
+            "position": "AM",
+            "starter": true,
+            "subbed_in": false,
+            "subbed_out": true
+          },
+          {
+            "athlete_id": "250465",
+            "display_name": "Pedri",
+            "formation_place": 4,
+            "jersey": "20",
+            "position": "LM",
+            "starter": true,
+            "subbed_in": false,
+            "subbed_out": true
+          },
+          {
+            "athlete_id": "231828",
+            "display_name": "Rodri",
+            "formation_place": 8,
+            "jersey": "16",
+            "position": "RM",
+            "starter": true,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "229018",
+            "display_name": "Mikel Oyarzabal",
+            "formation_place": 9,
+            "jersey": "21",
+            "position": "F",
+            "starter": true,
+            "subbed_in": false,
+            "subbed_out": true
+          },
+          {
+            "athlete_id": "297373",
+            "display_name": "Álex Baena",
+            "formation_place": 11,
+            "jersey": "15",
+            "position": "AM-L",
+            "starter": true,
+            "subbed_in": false,
+            "subbed_out": true
+          },
+          {
+            "athlete_id": "362150",
+            "display_name": "Lamine Yamal",
+            "formation_place": 7,
+            "jersey": "19",
+            "position": "AM-R",
+            "starter": true,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "209581",
+            "display_name": "Mikel Merino",
+            "formation_place": 0,
+            "jersey": "6",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": true,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "128714",
+            "display_name": "Eric García",
+            "formation_place": 0,
+            "jersey": "4",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "214995",
+            "display_name": "Borja Iglesias",
+            "formation_place": 0,
+            "jersey": "26",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": true,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "196176",
+            "display_name": "David Raya",
+            "formation_place": 0,
+            "jersey": "1",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "312146",
+            "display_name": "Nico Williams",
+            "formation_place": 0,
+            "jersey": "17",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "287266",
+            "display_name": "Martín Zubimendi",
+            "formation_place": 0,
+            "jersey": "18",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "332613",
+            "display_name": "Marc Pubill",
+            "formation_place": 0,
+            "jersey": "2",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "265869",
+            "display_name": "Ferran Torres",
+            "formation_place": 0,
+            "jersey": "7",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": true,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "206474",
+            "display_name": "Marcos Llorente",
+            "formation_place": 0,
+            "jersey": "5",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "166396",
+            "display_name": "Alejandro Grimaldo",
+            "formation_place": 0,
+            "jersey": "3",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "397545",
+            "display_name": "Víctor Muñoz",
+            "formation_place": 0,
+            "jersey": "25",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "323702",
+            "display_name": "Gavi",
+            "formation_place": 0,
+            "jersey": "9",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "297370",
+            "display_name": "Yéremy Pino",
+            "formation_place": 0,
+            "jersey": "11",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "297362",
+            "display_name": "Joan García",
+            "formation_place": 0,
+            "jersey": "13",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": false,
+            "subbed_out": false
+          },
+          {
+            "athlete_id": "214596",
+            "display_name": "Fabián Ruiz",
+            "formation_place": 0,
+            "jersey": "8",
+            "position": "SUB",
+            "starter": false,
+            "subbed_in": true,
+            "subbed_out": false
+          }
+        ],
+        "team": "Spain"
+      }
+    ],
+    "stats": [
+      {
+        "corners": null,
+        "fouls": 9,
+        "offsides": 2,
+        "possession": 44.6,
+        "red_cards": 0,
+        "shots": 10,
+        "shots_on_target": 2,
+        "team": "Portugal",
+        "yellow_cards": 2
+      },
+      {
+        "corners": null,
+        "fouls": 13,
+        "offsides": 1,
+        "possession": 55.4,
+        "red_cards": 0,
+        "shots": 15,
+        "shots_on_target": 6,
+        "team": "Spain",
+        "yellow_cards": 1
+      }
+    ]
+  }
+}
