@@ -183,6 +183,56 @@ def test_malformed_later_scoreboard_event_raises_shape_drift():
         adapter.fetch_live_matches()
 
 
+def test_scoreboard_event_missing_id_raises_shape_drift():
+    """Codex adversarial fix: a scoreboard event with a missing, null, or blank
+    id must fail closed at the provider seam. Otherwise it normalizes to an empty
+    match_id, collapsing malformed events into one collision-prone identity."""
+    import copy
+
+    import pytest
+
+    from gamecollect.provider import ShapeDriftError
+    from gamecollect_football.espn import ESPNAdapter
+
+    good_event = {
+        "id": "1",
+        "competitions": [{"status": {"type": {"description": "In Progress"}}, "competitors": []}],
+    }
+    for bad_id in ({}, {"id": None}, {"id": ""}, {"id": "   "}):
+        event = copy.deepcopy(good_event)
+        event.pop("id")
+        event.update(bad_id)
+        data = {"events": [event]}
+        adapter = ESPNAdapter(http_get=lambda url, params=None, _d=data: _d)
+        with pytest.raises(ShapeDriftError):
+            adapter.fetch_live_matches()
+
+
+def test_scoreboard_event_boolean_id_raises_shape_drift():
+    import pytest
+
+    from gamecollect.provider import ShapeDriftError
+    from gamecollect_football.espn import ESPNAdapter
+
+    for bad_id in (False, True):
+        data = {
+            "events": [
+                {
+                    "id": bad_id,
+                    "competitions": [
+                        {
+                            "status": {"type": {"description": "In Progress"}},
+                            "competitors": [],
+                        }
+                    ],
+                }
+            ]
+        }
+        adapter = ESPNAdapter(http_get=lambda url, params=None, _d=data: _d)
+        with pytest.raises(ShapeDriftError):
+            adapter.fetch_live_matches()
+
+
 def test_null_athlete_in_key_event_does_not_crash():
     """ESPN emits present-but-null nested values; normalization must not
     raise raw AttributeError (it previously escaped the ProviderError seam)."""

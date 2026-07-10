@@ -861,7 +861,18 @@ class ESPNAdapter(MatchDataProvider):
 
     def _normalize_scoreboard_event(self, ev: dict) -> NormalizedMatch:
         """Normalize one ESPN scoreboard event into a NormalizedMatch (score only)."""
-        match_id = str(ev.get("id", ""))
+        # The event id is the canonical/provider match identity downstream. A
+        # missing, null, or blank id would collapse malformed events into the
+        # same source-qualified row, so fail closed at the provider seam rather
+        # than persist a collision-prone identity.
+        raw_id = ev.get("id")
+        if (
+            isinstance(raw_id, bool)
+            or not isinstance(raw_id, (str, int))
+            or (isinstance(raw_id, str) and not raw_id.strip())
+        ):
+            raise ShapeDriftError(f"ESPN scoreboard event has missing or blank id: {raw_id!r}")
+        match_id = str(raw_id).strip()
         comp = ev["competitions"][0]
 
         status = _status_from_comp(comp)
