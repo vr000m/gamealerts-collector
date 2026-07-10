@@ -120,22 +120,35 @@ _MAX_GIVE_UP_EMISSIONS = 3
 # poll. The cooldown clears ONLY on a genuinely durable apply for the match.
 _COOLDOWN_BASE_POLLS = 8
 _COOLDOWN_MAX_POLLS = 256
+# Event types whose ``player``/``assist`` NormalizedEvent fields carry a
+# scorer/assist rather than a generic participant, and therefore land under
+# the ``scorer``/``assist`` payload keys instead of ``player``/``assist``.
+# NOTE (deliberate boundary erosion): this is a sport-specific taxonomy
+# literal living in the core engine. See ``_event_to_row``'s docstring for
+# why it wasn't lifted into a pack-declared ``EventTypeDecl`` field.
+_GOAL_FAMILY_EVENT_TYPES = frozenset({"goal", "own_goal"})
 
 
 def _event_to_row(event: NormalizedEvent) -> dict[str, Any]:
     """Project a :class:`NormalizedEvent` onto a writer ``events`` row.
 
-    Core-agnostic and lossless: ``seq``/``type``/``minute``/``importance``/
-    ``detail`` map onto their columns; the sport-shaped ``team``/``player``/
-    ``assist`` ride in ``payload`` (``actor_entity``/``target_entity`` remain
-    reserved and unpopulated by this writer — see ``schema.sql``). For
-    goal-family events (``goal``, ``own_goal``), ``player``/``assist`` land
-    under the ``scorer``/``assist`` payload keys instead, since those fields
-    carry a scorer/assist for that event type specifically; every other event
-    type keeps the ``player``/``assist`` keys. ``period`` is left NULL:
-    ``NormalizedEvent`` carries no authoritative period.
+    Mostly core-agnostic and lossless: ``seq``/``type``/``minute``/
+    ``importance``/``detail`` map onto their columns; the sport-shaped
+    ``team``/``player``/``assist`` ride in ``payload`` (``actor_entity``/
+    ``target_entity`` remain reserved and unpopulated by this writer — see
+    ``schema.sql``). For goal-family events (``goal``, ``own_goal``),
+    ``player``/``assist`` land under the ``scorer``/``assist`` payload keys
+    instead, since those fields carry a scorer/assist for that event type
+    specifically; every other event type keeps the ``player``/``assist``
+    keys. This one exception is a deliberate, visible boundary erosion: the
+    ``goal``/``own_goal`` literals (``_GOAL_FAMILY_EVENT_TYPES``) are a
+    sport-specific taxonomy check hardcoded into this otherwise sport-agnostic
+    core function, rather than being declared per-pack via ``EventTypeDecl``
+    (``packs/spec.py``). Revisit if a future pack needs a different
+    participant-key convention. ``period`` is left NULL: ``NormalizedEvent``
+    carries no authoritative period.
     """
-    is_goal_family = event.event_type in {"goal", "own_goal"}
+    is_goal_family = event.event_type in _GOAL_FAMILY_EVENT_TYPES
     participant_key = "scorer" if is_goal_family else "player"
     payload = {
         key: value
@@ -885,7 +898,15 @@ class CollectorEngine:
         events: list[NormalizedEvent] = []
         for seq, event_type, minute, importance, detail, payload in rows:
             extras = json.loads(payload) if payload else {}
-            participant_key = "scorer" if event_type in {"goal", "own_goal"} else "player"
+            is_goal_family = event_type in _GOAL_FAMILY_EVENT_TYPES
+            participant_key = "scorer" if is_goal_family else "player"
+            player = extras.get(participant_key)
+            if player is None and is_goal_family:
+                # Fallback for rows written before this convention landed
+                # (legacy ``payload.player`` on goal/own_goal rows): without
+                # this, such a row would silently read back as
+                # ``player=None`` on the seq-conflict reconciliation path.
+                player = extras.get("player")
             events.append(
                 NormalizedEvent(
                     seq=seq,
@@ -893,7 +914,7 @@ class CollectorEngine:
                     event_type=event_type,
                     importance=importance,
                     team=extras.get("team"),
-                    player=extras.get(participant_key),
+                    player=player,
                     assist=extras.get("assist"),
                     detail=detail,
                 )

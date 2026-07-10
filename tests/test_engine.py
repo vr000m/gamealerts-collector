@@ -5538,6 +5538,41 @@ def test_stored_events_round_trips_goal_family_scorer_key(tmp_path, event_type):
     assert event.assist == "Alphonso Davies"
 
 
+@pytest.mark.parametrize("event_type", ["goal", "own_goal"])
+def test_stored_events_falls_back_to_legacy_player_key_for_goal_family(tmp_path, event_type):
+    """A goal-family row written under the pre-this-branch convention
+    (payload key "player", not "scorer") must still round-trip a player name
+    through _stored_events instead of silently reading back as None. This
+    covers the _reconcile_sequence_conflict path, where _stored_events
+    rebuilds a baseline from rows already persisted on disk (potentially by
+    an older binary), as opposed to _last's live-poll refill."""
+    import json
+
+    db = tmp_path / "engine.db"
+    match = nm("m1", (ev(0, event_type, team="Canada", player="Jonathan David", assist=None),))
+    provider = ScriptedProvider([[match]])
+    engine = _engine(make_pack(provider), db)
+    try:
+        engine.poll_once()
+        # Simulate a row written by the pre-this-branch binary: payload key
+        # "player" instead of "scorer" for a goal-family event.
+        engine._conn.execute(
+            "UPDATE events SET payload = ? WHERE match_id = ? AND seq = 0",
+            (json.dumps({"team": "Canada", "player": "Jonathan David"}), qualified("m1")),
+        )
+        engine._conn.commit()
+        reconstructed = engine._stored_events(qualified("m1"))
+    finally:
+        engine.close()
+
+    assert len(reconstructed) == 1
+    event = reconstructed[0]
+    assert event.event_type == event_type
+    assert event.team == "Canada"
+    assert event.player == "Jonathan David"
+    assert event.assist is None
+
+
 @pytest.mark.parametrize("event_type", ["sub", "yellow", "red", "penalty"])
 def test_stored_events_round_trips_non_goal_player_key(tmp_path, event_type):
     """Symmetric non-goal branch: _stored_events keeps reading back via

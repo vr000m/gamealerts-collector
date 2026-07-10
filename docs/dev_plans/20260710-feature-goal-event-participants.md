@@ -1,12 +1,12 @@
 # Task: Goal-event participant contract — typed `payload.scorer`/`payload.assist`
 
-**Status**: Not Started
+**Status**: Complete
 **Component**: collector
 **Assigned to**: Claude
 **Priority**: High
 **Branch**: feature/goal-event-participants (branched from `main` at `46e9ca8`, post PR #2 merge)
 **Created**: 2026-07-10
-**Completed**: (pending)
+**Completed**: 2026-07-10
 
 ## Objective
 
