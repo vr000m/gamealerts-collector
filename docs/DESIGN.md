@@ -127,7 +127,11 @@ Two caveats consumers should know:
 - **Own-goal attribution is team-inverted relative to a normal goal.** On an
   `own_goal` row, `payload.scorer` names the player who scored into their own
   net, and the row's team attribution (`payload.team`/`event.team`) is that
-  player's own team — the team that did *not* benefit from the goal.
+  player's own team — the team that did *not* benefit from the goal. This
+  reflects ESPN's own team attribution in the raw feed, not collector-side
+  inversion logic: the adapter passes `team` through verbatim for all event
+  types, and this convention is provider behavior not independently verified
+  here.
 - **Two named assumptions, inherited from the ESPN adapter's parsing (not
   independently verified here):** (1) ESPN's `participants` array is ordered
   scorer-first, assist-second, inferred from a code comment with no explicit
