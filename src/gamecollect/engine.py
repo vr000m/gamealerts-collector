@@ -127,13 +127,23 @@ def _event_to_row(event: NormalizedEvent) -> dict[str, Any]:
 
     Core-agnostic and lossless: ``seq``/``type``/``minute``/``importance``/
     ``detail`` map onto their columns; the sport-shaped ``team``/``player``/
-    ``assist`` ride in ``payload`` (the engine does not synthesize
-    ``actor_entity`` refs — that is the pack importer's job in Phase 4). ``period``
-    is left NULL: ``NormalizedEvent`` carries no authoritative period.
+    ``assist`` ride in ``payload`` (``actor_entity``/``target_entity`` remain
+    reserved and unpopulated by this writer — see ``schema.sql``). For
+    goal-family events (``goal``, ``own_goal``), ``player``/``assist`` land
+    under the ``scorer``/``assist`` payload keys instead, since those fields
+    carry a scorer/assist for that event type specifically; every other event
+    type keeps the ``player``/``assist`` keys. ``period`` is left NULL:
+    ``NormalizedEvent`` carries no authoritative period.
     """
+    is_goal_family = event.event_type in {"goal", "own_goal"}
+    participant_key = "scorer" if is_goal_family else "player"
     payload = {
         key: value
-        for key, value in (("team", event.team), ("player", event.player), ("assist", event.assist))
+        for key, value in (
+            ("team", event.team),
+            (participant_key, event.player),
+            ("assist", event.assist),
+        )
         if value is not None
     }
     row: dict[str, Any] = {
@@ -863,8 +873,9 @@ class CollectorEngine:
         """Read the ACTUALLY-STORED event rows back as :class:`NormalizedEvent`s.
 
         The inverse of :func:`_event_to_row` (``team``/``player``/``assist``
-        ride in the JSON payload), so a reconstructed baseline compares equal
-        to an unchanged incoming event under the diffing fingerprint.
+        ride in the JSON payload, under ``scorer``/``assist`` for goal-family
+        events), so a reconstructed baseline compares equal to an unchanged
+        incoming event under the diffing fingerprint.
         """
         rows = self._conn.execute(
             "SELECT seq, type, minute, importance, detail, payload FROM events "
@@ -874,6 +885,7 @@ class CollectorEngine:
         events: list[NormalizedEvent] = []
         for seq, event_type, minute, importance, detail, payload in rows:
             extras = json.loads(payload) if payload else {}
+            participant_key = "scorer" if event_type in {"goal", "own_goal"} else "player"
             events.append(
                 NormalizedEvent(
                     seq=seq,
@@ -881,7 +893,7 @@ class CollectorEngine:
                     event_type=event_type,
                     importance=importance,
                     team=extras.get("team"),
-                    player=extras.get("player"),
+                    player=extras.get(participant_key),
                     assist=extras.get("assist"),
                     detail=detail,
                 )

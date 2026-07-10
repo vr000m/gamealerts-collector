@@ -61,9 +61,11 @@ SOURCE = "test-src"
 # writer via pack.taxonomy so writes are not rejected as undeclared types.
 TAXONOMY: dict[str, EventTypeDecl] = {
     "goal": EventTypeDecl(display_name="Goal", importance_default=1),
+    "own_goal": EventTypeDecl(display_name="Own goal", importance_default=1),
     "yellow": EventTypeDecl(display_name="Yellow card", importance_default=3),
     "sub": EventTypeDecl(display_name="Substitution", importance_default=4),
     "red": EventTypeDecl(display_name="Red card", importance_default=2),
+    "penalty": EventTypeDecl(display_name="Penalty", importance_default=2),
     "half_time": EventTypeDecl(display_name="Half time", importance_default=3),
 }
 
@@ -924,15 +926,16 @@ def test_inplace_correction_skips_conflicted_seq_but_new_events_keep_landing(tmp
     # the correction was skipped, not applied over the stored row.
     conn = read_db(db)
     try:
-        players = {
-            r["seq"]: json.loads(r["payload"])["player"]
-            for r in conn.execute(
-                "SELECT seq, payload FROM events WHERE match_id = ? ORDER BY seq", (qid_a,)
-            )
-        }
+        (seq1_payload,) = conn.execute(
+            "SELECT payload FROM events WHERE match_id = ? AND seq = 1", (qid_a,)
+        ).fetchone()
     finally:
         conn.close()
-    assert players[1] == "Jonathan David", "stored event must NOT be mutated by the correction"
+    # seq 1 is a "goal" event, so its stored payload uses the goal-family
+    # "scorer" key.
+    assert json.loads(seq1_payload)["scorer"] == "Jonathan David", (
+        "stored event must NOT be mutated by the correction"
+    )
     # The skip was loud: an ERROR record naming the conflicted seq — on BOTH
     # polls where the mutated seq 1 persisted (baseline from stored rows means
     # unresolved drift keeps re-surfacing rather than being baselined away).
@@ -5447,3 +5450,113 @@ def test_l3_drift_logs_one_error_per_epoch_then_debug(tmp_path, caplog):
     assert levels == [logging.ERROR, logging.DEBUG, logging.ERROR], (
         "drift logs one ERROR per epoch, DEBUG for same-epoch repeats, ERROR again on a new epoch"
     )
+
+
+# --------------------------------------------------------------------------- #
+# Phase 1 (docs/dev_plans/20260710-feature-goal-event-participants.md):
+# payload key contract — goal-family "scorer"/"assist" vs. everything-else
+# "player"/"assist", and the symmetric _stored_events read-back.
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("event_type", ["goal", "own_goal"])
+def test_event_to_row_goal_family_uses_scorer_key(event_type):
+    from gamecollect.engine import _event_to_row
+
+    row = _event_to_row(
+        ev(0, event_type, team="Canada", player="Jonathan David", assist="Alphonso Davies")
+    )
+
+    assert row["payload"] == {
+        "team": "Canada",
+        "scorer": "Jonathan David",
+        "assist": "Alphonso Davies",
+    }
+
+
+@pytest.mark.parametrize("event_type", ["goal", "own_goal"])
+def test_event_to_row_goal_family_omits_absent_assist_key(event_type):
+    """Keys are omitted (not set to null) when the underlying field is None —
+    a scorer-only goal must not carry an "assist": null entry."""
+    from gamecollect.engine import _event_to_row
+
+    row = _event_to_row(ev(0, event_type, team="Canada", player="Jonathan David", assist=None))
+
+    assert row["payload"] == {"team": "Canada", "scorer": "Jonathan David"}
+    assert "assist" not in row["payload"]
+
+
+@pytest.mark.parametrize("event_type", ["sub", "yellow", "red", "penalty"])
+def test_event_to_row_non_goal_types_keep_player_key_unchanged(event_type):
+    """Regression guard against the goal-family gate leaking: subs, cards, and
+    penalties keep today's "player"/"assist" payload keys exactly as-is."""
+    from gamecollect.engine import _event_to_row
+
+    row = _event_to_row(
+        ev(0, event_type, team="Canada", player="Booked Player", assist="Second Player")
+    )
+
+    assert row["payload"] == {
+        "team": "Canada",
+        "player": "Booked Player",
+        "assist": "Second Player",
+    }
+    assert "scorer" not in row["payload"]
+
+
+def test_event_to_row_non_goal_type_omits_absent_assist_key():
+    from gamecollect.engine import _event_to_row
+
+    row = _event_to_row(ev(0, "yellow", team="Canada", player="Booked Player", assist=None))
+
+    assert row["payload"] == {"team": "Canada", "player": "Booked Player"}
+    assert "assist" not in row["payload"]
+
+
+@pytest.mark.parametrize("event_type", ["goal", "own_goal"])
+def test_stored_events_round_trips_goal_family_scorer_key(tmp_path, event_type):
+    """The resumption/baseline-reconstruction path (_stored_events) must read
+    a goal-family row's payload back via "scorer", not "player", or scorer
+    data silently vanishes (becomes None) after an engine restart."""
+    db = tmp_path / "engine.db"
+    match = nm(
+        "m1", (ev(0, event_type, team="Canada", player="Jonathan David", assist="Alphonso Davies"),)
+    )
+    provider = ScriptedProvider([[match]])
+    engine = _engine(make_pack(provider), db)
+    try:
+        engine.poll_once()
+        reconstructed = engine._stored_events(qualified("m1"))
+    finally:
+        engine.close()
+
+    assert len(reconstructed) == 1
+    event = reconstructed[0]
+    assert event.event_type == event_type
+    assert event.team == "Canada"
+    assert event.player == "Jonathan David"
+    assert event.assist == "Alphonso Davies"
+
+
+@pytest.mark.parametrize("event_type", ["sub", "yellow", "red", "penalty"])
+def test_stored_events_round_trips_non_goal_player_key(tmp_path, event_type):
+    """Symmetric non-goal branch: _stored_events keeps reading back via
+    "player" for every event type outside the goal-family gate."""
+    db = tmp_path / "engine.db"
+    match = nm(
+        "m1", (ev(0, event_type, team="Canada", player="Booked Player", assist="Second Player"),)
+    )
+    provider = ScriptedProvider([[match]])
+    engine = _engine(make_pack(provider), db)
+    try:
+        engine.poll_once()
+        reconstructed = engine._stored_events(qualified("m1"))
+    finally:
+        engine.close()
+
+    assert len(reconstructed) == 1
+    event = reconstructed[0]
+    assert event.event_type == event_type
+    assert event.team == "Canada"
+    assert event.player == "Booked Player"
+    assert event.assist == "Second Player"

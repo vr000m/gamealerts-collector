@@ -239,8 +239,15 @@ def _seeded_match_id(conn: sqlite3.Connection, source: str) -> str:
 
 
 def _event_player(event) -> str | None:
-    """The scorer name the engine parked in the event payload (or actor ref)."""
+    """The scorer name the engine parked in the event payload (or actor ref).
+
+    Goal-family events (``goal``, ``own_goal``) land under ``payload.scorer``
+    since Phase 1 of docs/dev_plans/20260710-feature-goal-event-participants.md;
+    every other event type still uses ``payload.player``.
+    """
     payload = getattr(event, "payload", None)
+    if isinstance(payload, dict) and payload.get("scorer"):
+        return payload["scorer"]
     if isinstance(payload, dict) and payload.get("player"):
         return payload["player"]
     return getattr(event, "actor_entity", None)

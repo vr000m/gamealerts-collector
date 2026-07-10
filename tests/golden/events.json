@@ -7,11 +7,13 @@
     "period": 1,
     "type": "goal",
     "importance": 3,
-    "actor_entity": "t-can",
+    "actor_entity": null,
     "target_entity": null,
-    "detail": "Jonathan David",
+    "detail": "Jonathan David scores!",
     "payload": {
-      "assist": "Alphonso Davies"
+      "assist": "Alphonso Davies",
+      "scorer": "Jonathan David",
+      "team": "Canada"
     }
   },
   {
@@ -22,10 +24,14 @@
     "period": 1,
     "type": "goal",
     "importance": 3,
-    "actor_entity": "t-can",
+    "actor_entity": null,
     "target_entity": null,
-    "detail": "Jonathan David",
-    "payload": null
+    "detail": "Jonathan David scores again!",
+    "payload": {
+      "assist": "Alphonso Davies",
+      "scorer": "Jonathan David",
+      "team": "Canada"
+    }
   },
   {
     "source": "wc2026-test",
@@ -35,9 +41,12 @@
     "period": 1,
     "type": "yellow_card",
     "importance": 1,
-    "actor_entity": "t-qat",
+    "actor_entity": null,
     "target_entity": null,
     "detail": "Tactical foul",
-    "payload": null
+    "payload": {
+      "player": "Akram Afif",
+      "team": "Qatar"
+    }
   }
 ]
