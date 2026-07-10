@@ -157,16 +157,16 @@ Both are noted here for traceability back to the originating review; neither is 
 
 ## Progress
 
-- [ ] Phase 1: `payload.scorer`/`payload.assist` + contract cleanup
+- [x] Phase 1: `payload.scorer`/`payload.assist` + contract cleanup
 
 ## Findings
 
-- (none yet)
+- Mid-phase advisory review (opus) found no issues: goal-family gate is symmetric between `_event_to_row`/`_stored_events`, `fixture_io.py`/`replay.py` genuinely unmodified, non-goal event types unchanged, comments don't overstate the fix, golden fixture regenerated (not hand-patched) via `UPDATE_GOLDENS=1`.
 
 ## Issues & Solutions
 
-- (none yet)
+- Test-writer found and fixed an out-of-scope gap: `tests/test_replay.py`'s `_event_player()` helper read stored payload via `"player"` only; since `ReplayProvider` re-projects events through the real (changed) `_event_to_row`, its end-to-end replay assertion broke once the goal-family key rename landed. Fixed by checking `"scorer"` before falling back to `"player"`/`actor_entity`.
 
 ## Final Results
 
-- (pending)
+- Phase 1 complete (commit `9425e03`). `_event_to_row` writes `payload.scorer`/`payload.assist` for `goal`/`own_goal` events (keys omitted, not null, when absent); every other event type's payload is unchanged (`payload.player`/`.assist`). `_stored_events` reconstructs both branches symmetrically. `schema.sql` and `engine.py`'s `_event_to_row` docstring no longer promise unimplemented `actor_entity`/`target_entity` resolution. `tests/golden/events.json` regenerated to a single consistent convention. `fixture_io.py`/`replay.py` unmodified; importer docstring corrected. `docs/DESIGN.md` §6/`README.md` document the payload sub-key contract, the goal-family gate, the own-goal attribution quirk, and the two named ESPN assumptions. Full suite green: 495 passed, 2 skipped. No further phases in this plan.
