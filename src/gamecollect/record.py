@@ -95,6 +95,11 @@ class RecordWriter:
                     )
                 break
 
+    @property
+    def pending_count(self) -> int:
+        """Number of matches accumulated since the last successful flush."""
+        return len(self._record)
+
     def accumulate(self, matches: list[NormalizedMatch]) -> None:
         for match in matches:
             recorded = self._record.get(match.match_id)

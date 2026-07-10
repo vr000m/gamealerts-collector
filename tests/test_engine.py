@@ -2200,11 +2200,13 @@ def test_close_flush_failure_closes_conn_and_is_idempotent(tmp_path):
         engine.close()
     assert engine._conn is None, "connection must be closed even when the flush fails"
     # The recorded session survives the failed flush — it is NOT destroyed.
-    assert engine._recorder._record, "a failed flush must preserve the record buffer, not clear it"
+    assert engine._recorder.pending_count, (
+        "a failed flush must preserve the record buffer, not clear it"
+    )
 
     # A second close() must not re-run the failing flush.
     engine.close()
-    assert engine._recorder._record, (
+    assert engine._recorder.pending_count, (
         "the preserved record buffer must survive the idempotent re-close"
     )
 
@@ -5050,7 +5052,7 @@ def test_y3_twin_resumption_fallback_equal_score_later_minute_supersedes():
     equal-score blind spot and is judged against a durable applied live state with a
     real minute, so it gets the same rule — equal scores at a strictly later minute
     supersede, an earlier/equal minute keeps."""
-    from gamecollect.engine import _live_supersedes_fallback
+    from gamecollect.fallback_merge import live_supersedes_fallback as _live_supersedes_fallback
 
     false_terminal = nm(
         "m1", (), status=MatchStatus.FINISHED, minute=55, score_home=1, score_away=0
@@ -5070,7 +5072,7 @@ def test_y4_per_field_clock_fill_among_eligible_sides_but_not_ineligible():
     winner carrying minute 90 / null display_clock merges with an eligible FINISHED
     side's null-minute / "90'+3" to 90/"90'+3". An INELIGIBLE live side contributes
     nothing (the winner's null display_clock stays null — no cross-status leak)."""
-    from gamecollect.engine import _paired_clock
+    from gamecollect.fallback_merge import paired_clock as _paired_clock
 
     winner = nm(
         "m1",
@@ -5234,10 +5236,14 @@ def test_z2_swapped_score_board_does_not_supersede_but_clean_advance_does():
     must NOT supersede the genuine fallback in the resumption-tracker twin (the
     round-14 tracker code wrongly popped it on the one-sided advance). A CLEAN strict
     advance with no regression still supersedes. Both twins share the one helper."""
-    from gamecollect.engine import (
-        _live_supersedes_captured,
-        _live_supersedes_cooldown_fallback,
-        _live_supersedes_fallback,
+    from gamecollect.fallback_merge import (
+        live_supersedes_captured as _live_supersedes_captured,
+    )
+    from gamecollect.fallback_merge import (
+        live_supersedes_cooldown_fallback as _live_supersedes_cooldown_fallback,
+    )
+    from gamecollect.fallback_merge import (
+        live_supersedes_fallback as _live_supersedes_fallback,
     )
 
     fallback = nm("m1", (), status=MatchStatus.FINISHED, minute=80, score_home=1, score_away=2)
@@ -5295,7 +5301,7 @@ def test_z4_clock_fill_only_when_minutes_do_not_contradict():
     """Z4: the per-field clock fill among ELIGIBLE sides must not build a
     self-contradictory mixed-time pair. A missing display_clock is borrowed from the
     other side only when the other's minute does not contradict the winner's minute."""
-    from gamecollect.engine import _paired_clock
+    from gamecollect.fallback_merge import paired_clock as _paired_clock
 
     # Round-14 case still passes: winner (90, None) + other (None, "90'+3") → (90,
     # "90'+3") — other.minute is None, so no contradiction, the fill happens.
