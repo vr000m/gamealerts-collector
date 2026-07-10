@@ -65,10 +65,10 @@ from gamecollect.fallback_merge import (
     is_terminal as _is_terminal,
 )
 from gamecollect.fallback_merge import (
-    live_supersedes_captured as _live_supersedes_captured,
+    live_supersedes_cooldown_fallback as _live_supersedes_cooldown_fallback,
 )
 from gamecollect.fallback_merge import (
-    live_supersedes_cooldown_fallback as _live_supersedes_cooldown_fallback,
+    live_supersedes_fallback as _live_supersedes_fallback,
 )
 from gamecollect.fallback_merge import (
     non_regressing_score as _non_regressing_score,
@@ -1447,7 +1447,7 @@ class CollectorEngine:
         if (
             fallback is None
             or not _fallback_worth_retaining(fallback)
-            or _live_supersedes_captured(applied, fallback)
+            or _live_supersedes_fallback(applied, fallback)
         ):
             self._transitions.pop(match_id, None)
 
