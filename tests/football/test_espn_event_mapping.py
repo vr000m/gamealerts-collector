@@ -97,6 +97,28 @@ class TestEventMappingOracle:
 
 
 # ===========================================================================
+# Own-goal team attribution: the fixture's own_goal row must carry the
+# BENEFITING team, not the own-scorer's team (docs/DESIGN.md §6 caveat).
+# ===========================================================================
+
+
+class TestOwnGoalTeamAttribution:
+    def test_own_goal_team_is_the_benefiting_side_not_the_scorer_side(self):
+        """Mohamed Manai plays for Qatar and scores into his own net, but the
+        ESPN feed (and this adapter, which passes team through verbatim)
+        attributes the row to Canada — the team that benefited. A consumer
+        reading payload.team as "the scorer's team" would get this backwards."""
+        own_goals = [ev for ev in replay().events if ev.event_type == "own_goal"]
+        assert len(own_goals) == 1
+        own_goal = own_goals[0]
+        assert own_goal.player == "Mohamed Manai"
+        assert own_goal.team == "Canada", (
+            "own_goal.team must be the benefiting team (Canada), not the "
+            "own-scorer Mohamed Manai's own team (Qatar)"
+        )
+
+
+# ===========================================================================
 # The 0–2-event expansion of _normalize_key_event, pinned at both bounds.
 # ===========================================================================
 
