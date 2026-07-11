@@ -63,6 +63,43 @@ def _decode_payload(raw: Any) -> Any:
         return raw
 
 
+# Event types whose participant lands under ``payload.scorer`` rather than
+# ``payload.player`` — see ``gamecollect.engine._GOAL_FAMILY_EVENT_TYPES``.
+# This is a second, deliberate copy of the same taxonomy literal (matching
+# that constant's own "deliberate boundary erosion" precedent) rather than
+# importing ``gamecollect.engine`` — a daemon module pulling in ``signal``,
+# ``threading``, and provider/pack-loading machinery — into this lightweight,
+# sync, read-only client. Kept from drifting by
+# ``test_client_goal_family_matches_engine`` in ``tests/test_engine.py``.
+_GOAL_FAMILY_EVENT_TYPES = frozenset({"goal", "own_goal"})
+
+
+def _normalize_legacy_payload(event_type: str, payload: Any) -> Any:
+    """Rewrite a legacy goal-family ``payload.player`` key to ``payload.scorer``.
+
+    Rows written before the goal-event participant-contract rename
+    (``docs/dev_plans/20260710-feature-goal-event-participants.md``) stored
+    the scorer under ``payload.player``. ``engine._stored_events`` normalizes
+    this internally for engine reconciliation, but that fallback never
+    reaches the public read path — ``get_events_since``/``events --json`` are
+    the only other place a stored row's payload is decoded, and until this
+    normalization, a pre-rename row was exposed to every external consumer in
+    the old shape forever, with no way to tell it apart from a genuinely
+    keyless row. This closes that gap without a schema migration or a
+    contract-version bump: it is a read-time-only rewrite of the decoded
+    dict, exactly mirroring ``_stored_events``'s existing fallback.
+    """
+    if (
+        event_type in _GOAL_FAMILY_EVENT_TYPES
+        and isinstance(payload, dict)
+        and "scorer" not in payload
+        and "player" in payload
+    ):
+        payload = dict(payload)
+        payload["scorer"] = payload.pop("player")
+    return payload
+
+
 @dataclass(frozen=True)
 class MatchState:
     """Typed view of one ``matches`` row (``payload`` JSON-decoded)."""
@@ -118,18 +155,19 @@ class Event:
 
     @classmethod
     def from_row(cls, row: dict[str, Any]) -> Event:
+        event_type = row["type"]
         return cls(
             source=row["source"],
             match_id=row["match_id"],
             seq=row["seq"],
             minute=row.get("minute"),
             period=row.get("period"),
-            type=row["type"],
+            type=event_type,
             importance=row.get("importance"),
             actor_entity=row.get("actor_entity"),
             target_entity=row.get("target_entity"),
             detail=row.get("detail"),
-            payload=_decode_payload(row.get("payload")),
+            payload=_normalize_legacy_payload(event_type, _decode_payload(row.get("payload"))),
         )
 
 

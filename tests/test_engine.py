@@ -5595,3 +5595,19 @@ def test_stored_events_round_trips_non_goal_player_key(tmp_path, event_type):
     assert event.team == "Canada"
     assert event.player == "Booked Player"
     assert event.assist == "Second Player"
+
+
+def test_client_goal_family_matches_engine():
+    """gamecollect.client keeps a second, deliberate copy of the goal-family
+    taxonomy literal (to avoid importing the daemon-weight engine module into
+    a lightweight read client — see client._GOAL_FAMILY_EVENT_TYPES'
+    docstring). If the two ever drift, a legacy-payload row would normalize
+    correctly on the internal engine-reconciliation path but not on the
+    public get_events_since/events --json path, or vice versa."""
+    from gamecollect.client import _GOAL_FAMILY_EVENT_TYPES as client_set
+    from gamecollect.engine import _GOAL_FAMILY_EVENT_TYPES as engine_set
+
+    assert client_set == engine_set, (
+        f"gamecollect.client._GOAL_FAMILY_EVENT_TYPES {sorted(client_set)} drifted from "
+        f"gamecollect.engine._GOAL_FAMILY_EVENT_TYPES {sorted(engine_set)}"
+    )
