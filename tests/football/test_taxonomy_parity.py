@@ -101,6 +101,12 @@ class TestTaxonomyParity:
         silently mis-key goal-family payloads."""
         from gamecollect.engine import _GOAL_FAMILY_EVENT_TYPES
 
+        # NOTE: this check is football-pack-specific — it only compares
+        # against `football_pack.taxonomy`. Football is currently the only
+        # sport pack in the repo, so there is nothing to genuinely
+        # generalize against yet. If/when a second sport pack lands, it
+        # will need its own analogous parity test; this one won't catch
+        # drift for that pack.
         assert _GOAL_FAMILY_EVENT_TYPES <= set(football_pack.taxonomy), (
             f"engine._GOAL_FAMILY_EVENT_TYPES {sorted(_GOAL_FAMILY_EVENT_TYPES)} "
             f"drifted from the football pack's declared taxonomy keys "

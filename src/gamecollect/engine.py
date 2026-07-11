@@ -129,6 +129,16 @@ _COOLDOWN_MAX_POLLS = 256
 _GOAL_FAMILY_EVENT_TYPES = frozenset({"goal", "own_goal"})
 
 
+def _participant_key(event_type: str) -> str:
+    """The payload key that carries the participant for ``event_type``.
+
+    ``"scorer"`` for goal-family types (see ``_GOAL_FAMILY_EVENT_TYPES``),
+    ``"player"`` otherwise. Shared by ``_event_to_row`` (write path) and
+    ``_stored_events`` (read path) so the two stay in lockstep.
+    """
+    return "scorer" if event_type in _GOAL_FAMILY_EVENT_TYPES else "player"
+
+
 def _event_to_row(event: NormalizedEvent) -> dict[str, Any]:
     """Project a :class:`NormalizedEvent` onto a writer ``events`` row.
 
@@ -148,8 +158,7 @@ def _event_to_row(event: NormalizedEvent) -> dict[str, Any]:
     participant-key convention. ``period`` is left NULL: ``NormalizedEvent``
     carries no authoritative period.
     """
-    is_goal_family = event.event_type in _GOAL_FAMILY_EVENT_TYPES
-    participant_key = "scorer" if is_goal_family else "player"
+    participant_key = _participant_key(event.event_type)
     payload = {
         key: value
         for key, value in (
@@ -898,10 +907,9 @@ class CollectorEngine:
         events: list[NormalizedEvent] = []
         for seq, event_type, minute, importance, detail, payload in rows:
             extras = json.loads(payload) if payload else {}
-            is_goal_family = event_type in _GOAL_FAMILY_EVENT_TYPES
-            participant_key = "scorer" if is_goal_family else "player"
+            participant_key = _participant_key(event_type)
             player = extras.get(participant_key)
-            if player is None and is_goal_family:
+            if player is None and event_type in _GOAL_FAMILY_EVENT_TYPES:
                 # Fallback for rows written before this convention landed
                 # (legacy ``payload.player`` on goal/own_goal rows): without
                 # this, such a row would silently read back as

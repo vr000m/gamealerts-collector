@@ -248,10 +248,8 @@ def _event_player(event) -> str | None:
     the core writer — see ``schema.sql``), so there is no third fallback.
     """
     payload = getattr(event, "payload", None)
-    if isinstance(payload, dict) and payload.get("scorer"):
-        return payload["scorer"]
-    if isinstance(payload, dict) and payload.get("player"):
-        return payload["player"]
+    if isinstance(payload, dict):
+        return payload.get("scorer") or payload.get("player") or None
     return None
 
 
