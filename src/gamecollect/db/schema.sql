@@ -68,10 +68,12 @@ CREATE TABLE IF NOT EXISTS events (
     period        INTEGER,
     type          TEXT NOT NULL,
     importance    INTEGER,
-    actor_entity  TEXT,                     -- soft ref -> entities.entity_id (scorer, booked player, ...)
-    target_entity TEXT,                     -- soft ref -> entities.entity_id (assist, subbed-off, ...)
+    actor_entity  TEXT,                     -- reserved, unpopulated by the writer today; participant names live in payload.scorer/.player (see below)
+    target_entity TEXT,                     -- reserved, unpopulated by the writer today; participant names live in payload.assist (see below)
     detail        TEXT,
-    payload       TEXT,                     -- JSON: sport extras
+    payload       TEXT,                     -- JSON: sport extras. team (always, when known); scorer/assist for
+                                             -- goal-family events (goal, own_goal); player/assist for every
+                                             -- other event type.
     PRIMARY KEY (source, match_id, seq)
 );
 

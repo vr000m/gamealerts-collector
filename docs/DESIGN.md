@@ -109,6 +109,40 @@ Requirement discovered during Q&A design: the surface needs *historical and
 reference* endpoints (squads, player tournament stats, past meetings), not just
 live state — upstream provider coverage for these must be verified per pack.
 
+**Event `payload` sub-key contract.** `get_events_since`/`events --json` rows
+carry a `payload` object; its sub-keys are the only currently-populated,
+stable way to read event participants (`actor_entity`/`target_entity` are
+reserved schema columns, unpopulated by the writer today). `payload.team` is
+present whenever the event's team is known. For goal-family event types
+(`goal`, `own_goal`), `payload.scorer`/`payload.assist` carry the scorer's and
+assister's display names as plain strings; for every other event type
+(`penalty`, `yellow`, `red`, `sub`, and any future taxonomy addition),
+`payload.player`/`payload.assist` carry the same shape under the pre-existing
+key names (e.g. the booked player on a card, or the two players on a
+substitution). Keys are omitted entirely — never set to `null` — when the
+underlying field has no value.
+
+Two caveats consumers should know:
+
+- **Own-goal team attribution is the benefiting team, not the scorer's own
+  team.** On an `own_goal` row, `payload.scorer` names the player who scored
+  into their own net, but the row's team attribution (`payload.team`/
+  `event.team`) is the team that *benefited* from the goal — not the
+  own-scorer's team. E.g. when Cabo Verde's Diney Borges scores an own goal,
+  the row carries `team: "Argentina"` (the beneficiary), not `"Cabo Verde"`.
+  This reflects ESPN's own team attribution in the raw feed, not
+  collector-side logic: the adapter passes `team` through verbatim for all
+  event types, and this convention is provider behavior not independently
+  verified beyond the fixtures checked into this repo.
+- **Two named assumptions, inherited from the ESPN adapter's parsing (not
+  independently verified here):** (1) ESPN's `participants` array is ordered
+  scorer-first, assist-second, inferred from a code comment with no explicit
+  role field to confirm it, corroborated only by a small fixture sample; (2)
+  the free-text content of `detail` (ESPN's `text`/`shortText`) is provider
+  behavior this repo does not control — for goal-family events, treat
+  `payload.scorer`/`.assist` as the authoritative source of participant
+  identity, not `detail`.
+
 ## 7. Record/replay is a provider, not test scaffolding
 
 `ReplayProvider` (`gamecollect.replay`) implements the same provider ABC,

@@ -90,6 +90,12 @@ def _seed_golden_db(db_path: Path) -> None:
             "updated_at": PINNED_UPDATED_AT,
         }
     )
+    # ``detail`` is opaque provider text (e.g. ESPN's raw shortText) for every
+    # row here — it is descriptive prose, not a structured field, and must not
+    # be parsed for participant identity. ``actor_entity``/``target_entity``
+    # are left NULL (unpopulated/reserved, matching the real writer's
+    # ``_event_to_row`` — see docs/dev_plans/20260710-...-participants.md);
+    # goal-family participant names live in ``payload.scorer``/``.assist``.
     writer.append_events(
         MATCH_ID,
         [
@@ -100,9 +106,12 @@ def _seed_golden_db(db_path: Path) -> None:
                 "minute": 10,
                 "period": 1,
                 "importance": 3,
-                "actor_entity": "t-can",
-                "detail": "Jonathan David",
-                "payload": {"assist": "Alphonso Davies"},
+                "detail": "Jonathan David scores!",
+                "payload": {
+                    "team": "Canada",
+                    "scorer": "Jonathan David",
+                    "assist": "Alphonso Davies",
+                },
             },
             {
                 "match_id": MATCH_ID,
@@ -111,8 +120,12 @@ def _seed_golden_db(db_path: Path) -> None:
                 "minute": 25,
                 "period": 1,
                 "importance": 3,
-                "actor_entity": "t-can",
-                "detail": "Jonathan David",
+                "detail": "Jonathan David scores again!",
+                "payload": {
+                    "team": "Canada",
+                    "scorer": "Jonathan David",
+                    "assist": "Alphonso Davies",
+                },
             },
             {
                 "match_id": MATCH_ID,
@@ -121,8 +134,8 @@ def _seed_golden_db(db_path: Path) -> None:
                 "minute": 40,
                 "period": 1,
                 "importance": 1,
-                "actor_entity": "t-qat",
                 "detail": "Tactical foul",
+                "payload": {"team": "Qatar", "player": "Akram Afif"},
             },
         ],
     )

@@ -426,6 +426,93 @@ def test_get_events_since_beyond_head_is_empty_not_error(tmp_path):
     assert list(result) == [], "since_seq beyond the head must yield an empty list"
 
 
+def test_get_events_since_normalizes_legacy_goal_payload_player_key(tmp_path):
+    """A goal-family row written under the pre-rename convention (payload key
+    "player", not "scorer" — see docs/dev_plans/20260710-feature-goal-event-
+    participants.md) must be exposed via the PUBLIC read path (get_events_since
+    / events --json) with the documented "scorer" key, not left in the old
+    shape forever. engine._stored_events already normalizes this internally
+    for engine reconciliation, but that fallback never reaches this path —
+    Codex's adversarial review flagged that gap as a no-ship-severity issue:
+    an upgraded consumer database's pre-change goal rows stayed externally
+    indistinguishable from genuinely keyless rows.
+    """
+    db = tmp_path / "client.db"
+    m1 = f"{SRC}:760440"
+    conn, w = _writer(db, SRC)
+    writer_method(w, "match")(match_row(m1, status="FINISHED"))
+    w.append_events(
+        m1,
+        [
+            event_row(
+                m1,
+                0,
+                type="goal",
+                payload={"team": "Canada", "player": "Jonathan David"},
+            )
+        ],
+    )
+    conn.commit()
+    conn.close()
+
+    events = _invoke(_client_fn("get_events_since"), db, args=(m1, -1))
+    assert len(events) == 1
+    payload = _field(events[0], "payload")
+    assert payload == {"team": "Canada", "scorer": "Jonathan David"}, (
+        f"legacy payload.player must be exposed as payload.scorer via the public "
+        f"read path, got {payload!r}"
+    )
+
+
+def test_get_events_since_leaves_current_goal_payload_untouched(tmp_path):
+    """A row already written under the current convention (payload key
+    "scorer") must pass through unchanged — the normalization is additive,
+    not a blanket rewrite."""
+    db = tmp_path / "client.db"
+    m1 = f"{SRC}:760440"
+    conn, w = _writer(db, SRC)
+    writer_method(w, "match")(match_row(m1, status="FINISHED"))
+    w.append_events(
+        m1,
+        [
+            event_row(
+                m1,
+                0,
+                type="own_goal",
+                payload={"team": "Qatar", "scorer": "Jonathan David", "assist": "Alphonso Davies"},
+            )
+        ],
+    )
+    conn.commit()
+    conn.close()
+
+    events = _invoke(_client_fn("get_events_since"), db, args=(m1, -1))
+    payload = _field(events[0], "payload")
+    assert payload == {"team": "Qatar", "scorer": "Jonathan David", "assist": "Alphonso Davies"}
+
+
+def test_get_events_since_leaves_non_goal_player_payload_untouched(tmp_path):
+    """A non-goal-family event's payload.player key must never be rewritten —
+    the goal-family gate is the same one engine._GOAL_FAMILY_EVENT_TYPES uses,
+    and it must not fire for a "sub"/"yellow"/"red"/"penalty" row even if that
+    row happens to omit a "scorer" key (it always does; that's not a legacy
+    marker for non-goal types)."""
+    db = tmp_path / "client.db"
+    m1 = f"{SRC}:760440"
+    conn, w = _writer(db, SRC)
+    writer_method(w, "match")(match_row(m1, status="FINISHED"))
+    w.append_events(
+        m1,
+        [event_row(m1, 0, type="yellow", payload={"team": "Canada", "player": "Booked Player"})],
+    )
+    conn.commit()
+    conn.close()
+
+    events = _invoke(_client_fn("get_events_since"), db, args=(m1, -1))
+    payload = _field(events[0], "payload")
+    assert payload == {"team": "Canada", "player": "Booked Player"}
+
+
 # ---------------------------------------------------------------------------
 # get_standings — explicit source
 # ---------------------------------------------------------------------------

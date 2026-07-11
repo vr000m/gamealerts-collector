@@ -63,6 +63,15 @@ gamecollect events <match_id> --db games.db --json       # events (opt. --since_
 gamecollect standings <source> --db games.db --json      # standings (opt. --group_key)
 ```
 
+An `events` row's `payload` carries `team` (always, when known), plus either
+`scorer`/`assist` (goal-family events: `goal`, `own_goal`) or `player`/`assist`
+(every other event type) as plain display-name strings — keys are omitted, not
+`null`, when the underlying value is absent. E.g. a goal event's payload looks
+like `{"team": "Canada", "scorer": "Jonathan David", "assist": "Alphonso Davies"}`;
+a substitution's looks like `{"team": "Canada", "player": "Jonathan David"}`. See
+[docs/DESIGN.md](docs/DESIGN.md) §6 for the full contract, including the
+own-goal attribution convention.
+
 With the `football-wc2026` pack installed, two more read ops appear
 automatically (both match-scoped; `--team` optionally narrows them):
 

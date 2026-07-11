@@ -91,6 +91,28 @@ class TestTaxonomyParity:
                 f"taxonomy[{key!r}] has an empty display name"
             )
 
+    def test_goal_family_event_types_are_declared_by_the_pack(self, football_pack):
+        """``gamecollect.engine._GOAL_FAMILY_EVENT_TYPES`` gates the
+        ``player``->``scorer`` payload-key rewrite by hardcoded slug, with no
+        shared constant tying it to the football pack's own taxonomy (a
+        deliberate, documented boundary erosion — see that constant's
+        docstring). If a future taxonomy slug rename or removal drifts out of
+        sync with the engine's literal, this must fail loudly rather than
+        silently mis-key goal-family payloads."""
+        from gamecollect.engine import _GOAL_FAMILY_EVENT_TYPES
+
+        # NOTE: this check is football-pack-specific — it only compares
+        # against `football_pack.taxonomy`. Football is currently the only
+        # sport pack in the repo, so there is nothing to genuinely
+        # generalize against yet. If/when a second sport pack lands, it
+        # will need its own analogous parity test; this one won't catch
+        # drift for that pack.
+        assert _GOAL_FAMILY_EVENT_TYPES <= set(football_pack.taxonomy), (
+            f"engine._GOAL_FAMILY_EVENT_TYPES {sorted(_GOAL_FAMILY_EVENT_TYPES)} "
+            f"drifted from the football pack's declared taxonomy keys "
+            f"{sorted(football_pack.taxonomy)}"
+        )
+
 
 # ===========================================================================
 # Loud rejection with the REAL pack: undeclared type raises at write time.

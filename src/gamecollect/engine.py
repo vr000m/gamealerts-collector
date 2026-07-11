@@ -120,20 +120,52 @@ _MAX_GIVE_UP_EMISSIONS = 3
 # poll. The cooldown clears ONLY on a genuinely durable apply for the match.
 _COOLDOWN_BASE_POLLS = 8
 _COOLDOWN_MAX_POLLS = 256
+# Event types whose ``player``/``assist`` NormalizedEvent fields carry a
+# scorer/assist rather than a generic participant, and therefore land under
+# the ``scorer``/``assist`` payload keys instead of ``player``/``assist``.
+# NOTE (deliberate boundary erosion): this is a sport-specific taxonomy
+# literal living in the core engine. See ``_event_to_row``'s docstring for
+# why it wasn't lifted into a pack-declared ``EventTypeDecl`` field.
+_GOAL_FAMILY_EVENT_TYPES = frozenset({"goal", "own_goal"})
+
+
+def _participant_key(event_type: str) -> str:
+    """The payload key that carries the participant for ``event_type``.
+
+    ``"scorer"`` for goal-family types (see ``_GOAL_FAMILY_EVENT_TYPES``),
+    ``"player"`` otherwise. Shared by ``_event_to_row`` (write path) and
+    ``_stored_events`` (read path) so the two stay in lockstep.
+    """
+    return "scorer" if event_type in _GOAL_FAMILY_EVENT_TYPES else "player"
 
 
 def _event_to_row(event: NormalizedEvent) -> dict[str, Any]:
     """Project a :class:`NormalizedEvent` onto a writer ``events`` row.
 
-    Core-agnostic and lossless: ``seq``/``type``/``minute``/``importance``/
-    ``detail`` map onto their columns; the sport-shaped ``team``/``player``/
-    ``assist`` ride in ``payload`` (the engine does not synthesize
-    ``actor_entity`` refs — that is the pack importer's job in Phase 4). ``period``
-    is left NULL: ``NormalizedEvent`` carries no authoritative period.
+    Mostly core-agnostic and lossless: ``seq``/``type``/``minute``/
+    ``importance``/``detail`` map onto their columns; the sport-shaped
+    ``team``/``player``/``assist`` ride in ``payload`` (``actor_entity``/
+    ``target_entity`` remain reserved and unpopulated by this writer — see
+    ``schema.sql``). For goal-family events (``goal``, ``own_goal``),
+    ``player``/``assist`` land under the ``scorer``/``assist`` payload keys
+    instead, since those fields carry a scorer/assist for that event type
+    specifically; every other event type keeps the ``player``/``assist``
+    keys. This one exception is a deliberate, visible boundary erosion: the
+    ``goal``/``own_goal`` literals (``_GOAL_FAMILY_EVENT_TYPES``) are a
+    sport-specific taxonomy check hardcoded into this otherwise sport-agnostic
+    core function, rather than being declared per-pack via ``EventTypeDecl``
+    (``packs/spec.py``). Revisit if a future pack needs a different
+    participant-key convention. ``period`` is left NULL: ``NormalizedEvent``
+    carries no authoritative period.
     """
+    participant_key = _participant_key(event.event_type)
     payload = {
         key: value
-        for key, value in (("team", event.team), ("player", event.player), ("assist", event.assist))
+        for key, value in (
+            ("team", event.team),
+            (participant_key, event.player),
+            ("assist", event.assist),
+        )
         if value is not None
     }
     row: dict[str, Any] = {
@@ -863,8 +895,9 @@ class CollectorEngine:
         """Read the ACTUALLY-STORED event rows back as :class:`NormalizedEvent`s.
 
         The inverse of :func:`_event_to_row` (``team``/``player``/``assist``
-        ride in the JSON payload), so a reconstructed baseline compares equal
-        to an unchanged incoming event under the diffing fingerprint.
+        ride in the JSON payload, under ``scorer``/``assist`` for goal-family
+        events), so a reconstructed baseline compares equal to an unchanged
+        incoming event under the diffing fingerprint.
         """
         rows = self._conn.execute(
             "SELECT seq, type, minute, importance, detail, payload FROM events "
@@ -874,6 +907,14 @@ class CollectorEngine:
         events: list[NormalizedEvent] = []
         for seq, event_type, minute, importance, detail, payload in rows:
             extras = json.loads(payload) if payload else {}
+            participant_key = _participant_key(event_type)
+            player = extras.get(participant_key)
+            if player is None and event_type in _GOAL_FAMILY_EVENT_TYPES:
+                # Fallback for rows written before this convention landed
+                # (legacy ``payload.player`` on goal/own_goal rows): without
+                # this, such a row would silently read back as
+                # ``player=None`` on the seq-conflict reconciliation path.
+                player = extras.get("player")
             events.append(
                 NormalizedEvent(
                     seq=seq,
@@ -881,7 +922,7 @@ class CollectorEngine:
                     event_type=event_type,
                     importance=importance,
                     team=extras.get("team"),
-                    player=extras.get("player"),
+                    player=player,
                     assist=extras.get("assist"),
                     detail=detail,
                 )

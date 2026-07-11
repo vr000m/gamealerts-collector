@@ -27,10 +27,11 @@ external to this repo, so this map is the contract. A gamealerts event row
 The fixture is the faithful **source** record; the collector's derived event
 columns are computed downstream from these preserved fields, not baked in here:
 ``period`` from ``minute`` (half 1 for ≤45(+stoppage), half 2 above; NULL when
-``minute`` is missing), ``actor_entity`` from ``player`` (a source-qualified
-fold of the name), ``target_entity`` from ``assist``, entity ``parent`` from
-``team``. The engine's writer lands ``team``/``player``/``assist`` in the
-event ``payload`` when it collects a replayed fixture.
+``minute`` is missing). ``actor_entity``/``target_entity`` remain reserved and
+unpopulated by the engine's writer. The engine's writer instead lands
+``team``/``scorer``/``assist`` in the event ``payload`` for goal-family types
+(``goal``, ``own_goal``), or ``team``/``player``/``assist`` for every other
+type, when it collects a replayed fixture.
 
 Guards (the live DBs are mutable, with active WAL files):
 
