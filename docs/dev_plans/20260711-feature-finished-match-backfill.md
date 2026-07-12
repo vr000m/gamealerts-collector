@@ -211,7 +211,7 @@ Single-component change (`CollectorEngine`'s internal poll loop plus CLI flag pl
 ## Progress
 
 - [x] Phase 1: Live-network gate + detection + one-time fetch (happy path)
-- [ ] Phase 2: Bounded failure tolerance
+- [x] Phase 2: Bounded failure tolerance
 - [ ] Phase 3: Docs and replay verification
 
 ## Findings
