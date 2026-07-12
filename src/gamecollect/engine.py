@@ -112,6 +112,15 @@ _MAX_TRANSITION_TOTAL_ATTEMPTS = 10
 # re-emit forever. After this many emissions whose apply never landed, ONE
 # final ERROR is logged and the tracker is dropped.
 _MAX_GIVE_UP_EMISSIONS = 3
+# Consecutive detail-fetch failures tolerated on a first-sight-finished
+# backfill attempt (see ``_first_sight_finished``) before the engine gives up
+# and persists the best-known (scoreboard-only) snapshot. Held on a separate
+# ``self._backfill`` tracker, never ``self._transitions`` (see
+# ``CollectorEngine._backfill`` and ``_backfill_tracker_at_cap`` for why): a
+# backfill retry has no "total attempts" distinct concept (every attempt is a
+# detail-fetch attempt), so one cap suffices, mirroring the order of
+# magnitude of ``_MAX_TRANSITION_DETAIL_FAILURES``.
+_BACKFILL_MAX_ATTEMPTS = 3
 # Abandonment COOLDOWN (see :class:`_Cooldown` and the ``_TransitionTracker``
 # docstring): after a match is abandoned it may be re-tracked only once this
 # many polls have elapsed, doubling per successive abandonment epoch (8, 16,
@@ -499,6 +508,17 @@ def _tracker_at_cap(tracker: _TransitionTracker) -> bool:
     )
 
 
+def _backfill_tracker_at_cap(tracker: _TransitionTracker) -> bool:
+    """True when a backfill retry tracker owes a give-up (pending or capped).
+
+    Mirrors :func:`_tracker_at_cap`'s shape but against ``_BACKFILL_MAX_ATTEMPTS``
+    and ``consecutive_failures`` only — a backfill tracker has no non-terminal
+    "total attempts" concept distinct from a fetch failure (every attempt is a
+    detail fetch that either succeeds or raises).
+    """
+    return tracker.give_up_pending or tracker.consecutive_failures >= _BACKFILL_MAX_ATTEMPTS
+
+
 def _first_sight_finished(
     *,
     previous: NormalizedMatch | None,
@@ -631,6 +651,22 @@ class CollectorEngine:
         # is removed only by a terminal resolution (_resolve_tracker) or the
         # expired-and-unseen purge (_age_cooldowns).
         self._cooldowns: dict[str, _Cooldown] = {}
+        # One tracker per in-flight first-sight-finished backfill retry, keyed
+        # by provider-native match id — a container SEPARATE from
+        # ``self._transitions`` (see ``_first_sight_finished``/Architecture
+        # Decisions in the dev plan): ``self._transitions`` membership feeds
+        # ``was_live`` and is read by ``_hydrate_vanished_matches``; parking a
+        # backfill retry there would misroute a retrying first-sight match
+        # onto the live→terminal transition path on its very next poll. Only
+        # the give-up SHAPE and its emission cap are shared with
+        # ``_TransitionTracker``'s pattern — NOT the cooldown side-effect
+        # (backfill give-up is permanent-by-design, so there is never a
+        # re-track to space out; see ``_emit_backfill_give_up``). Popped
+        # ONLY by ``_resolve_backfill_tracker`` (consume-side, any non-live
+        # durable apply) or by emission-cap exhaustion in
+        # ``_emit_backfill_give_up`` — no vanished-match purge (accepted,
+        # in-memory only, bounded by matches-per-slate).
+        self._backfill: dict[str, _TransitionTracker] = {}
         self._backoff_multiplier = 1
         # One-time restart scan latch: on the FIRST successful poll the stored
         # matches table is scanned for rows this source left live at shutdown
@@ -1146,9 +1182,31 @@ class CollectorEngine:
                 # durable write.
                 self._emit_give_up(hydrated, match.match_id, tracker, fresh=match)
                 continue
+            backfill_tracker = self._backfill.get(match.match_id) if is_backfill else None
+            if (
+                is_backfill
+                and backfill_tracker is not None
+                and _backfill_tracker_at_cap(backfill_tracker)
+            ):
+                # A backfill give-up is already due (typically re-emitted
+                # because its apply did not land last poll): skip the fetch,
+                # retry the durable write instead of re-fetching only to fail
+                # again.
+                self._emit_backfill_give_up(hydrated, match.match_id, backfill_tracker, fresh=match)
+                continue
             try:
                 detail = self._provider.fetch_match_detail(match.match_id)
             except (ProviderUnavailableError, ShapeDriftError) as exc:
+                if is_backfill:
+                    self._log_detail_fetch_failure(match.match_id, exc)
+                    backfill_tracker = self._backfill_tracker(match.match_id)
+                    backfill_tracker.fallback = _accrue_fallback(backfill_tracker.fallback, match)
+                    backfill_tracker.consecutive_failures += 1
+                    if _backfill_tracker_at_cap(backfill_tracker):
+                        self._emit_backfill_give_up(
+                            hydrated, match.match_id, backfill_tracker, fresh=match
+                        )
+                    continue
                 if in_transition and cooling:
                     # In cooldown: the fetch is STILL attempted (so a recovered
                     # board applies immediately — matrix (d)), but a persistent
@@ -1194,6 +1252,8 @@ class CollectorEngine:
                 continue
             if tracker is not None:
                 tracker.consecutive_failures = 0
+            if backfill_tracker is not None:
+                backfill_tracker.consecutive_failures = 0
             merged = _merge_detail(match, detail)
             if in_transition and not _is_terminal(merged.status):
                 # The transition hydration succeeded but did NOT yield a
@@ -1359,6 +1419,18 @@ class CollectorEngine:
             cooldown = self._cooldowns.get(match_id)
             if cooldown is not None and cooldown.fallback is not None:
                 tracker.fallback = _accrue_fallback(tracker.fallback, cooldown.fallback)
+        return tracker
+
+    def _backfill_tracker(self, match_id: str) -> _TransitionTracker:
+        """Get-or-create the backfill retry tracker for ``match_id``.
+
+        Unlike :meth:`_tracker`, never seeds from ``self._cooldowns`` — a
+        backfill retry has no cooldown (see ``self._backfill``'s docstring in
+        ``__init__``).
+        """
+        tracker = self._backfill.get(match_id)
+        if tracker is None:
+            tracker = self._backfill[match_id] = _TransitionTracker()
         return tracker
 
     def _age_cooldowns(self, slate_ids: set[str]) -> None:
@@ -1638,6 +1710,56 @@ class CollectorEngine:
         tracker.give_up_pending = True
         out.append(snapshot)
 
+    def _emit_backfill_give_up(
+        self,
+        out: list[NormalizedMatch],
+        match_id: str,
+        tracker: _TransitionTracker,
+        fresh: NormalizedMatch | None,
+    ) -> None:
+        """Queue a backfill give-up snapshot — shape shared, cooldown bypassed.
+
+        Shares :meth:`_emit_give_up`'s give-up SHAPE (best-known,
+        merged-never-raw snapshot via :meth:`_build_give_up_snapshot`,
+        ``give_up_pending`` set so a non-landing write re-emits next poll
+        instead of losing the captured state) but does NOT call
+        :meth:`_abandon`: a backfill give-up is permanent-by-design (once
+        persisted, ``_first_sight_finished``'s ``has_stored_row`` term is
+        ``False`` forever, so there is never a re-track to space out with a
+        cooldown). It DOES preserve ``_abandon``'s emission-cap BOUND: past
+        ``_MAX_GIVE_UP_EMISSIONS`` re-emissions whose apply never durably
+        landed, the ``self._backfill`` entry is dropped directly (no
+        cooldown) instead of re-emitting forever — this is pop path 2 of 2
+        (the other is :meth:`_resolve_backfill_tracker`, consume-side, on a
+        durable apply landing).
+        """
+        snapshot = self._build_give_up_snapshot(match_id, tracker, fresh)
+        if snapshot is None:
+            log.error(
+                "giving up on backfill detail hydration for match %s on "
+                "source %s after %d consecutive fetch failures: no baseline, "
+                "fallback, or stored row is known: nothing to persist",
+                match_id,
+                self._source,
+                tracker.consecutive_failures,
+            )
+            self._backfill.pop(match_id, None)
+            return
+        tracker.give_up_emissions += 1
+        if tracker.give_up_emissions > _MAX_GIVE_UP_EMISSIONS:
+            log.error(
+                "could not persist backfill terminal state for match %s on "
+                "source %s: the give-up snapshot's apply never landed after "
+                "%d emissions — abandoning backfill tracker",
+                match_id,
+                self._source,
+                _MAX_GIVE_UP_EMISSIONS,
+            )
+            self._backfill.pop(match_id, None)
+            return
+        tracker.give_up_pending = True
+        out.append(snapshot)
+
     def _abandon(self, match_id: str, message: str, *log_args: Any) -> None:
         """Pop the tracker, enter a cooldown, and log at the epoch-based level.
 
@@ -1789,6 +1911,7 @@ class CollectorEngine:
         """
         if snapshot.status in LIVE_STATUSES:
             return
+        self._resolve_backfill_tracker(match_id, snapshot)
         self._cooldowns.pop(match_id, None)
         tracker = self._transitions.pop(match_id, None)
         if tracker is None or not tracker.give_up_pending:
@@ -1802,6 +1925,32 @@ class CollectorEngine:
             self._source,
             tracker.consecutive_failures,
             tracker.total_attempts,
+            snapshot.status.value,
+            snapshot.score_home,
+            snapshot.score_away,
+        )
+
+    def _resolve_backfill_tracker(self, match_id: str, snapshot: NormalizedMatch) -> None:
+        """CONSUME point: pop a resolved backfill tracker on any durable apply.
+
+        Pop path 1 of 2 (the other is emission-cap exhaustion in
+        :meth:`_emit_backfill_give_up`). Called from :meth:`_resolve_tracker`
+        for every non-live durable apply, covering BOTH an ordinary
+        retry-then-succeed apply (``give_up_pending`` never set) and a
+        give-up apply landing — ``self._backfill`` must never leak either
+        way. No cooldown involvement: backfill has none.
+        """
+        tracker = self._backfill.pop(match_id, None)
+        if tracker is None or not tracker.give_up_pending:
+            return
+        log.error(
+            "giving up on backfill detail hydration for match %s on source %s "
+            "after %d consecutive fetch failures: persisted best-known "
+            "terminal state (status %s, score %s-%s) — final event list may "
+            "be missing",
+            match_id,
+            self._source,
+            tracker.consecutive_failures,
             snapshot.status.value,
             snapshot.score_home,
             snapshot.score_away,
