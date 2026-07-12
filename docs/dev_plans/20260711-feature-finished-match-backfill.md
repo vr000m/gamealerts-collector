@@ -1,6 +1,6 @@
 # Task: Finished-on-first-sight event backfill
 
-**Status**: Not Started
+**Status**: In Review
 **Component**: collector
 **Assigned to**: Claude
 **Priority**: High
@@ -231,4 +231,19 @@ Single-component change (`CollectorEngine`'s internal poll loop plus CLI flag pl
 
 ## Final Results
 
-(fill in when complete)
+Phase 1 landed detection (`is_backfill`, gated on `previous is None`, non-live status,
+no in-memory or stored baseline, and an empty scoreboard event list) and the one-time
+`fetch_match_detail` call, reusing the existing `_merge_detail`/`diff_matches`/`_apply`
+write path so a first-sight-finished match's events land through the same
+`_event_to_row` contract as a live match's — no bespoke write path, and gated behind a
+`backfill_finished_matches` constructor flag / `--no-finished-backfill` CLI switch, on
+by default. Phase 2 added bounded, non-fatal retry: failed fetches are tracked in a
+`self._backfill` container kept separate from `self._transitions` (so a retrying match
+never misroutes onto the live→terminal transition path), capped at
+`_BACKFILL_MAX_ATTEMPTS`, and a give-up path that persists the best-known
+scoreboard-only snapshot (shape shared with the transition give-up path, cooldown
+side-effect bypassed since backfill give-up is permanent-by-design) with a symmetric
+consume-side resolve so `self._backfill` entries are never leaked. Phase 3 verified the
+detection/backfill/give-up flow end-to-end against `ReplayProvider` fixtures and
+documented the feature (including its accepted same-slate scope limit and the
+no-vanished-match-purge trade-off) in `docs/DESIGN.md`.
