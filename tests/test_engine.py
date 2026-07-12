@@ -1516,6 +1516,135 @@ def test_backfill_fetch_fails_once_then_succeeds_retries_and_pops_tracker(tmp_pa
     )
 
 
+def test_backfill_retry_resolving_live_pops_tracker_not_leaked(tmp_path):
+    """Regression for the round-2 Codex finding: a backfill-tracked match
+    (first-sight SCHEDULED, bare/no-event board) whose retried detail fetch
+    resolves the merged snapshot to a LIVE status (a provider correcting a
+    stale SCHEDULED read to IN_PLAY — exactly the scenario documented on
+    ``_on_durable_snapshot``) must still pop ``self._backfill`` once that
+    apply durably lands. ``_resolve_tracker`` (the non-live consume point) is
+    never reached for a live snapshot — ``_on_durable_snapshot`` returns from
+    its live branch before calling it — so the pop must happen unconditionally
+    inside ``_on_durable_snapshot`` itself, not gated behind the terminal
+    path. Board status stays SCHEDULED (not FINISHED) on both polls so
+    ``is_backfill`` re-evaluates True on the retry too (``previous is None``
+    persists: a failed backfill attempt never baselines)."""
+    from gamecollect.engine import CollectorEngine
+
+    db = tmp_path / "engine.db"
+    board = nm(
+        "m1",
+        (),
+        status=MatchStatus.SCHEDULED,
+        minute=None,
+        score_home=None,
+        score_away=None,
+        display_clock=None,
+    )
+    detail = nm(
+        "m1",
+        (),
+        status=MatchStatus.IN_PLAY,
+        minute=5,
+        score_home=0,
+        score_away=0,
+        display_clock="5'",
+    )
+    provider = ScriptedDetailProvider(
+        [
+            ([board], {"m1": ProviderUnavailableError("summary 503")}),
+            ([board], {"m1": detail}),
+        ]
+    )
+    engine = CollectorEngine(make_pack(provider), str(db), SOURCE, 0.01, provider=provider)
+    try:
+        engine.poll_once()
+        assert "m1" in engine._backfill, "the failed first-sight backfill attempt must be tracked"
+        engine.poll_once()
+    finally:
+        engine.close()
+
+    assert provider.detail_calls == ["m1", "m1"]
+    state = reader.get_state(read_db(db), qualified("m1"))
+    assert state is not None and state["status"] == MatchStatus.IN_PLAY.value, (
+        "the merged detail (forward-only status rank: IN_PLAY > SCHEDULED) "
+        "must durably apply as live"
+    )
+    assert "m1" not in engine._backfill, (
+        "self._backfill must not leak once a backfill-tracked match's "
+        "retried apply durably lands as LIVE — the pop must not be gated "
+        "behind the non-live-only _resolve_tracker consume point"
+    )
+
+
+def test_backfill_pending_retry_survives_later_partial_nonempty_scoreboard(tmp_path):
+    """Regression for the round-3 Codex finding: once a match is parked in
+    ``self._backfill`` (its one-time detail fetch failed, pending retry), a
+    LATER poll's bare scoreboard carrying some non-empty ``events`` (a shape
+    the provider ABC explicitly permits — ``MatchDataProvider.fetch_live_matches``
+    docstring, and exactly what ``ReplayProvider`` does by design) must NOT
+    flip ``_first_sight_finished`` False and short-circuit the match onto the
+    ordinary "already terminal, nothing to do" skip path. That path would
+    persist the partial scoreboard snapshot directly (no detail fetch) and
+    let ``_on_durable_snapshot`` silently pop the pending tracker's accrued
+    fallback, permanently losing any event absent from the partial snapshot.
+    The retry must keep firing (``fetch_match_detail`` called every poll)
+    until it succeeds, and the final stored event list must be the FULL
+    detail list, not the partial scoreboard prefix."""
+    from gamecollect.engine import CollectorEngine
+
+    db = tmp_path / "engine.db"
+    bare_board = nm("m1", (), status=MatchStatus.FINISHED, score_home=2, score_away=1)
+    partial_board = nm(
+        "m1",
+        (ev(0, "goal", minute=23, team="Norway", player="Andreas Schjelderup"),),
+        status=MatchStatus.FINISHED,
+        score_home=2,
+        score_away=1,
+    )
+    full_detail = nm(
+        "m1",
+        (
+            ev(0, "goal", minute=23, team="Norway", player="Andreas Schjelderup"),
+            ev(1, "goal", minute=67, team="Norway", player="Erling Haaland"),
+        ),
+        status=MatchStatus.FINISHED,
+        score_home=2,
+        score_away=1,
+    )
+    provider = ScriptedDetailProvider(
+        [
+            ([bare_board], {"m1": ProviderUnavailableError("summary 503")}),
+            ([partial_board], {"m1": full_detail}),
+        ]
+    )
+    engine = CollectorEngine(make_pack(provider), str(db), SOURCE, 0.01, provider=provider)
+    try:
+        engine.poll_once()
+        assert "m1" in engine._backfill, "the failed first-sight backfill attempt must be tracked"
+        assert engine._stored_rows_for_provider("m1") == [], (
+            "no stored row may exist after the first failed backfill attempt"
+        )
+        engine.poll_once()
+    finally:
+        engine.close()
+
+    assert provider.detail_calls == ["m1", "m1"], (
+        "the pending retry must re-fetch detail on the next poll even though "
+        "that poll's bare scoreboard now carries a partial non-empty events "
+        "list — it must not be treated as an ordinary non-backfill terminal "
+        "match and skipped straight to persistence"
+    )
+    assert event_seqs(db, qualified("m1")) == [0, 1], (
+        "the durably stored event list must be the FULL detail list, not the "
+        "partial scoreboard prefix that would have been persisted by the bug"
+    )
+    assert "m1" not in engine._backfill, (
+        "self._backfill must no longer contain the match id once the retry "
+        "succeeds and durably applies"
+    )
+
+
 def test_backfill_stored_row_absent_after_each_pre_give_up_failed_poll(tmp_path):
     """Direct assertion of the plan's central invariant, repeated after EVERY
     pre-give-up failed poll (not only the first): a row erroneously written

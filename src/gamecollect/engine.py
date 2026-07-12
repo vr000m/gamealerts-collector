@@ -556,6 +556,21 @@ def _live_to_terminal_transition(was_live: bool, status: MatchStatus) -> bool:
     return was_live and status not in LIVE_STATUSES
 
 
+def _rows_report_live(rows: list[tuple]) -> bool:
+    """True when the best (authority-first, then freshest) stored row is live.
+
+    Shared derivation for the two ``_stored_liveness_rows`` consumers: the
+    restart-gap ``was_live``/``has_stored_row`` computation in
+    :meth:`CollectorEngine._fetch_poll_snapshots` (which also needs the raw
+    ``rows`` for ``has_stored_row``, so it cannot call
+    :meth:`CollectorEngine._stored_status_is_live` directly — that method
+    discards its rows and returns only a bool) and
+    :meth:`CollectorEngine._stored_status_is_live` itself. Empty ``rows``
+    (no stored row) is not live.
+    """
+    return bool(rows) and rows[0][0] in LIVE_STATUS_VALUES
+
+
 # The remaining pure comparison/accumulation helpers
 # (_live_supersedes_cooldown_fallback, _live_supersedes_captured,
 # _fallback_worth_retaining, _live_supersedes_fallback, _accrue_fallback,
@@ -1148,13 +1163,47 @@ class CollectorEngine:
                 # detection below, from this same lookup (no second call).
                 rows = self._stored_liveness_rows(match.match_id)
                 has_stored_row = bool(rows)
-                was_live = bool(rows) and rows[0][0] in LIVE_STATUS_VALUES
-            is_backfill = self._backfill_finished_matches and _first_sight_finished(
-                previous=previous,
-                status=match.status,
-                was_live=was_live,
-                events=match.events,
-                has_stored_row=has_stored_row,
+                was_live = _rows_report_live(rows)
+            # Round-3 Codex finding: ``_first_sight_finished``'s ``not events``
+            # conjunct is a DETECTION heuristic, not an invariant the provider
+            # ABC guarantees — ``fetch_live_matches``'s docstring explicitly
+            # allows "partial event lists" on a scoreboard-only snapshot (see
+            # ``MatchDataProvider``), and ``ReplayProvider`` is a first-class
+            # provider that does exactly this by design (a fixture's revealed
+            # event prefix rides on the bare scoreboard snapshot, growing poll
+            # over poll). So a match ALREADY parked in ``self._backfill`` (its
+            # one-time detail fetch failed and is pending retry, per
+            # ``_backfill_tracker``) must keep routing through the retry/fetch
+            # path even if a LATER poll's bare scoreboard happens to carry some
+            # events — otherwise ``_first_sight_finished`` goes False solely on
+            # ``events`` becoming non-empty, this match falls into the
+            # ordinary "already terminal, nothing to do" skip below, the
+            # partial scoreboard snapshot is persisted directly (bypassing
+            # detail fetch entirely), and ``_on_durable_snapshot`` pops the
+            # pending tracker's accrued fallback silently (no give-up log,
+            # since ``give_up_pending`` was never set) — permanently losing any
+            # events absent from that partial snapshot. Gated on ``not
+            # was_live`` and ``status not in LIVE_STATUSES`` (mirroring
+            # ``_first_sight_finished``'s own terms) so a pending-retry match
+            # that reappears genuinely LIVE this poll still takes the ordinary
+            # live path instead of being force-routed into backfill-failure
+            # handling — preserves the ``is_backfill``/``in_transition``
+            # mutual exclusivity invariant by construction.
+            pending_backfill_retry = (
+                self._backfill_finished_matches
+                and match.match_id in self._backfill
+                and match.status not in LIVE_STATUSES
+                and not was_live
+            )
+            is_backfill = self._backfill_finished_matches and (
+                _first_sight_finished(
+                    previous=previous,
+                    status=match.status,
+                    was_live=was_live,
+                    events=match.events,
+                    has_stored_row=has_stored_row,
+                )
+                or pending_backfill_retry
             )
             if match.status not in LIVE_STATUSES and not was_live and not is_backfill:
                 hydrated.append(match)
@@ -1537,7 +1586,20 @@ class CollectorEngine:
         from ``live_resumptions``) — resetting its tracker would stop the
         total-attempts cap from ever force-closing a match whose detail never
         turns terminal.
+
+        Backfill tracker resolution runs FIRST and unconditionally — before the
+        live/non-live branch below and independent of ``state_advanced``:
+        ``self._backfill`` membership is never read by the live/cooldown
+        machinery above, so popping it here on every durable apply (a
+        no-change apply included, since the stored row already durably
+        matches) is safe and required. Without this, a backfill-tracked match
+        whose merged detail resolves LIVE (a provider correcting a stale
+        terminal/scheduled read) would leak its ``self._backfill`` entry
+        forever: neither other documented pop path (the non-live consume-side
+        resolve in :meth:`_resolve_tracker`, or emission-cap exhaustion in
+        :meth:`_emit_backfill_give_up`) would ever fire for it.
         """
+        self._resolve_backfill_tracker(match_id, snapshot)
         if snapshot.status in LIVE_STATUSES:
             if state_advanced:
                 self._clear_cooling_gate(match_id, snapshot)
@@ -1732,8 +1794,16 @@ class CollectorEngine:
         cooldown) instead of re-emitting forever — this is pop path 2 of 2
         (the other is :meth:`_resolve_backfill_tracker`, consume-side, on a
         durable apply landing).
+
+        Passes ``force_terminal=False`` to :meth:`_build_give_up_snapshot`:
+        the broad ``is_backfill`` detection also covers a first-sight
+        SCHEDULED/UNKNOWN match (see ``_first_sight_finished``), so a backfill
+        give-up candidate is not guaranteed to be terminal. Force-coercing it
+        to FINISHED would fabricate a durable "FINISHED 0-0" row for a match
+        that never kicked off — the dev plan's give-up contract is to persist
+        the best-known *actual* scoreboard-only snapshot, not a forced close.
         """
-        snapshot = self._build_give_up_snapshot(match_id, tracker, fresh)
+        snapshot = self._build_give_up_snapshot(match_id, tracker, fresh, force_terminal=False)
         if snapshot is None:
             log.error(
                 "giving up on backfill detail hydration for match %s on "
@@ -1777,7 +1847,12 @@ class CollectorEngine:
         log.log(logging.ERROR if epoch == 1 else logging.WARNING, message, *log_args)
 
     def _build_give_up_snapshot(
-        self, match_id: str, tracker: _TransitionTracker, fresh: NormalizedMatch | None
+        self,
+        match_id: str,
+        tracker: _TransitionTracker,
+        fresh: NormalizedMatch | None,
+        *,
+        force_terminal: bool = True,
     ) -> NormalizedMatch | None:
         """Best-known terminal snapshot at give-up — merged, never raw.
 
@@ -1825,26 +1900,41 @@ class CollectorEngine:
             None,
         )
         merged = _merge_over_base(base, candidate) if base is not None else candidate
-        return self._nonregress_over_stored(match_id, merged, stored)
+        return self._nonregress_over_stored(match_id, merged, stored, force_terminal=force_terminal)
 
     def _nonregress_over_stored(
-        self, match_id: str, snap: NormalizedMatch, stored: NormalizedMatch | None = _UNSET
+        self,
+        match_id: str,
+        snap: NormalizedMatch,
+        stored: NormalizedMatch | None = _UNSET,
+        *,
+        force_terminal: bool = True,
     ) -> NormalizedMatch:
-        """Round-11 give-up decision table: emit a terminal, score/clock-monotonic close.
+        """Round-11 give-up decision table: emit a monotonic, non-regressing close.
 
-        The single emission choke point. Combines the candidate ``snap`` with the
-        durably-stored row per the prescribed table (a give-up MUST be terminal so
-        the non-live consume point :meth:`_resolve_tracker` can resolve it — a
-        live emission would never pop the tracker, never clear the gate, and
-        re-emit forever):
+        The single emission choke point (shared, per design, between the
+        transition and backfill give-up paths — see :meth:`_emit_give_up` /
+        :meth:`_emit_backfill_give_up`). Combines the candidate ``snap`` with
+        the durably-stored row per the prescribed table:
 
-        G0 TERMINALITY: the emitted status MUST be terminal. If the candidate's
+        G0 TERMINALITY (``force_terminal=True``, the transition give-up
+           default — a give-up MUST be terminal there so the non-live consume
+           point :meth:`_resolve_tracker` can resolve it): if the candidate's
            status is not terminal it is coerced to FINISHED (the accepted loud
            force-close) AND its minute/display_clock are NULLed — a coerced close
            has no authoritative clock (mirrors the detail-merge doctrine that
            clocks are legitimately null at FT), so it can never ship a stale live
            clock like "80'". A genuinely-terminal candidate keeps its own
-           status and clock.
+           status and clock. **Backfill give-up passes ``force_terminal=False``**:
+           a first-sight-finished candidate is not necessarily terminal (the
+           broad ``is_backfill`` detection also covers a first-sight SCHEDULED
+           match whose detail fetch never lands — see ``_first_sight_finished``),
+           and the dev plan's give-up contract is to persist the best-known
+           *actual* scoreboard-only snapshot, not to force-close a match that
+           never kicked off into a fabricated "FINISHED 0-0" row. With
+           ``force_terminal=False`` the candidate's own status/minute/clock are
+           always kept (never coerced), matching the existing non-coerced
+           branch below.
         G1 SCORES: per side the emitted score is the MAX of candidate and stored
            (``None`` = unknown, filled from the other) — a stored non-null score
            is never regressed (cumulative facts).
@@ -1865,7 +1955,7 @@ class CollectorEngine:
         """
         if stored is _UNSET:
             stored = self._stored_match_snapshot(match_id)
-        coerced = not _is_terminal(snap.status)
+        coerced = force_terminal and not _is_terminal(snap.status)
         if coerced:
             status = MatchStatus.FINISHED  # G0
             minute: int | None = None
@@ -1898,20 +1988,22 @@ class CollectorEngine:
         )
 
     def _resolve_tracker(self, match_id: str, snapshot: NormalizedMatch) -> None:
-        """CONSUME point: pop the tracker after a DURABLE non-live apply.
+        """CONSUME point: pop the terminal tracker after a DURABLE non-live apply.
 
-        Called from ``poll_once`` only once ``_apply`` returned a baseline
-        (or the snapshot produced no diff because stored state already
-        matches). A pending give-up logs its ERROR here — persistence is
-        claimed only after the write actually landed. A durable non-live apply
-        REMOVES the cooldown entry entirely (the terminal resolution is one of
-        the only two entry-removal points, alongside the expired-unseen purge):
-        the row has resolved terminally, so the epoch/backoff memory is moot and
-        must not linger and block later re-tracking.
+        Called only from :meth:`_on_durable_snapshot`'s non-live tail — the
+        live-status case never reaches here (it returns earlier). A pending
+        give-up logs its ERROR here — persistence is claimed only after the
+        write actually landed. A durable non-live apply REMOVES the cooldown
+        entry entirely (the terminal resolution is one of the only two
+        entry-removal points, alongside the expired-unseen purge): the row has
+        resolved terminally, so the epoch/backoff memory is moot and must not
+        linger and block later re-tracking.
+
+        Backfill tracker resolution does NOT happen here: it is resolved by
+        :meth:`_on_durable_snapshot` itself, unconditionally, before branching
+        on live status — see that method's docstring for why it must not be
+        gated behind this (non-live-only) method.
         """
-        if snapshot.status in LIVE_STATUSES:
-            return
-        self._resolve_backfill_tracker(match_id, snapshot)
         self._cooldowns.pop(match_id, None)
         tracker = self._transitions.pop(match_id, None)
         if tracker is None or not tracker.give_up_pending:
@@ -1934,11 +2026,16 @@ class CollectorEngine:
         """CONSUME point: pop a resolved backfill tracker on any durable apply.
 
         Pop path 1 of 2 (the other is emission-cap exhaustion in
-        :meth:`_emit_backfill_give_up`). Called from :meth:`_resolve_tracker`
-        for every non-live durable apply, covering BOTH an ordinary
-        retry-then-succeed apply (``give_up_pending`` never set) and a
-        give-up apply landing — ``self._backfill`` must never leak either
-        way. No cooldown involvement: backfill has none.
+        :meth:`_emit_backfill_give_up`). Called from
+        :meth:`_on_durable_snapshot` FIRST, unconditionally, for EVERY durable
+        apply (live or not, ``state_advanced`` or not — including a no-change
+        apply, since the stored row already durably matches the snapshot),
+        covering an ordinary retry-then-succeed apply (``give_up_pending``
+        never set), a give-up apply landing, AND the case of a merged detail
+        resolving LIVE for a backfill-tracked match (e.g. a provider
+        correcting a stale terminal/scheduled read) — ``self._backfill`` must
+        never leak any of these ways. No cooldown involvement: backfill has
+        none.
         """
         tracker = self._backfill.pop(match_id, None)
         if tracker is None or not tracker.give_up_pending:
@@ -2154,7 +2251,7 @@ class CollectorEngine:
         inversely let a fresher non-live stub mask a still-live canonical row.
         """
         rows = self._stored_liveness_rows(provider_match_id)
-        return bool(rows) and rows[0][0] in LIVE_STATUS_VALUES
+        return _rows_report_live(rows)
 
     def _seed_restart_trackers(self, slate_ids: set[str]) -> None:
         """One-time restart scan: track stored-live matches gone from the slate.
