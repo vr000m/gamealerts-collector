@@ -89,6 +89,11 @@ gamecollect collect --pack football-wc2026 --db games.db --source wc2026-live \
     --record sessions/            # optional: write a replay fixture
 ```
 
+A match first seen already `FINISHED` (collector started late, or the match
+ended before it was ever polled) has its full event list backfilled once,
+same-slate-bounded by construction — pass `--no-finished-backfill` to disable
+(see [docs/DESIGN.md](docs/DESIGN.md) for the retry-cap and scope details).
+
 **Replay.** Recorded sessions (and the seed fixtures checked in under
 [fixtures/football/](fixtures/football/)) replay through `ReplayProvider`,
 which implements the same provider ABC the engine polls — paced in real time,

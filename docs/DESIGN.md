@@ -143,6 +143,24 @@ Two caveats consumers should know:
   `payload.scorer`/`.assist` as the authoritative source of participant
   identity, not `detail`.
 
+**Finished-on-first-sight event backfill.** A match the collector first
+observes already `FINISHED` — no in-memory baseline, no stored `matches` row,
+never previously seen live — is backfilled once: the engine calls
+`fetch_match_detail` for it and merges the result through the same
+`_event_to_row`/writer path as a live-observed match, so its events land under
+the identical `payload.scorer`/`payload.assist`/`payload.team` contract above,
+not a bare scoreboard-only snapshot. This is current-slate-bounded by
+construction, not by a new rate limiter: ESPN's default (no-`dates`)
+scoreboard response only ever holds the current slate (verified live against
+`fifa.world`), so a match that finished on a prior slate has already rolled
+off the board and is out of scope for this backfill. A failed detail fetch is
+retried on subsequent polls up to a pinned cap, `_BACKFILL_MAX_ATTEMPTS = 3`
+(`gamecollect.engine`); once exhausted, the collector gives up and persists
+the scoreboard-only snapshot (final score retained, no further retries for
+that match). The behavior defaults on and can be disabled with
+`collect --no-finished-backfill` (`backfill_finished_matches=False` on
+`CollectorEngine`).
+
 ## 7. Record/replay is a provider, not test scaffolding
 
 `ReplayProvider` (`gamecollect.replay`) implements the same provider ABC,
