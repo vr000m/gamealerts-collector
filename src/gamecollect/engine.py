@@ -499,6 +499,43 @@ def _tracker_at_cap(tracker: _TransitionTracker) -> bool:
     )
 
 
+def _first_sight_finished(
+    *,
+    previous: NormalizedMatch | None,
+    status: MatchStatus,
+    was_live: bool,
+    events: list[NormalizedEvent],
+    has_stored_row: bool,
+) -> bool:
+    """True on first sight of an already-finished (non-live) match.
+
+    Exactly five conjuncts, matching the plan's detection bullet verbatim:
+    no in-memory baseline, a non-live status, never live this poll (neither
+    via the baseline nor a stored row), a bare (event-empty) scoreboard
+    snapshot, and no existing stored row. Deliberately excludes any give-up/
+    at-cap term — that is Phase 2's pre-fetch short-circuit, evaluated
+    separately — and deliberately excludes the ``backfill_finished_matches``
+    kill switch, which the caller ANDs in on top of this predicate.
+    """
+    return (
+        previous is None
+        and status not in LIVE_STATUSES
+        and not was_live
+        and not events
+        and not has_stored_row
+    )
+
+
+def _live_to_terminal_transition(was_live: bool, status: MatchStatus) -> bool:
+    """True when a match was live and this poll's status is non-live.
+
+    Structurally exclusive with :func:`_first_sight_finished`: the latter
+    requires ``not was_live``, this requires ``was_live`` — both read
+    ``was_live`` with opposite polarity by construction.
+    """
+    return was_live and status not in LIVE_STATUSES
+
+
 # The remaining pure comparison/accumulation helpers
 # (_live_supersedes_cooldown_fallback, _live_supersedes_captured,
 # _fallback_worth_retaining, _live_supersedes_fallback, _accrue_fallback,
@@ -549,6 +586,7 @@ class CollectorEngine:
         record_path: str | Path | None = None,
         rng: random.Random | None = None,
         sleep: Callable[[float], None] | None = None,
+        backfill_finished_matches: bool = True,
     ) -> None:
         if poll_interval <= 0:
             raise ValueError("poll_interval must be positive")
@@ -556,6 +594,7 @@ class CollectorEngine:
         self._db_path = Path(db_path)
         self._source = source
         self._poll_interval = float(poll_interval)
+        self._backfill_finished_matches = backfill_finished_matches
         self._provider = provider if provider is not None else pack.provider_factory()
         # Fail fast on an unusable --record target BEFORE any polling (in
         # RecordWriter.__init__): a bad path discovered only at shutdown would
@@ -1058,16 +1097,33 @@ class CollectorEngine:
             was_live = (
                 previous is not None and previous.status in LIVE_STATUSES
             ) or match.match_id in self._transitions
+            # Default-initialized ahead of the restart-gap guard below (not
+            # derived from was_live) so it is never unbound/stale for a
+            # baselined, non-live, never-live match that reaches the skip
+            # condition further down (e.g. a repeatedly-polled SCHEDULED
+            # fixture never enters the guard).
+            has_stored_row = False
             if not was_live and previous is None and match.status not in LIVE_STATUSES:
                 # No in-memory baseline (typically the first poll after a
                 # restart): the transition may have happened while we were
                 # down — the stored row still says live. Cheap: fires only
-                # until the match is first baselined or tracker'd.
-                was_live = self._stored_status_is_live(match.match_id)
-            if match.status not in LIVE_STATUSES and not was_live:
+                # until the match is first baselined or tracker'd. Also
+                # surfaces row-existence for the first-sight-finished
+                # detection below, from this same lookup (no second call).
+                rows = self._stored_liveness_rows(match.match_id)
+                has_stored_row = bool(rows)
+                was_live = bool(rows) and rows[0][0] in LIVE_STATUS_VALUES
+            is_backfill = self._backfill_finished_matches and _first_sight_finished(
+                previous=previous,
+                status=match.status,
+                was_live=was_live,
+                events=match.events,
+                has_stored_row=has_stored_row,
+            )
+            if match.status not in LIVE_STATUSES and not was_live and not is_backfill:
                 hydrated.append(match)
                 continue
-            in_transition = was_live and match.status not in LIVE_STATUSES
+            in_transition = _live_to_terminal_transition(was_live, match.status)
             # A recoverable board is ALWAYS processed (fetch/merge/apply): a
             # FINISHED board closes an abandoned row (removing the cooldown entry
             # via _resolve_tracker), a live board resumes it (clearing the cooling
@@ -1909,8 +1965,8 @@ class CollectorEngine:
             kickoff_utc=kickoff_utc,
         )
 
-    def _stored_status_is_live(self, provider_match_id: str) -> bool:
-        """True when the AUTHORITATIVE stored ``matches`` row for this match is live.
+    def _stored_liveness_rows(self, provider_match_id: str) -> list[tuple]:
+        """Return the stored liveness-check candidate rows for this match.
 
         Consulted only for a non-live slate match with no in-memory diff
         baseline (a restart gap). The row is looked up under this source by
@@ -1926,20 +1982,30 @@ class CollectorEngine:
         non-baselined non-live slate match), which also skips the map join
         for ``default_seed_match`` packs, where no map entry can exist.
 
-        Evaluates ONLY the best (authority-first, then freshest) row's status
-        — consistent with :meth:`_stored_match_snapshot`, which merges from that
-        same row. Scanning "is ANY candidate row live" would let an older live
-        stub override a fresher non-live canonical row, wrongly classifying a
-        restart-gap match as a live→terminal transition when the canonical row
-        already recorded the terminal state; freshest-first would inversely let
-        a fresher non-live stub mask a still-live canonical row.
+        Returned rows are ordered best (authority-first, then freshest)
+        first — consistent with :meth:`_stored_match_snapshot`, which merges
+        from that same row. An empty list means no stored row exists at all,
+        which the caller uses as its own signal (e.g. first-sight-finished
+        detection) alongside liveness, from this one lookup.
         """
-        rows = self._stored_rows_for_provider(
+        return self._stored_rows_for_provider(
             provider_match_id, columns=self._STORED_LIVENESS_COLUMNS
         )
-        if not rows:
-            return False
-        return rows[0][0] in LIVE_STATUS_VALUES
+
+    def _stored_status_is_live(self, provider_match_id: str) -> bool:
+        """True when the AUTHORITATIVE stored ``matches`` row for this match is live.
+
+        Evaluates ONLY the best (authority-first, then freshest) row's status
+        from :meth:`_stored_liveness_rows` — consistent with
+        :meth:`_stored_match_snapshot`, which merges from that same row.
+        Scanning "is ANY candidate row live" would let an older live stub
+        override a fresher non-live canonical row, wrongly classifying a
+        restart-gap match as a live→terminal transition when the canonical
+        row already recorded the terminal state; freshest-first would
+        inversely let a fresher non-live stub mask a still-live canonical row.
+        """
+        rows = self._stored_liveness_rows(provider_match_id)
+        return bool(rows) and rows[0][0] in LIVE_STATUS_VALUES
 
     def _seed_restart_trackers(self, slate_ids: set[str]) -> None:
         """One-time restart scan: track stored-live matches gone from the slate.

@@ -1043,6 +1043,405 @@ def test_live_to_finished_transition_hydrates_final_detail(tmp_path):
     assert provider.detail_calls == ["m1", "m1"]
 
 
+# --------------------------------------------------------------------------- #
+# Finished-on-first-sight event backfill
+# (docs/dev_plans/20260711-feature-finished-match-backfill.md, Phase 1)
+# --------------------------------------------------------------------------- #
+
+
+def test_first_sight_finished_match_backfills_events_once_with_participant_payload(tmp_path):
+    """A match observed for the very first time already ``FINISHED`` — no
+    in-memory baseline, no stored row, real-ESPN-shaped scoreboard snapshot
+    carrying zero events — must trigger exactly one ``fetch_match_detail``
+    call and have its full event list persisted through the normal
+    ``_event_to_row``/writer path, with the PR #3 payload contract
+    (``payload.scorer``/``payload.assist``/``payload.team``) on a goal-family
+    event, not just event-count equality against an oracle."""
+    from gamecollect.engine import CollectorEngine
+
+    db = tmp_path / "engine.db"
+    board = nm("m1", (), status=MatchStatus.FINISHED, score_home=2, score_away=1)
+    detail = nm(
+        "m1",
+        (
+            ev(
+                0,
+                "goal",
+                minute=23,
+                team="Norway",
+                player="Andreas Schjelderup",
+                assist="Martin Ødegaard",
+            ),
+            ev(1, "yellow", minute=55, detail="Booking"),
+        ),
+        status=MatchStatus.FINISHED,
+        score_home=2,
+        score_away=1,
+    )
+    provider = DetailProvider([board], {"m1": detail})
+    engine = CollectorEngine(make_pack(provider), str(db), SOURCE, 0.01, provider=provider)
+    try:
+        engine.poll_once()
+    finally:
+        engine.close()
+
+    assert provider.detail_calls == ["m1"], (
+        "a genuinely first-sight FINISHED match must trigger exactly one detail fetch"
+    )
+    assert event_seqs(db, qualified("m1")) == [0, 1]
+    state = reader.get_state(read_db(db), qualified("m1"))
+    assert state is not None and state["status"] == MatchStatus.FINISHED.value
+
+    conn = read_db(db)
+    try:
+        (seq0_payload,) = conn.execute(
+            "SELECT payload FROM events WHERE match_id = ? AND seq = 0", (qualified("m1"),)
+        ).fetchone()
+    finally:
+        conn.close()
+    payload = json.loads(seq0_payload)
+    assert payload["scorer"] == "Andreas Schjelderup"
+    assert payload["assist"] == "Martin Ødegaard"
+    assert payload["team"] == "Norway"
+
+
+def test_first_sight_finished_match_repoll_does_not_refetch_or_duplicate(tmp_path):
+    """Re-polling the same already-backfilled match must not re-fetch detail
+    (the stored-row-existence gate short-circuits detection) and therefore
+    must not duplicate events."""
+    from gamecollect.engine import CollectorEngine
+
+    db = tmp_path / "engine.db"
+    board = nm("m1", (), status=MatchStatus.FINISHED, score_home=1, score_away=0)
+    detail = nm(
+        "m1",
+        (ev(0, "goal", minute=10, team="Canada", player="Jonathan David"),),
+        status=MatchStatus.FINISHED,
+        score_home=1,
+        score_away=0,
+    )
+    provider = ScriptedDetailProvider(
+        [
+            ([board], {"m1": detail}),
+            ([board], {"m1": detail}),
+        ]
+    )
+    engine = CollectorEngine(make_pack(provider), str(db), SOURCE, 0.01, provider=provider)
+    try:
+        engine.poll_once()
+        engine.poll_once()
+    finally:
+        engine.close()
+
+    assert provider.detail_calls == ["m1"], (
+        "a second poll of the same already-backfilled match must not re-fetch detail"
+    )
+    assert event_seqs(db, qualified("m1")) == [0], "no duplicate events from the re-poll"
+
+
+def test_live_then_finished_match_does_not_trigger_backfill_branch(tmp_path):
+    """A match observed live and only later finishing must stay on the
+    existing live/transition path — ``was_live`` is True for it, so it can
+    never satisfy the new first-sight-finished detection. This directly
+    covers the "no double-fetch for a live→finished match" Review Focus item
+    with an explicit call-count assertion distinguishing it from a genuine
+    first-sight-finished match (which fetches once, not per live+transition
+    poll)."""
+    from gamecollect.engine import CollectorEngine
+
+    db = tmp_path / "engine.db"
+    live_board = nm("m1", (), status=MatchStatus.IN_PLAY, minute=10)
+    live_detail = nm("m1", (ev(0, "goal", minute=10),), status=MatchStatus.IN_PLAY, minute=10)
+    ft_board = nm("m1", (), status=MatchStatus.FINISHED, minute=90, score_home=1)
+    ft_detail = nm(
+        "m1",
+        (ev(0, "goal", minute=10),),
+        status=MatchStatus.FINISHED,
+        minute=90,
+        score_home=1,
+    )
+    provider = ScriptedDetailProvider(
+        [
+            ([live_board], {"m1": live_detail}),
+            ([ft_board], {"m1": ft_detail}),
+        ]
+    )
+    engine = CollectorEngine(make_pack(provider), str(db), SOURCE, 0.01, provider=provider)
+    try:
+        engine.poll_once()
+        engine.poll_once()
+    finally:
+        engine.close()
+
+    # One detail fetch per poll (live poll + transition poll) — the
+    # pre-existing live/transition behavior, not the backfill path's
+    # exactly-one-ever contract.
+    assert provider.detail_calls == ["m1", "m1"]
+    assert event_seqs(db, qualified("m1")) == [0]
+
+
+def _resolve_backfill_predicates():
+    """Best-effort lookup of the factored ``is_backfill``/``in_transition``
+    predicates (Phase 1 checklist's factoring requirement, `/review-plan`
+    round 5: these must be referenceable helpers, not merely inline locals,
+    so a test can call them directly instead of only restating the formula).
+    Tries a short list of plausible module-level names (mirroring this
+    file's own ``_resolve_run``/``_resolve_stop`` convention) since this test
+    module cannot see the implementer's chosen name in advance. Returns
+    ``(is_backfill_fn, in_transition_fn)`` or ``(None, None)`` if neither
+    resolves, in which case the caller falls back to the plan-permitted
+    documentation-guard behavior instead of a direct code-level proof.
+    """
+    import gamecollect.engine as engine_module
+
+    is_backfill_fn = None
+    for name in ("_first_sight_finished", "_is_backfill", "_compute_is_backfill", "is_backfill"):
+        fn = getattr(engine_module, name, None)
+        if callable(fn):
+            is_backfill_fn = fn
+            break
+    in_transition_fn = None
+    for name in ("_live_to_terminal_transition", "_in_transition", "in_transition"):
+        fn = getattr(engine_module, name, None)
+        if callable(fn):
+            in_transition_fn = fn
+            break
+    return is_backfill_fn, in_transition_fn
+
+
+def test_is_backfill_and_in_transition_are_mutually_exclusive_by_construction():
+    """Structural assertion (Review Focus): ``is_backfill`` (``previous is
+    None and status not in LIVE_STATUSES and not was_live and not events and
+    not has_stored_row``) and ``in_transition`` (``was_live and status not in
+    LIVE_STATUSES``) read ``was_live`` with opposite polarity by construction
+    and can never both be ``True`` for the same input. Calls the factored
+    predicates directly (by keyword, so either implementation's exact
+    parameter names still bind) if the implementer exposed them at module
+    level; otherwise falls back to a documentation-guard note, per the
+    plan's named fallback, since the property is also covered behaviorally
+    by ``test_first_sight_finished_match_backfills_events_once_with_participant_payload``
+    and ``test_live_then_finished_match_does_not_trigger_backfill_branch``."""
+    is_backfill_fn, in_transition_fn = _resolve_backfill_predicates()
+    if is_backfill_fn is None or in_transition_fn is None:
+        pytest.skip(
+            "no factored is_backfill/in_transition predicate found at module level "
+            "in gamecollect.engine; exclusivity is covered behaviorally instead "
+            "(plan-permitted documentation-guard fallback)"
+        )
+
+    finished_status = MatchStatus.FINISHED
+    for was_live in (False, True):
+        is_backfill = is_backfill_fn(
+            previous=None if not was_live else nm("m1", (), status=MatchStatus.IN_PLAY),
+            status=finished_status,
+            was_live=was_live,
+            events=[],
+            has_stored_row=False,
+        )
+        in_transition = in_transition_fn(was_live, finished_status)
+        assert not (is_backfill and in_transition), (
+            f"is_backfill ({is_backfill}) and in_transition ({in_transition}) must "
+            f"never both be True (was_live={was_live})"
+        )
+    # And the concrete first-sight case is actually backfill, not transition:
+    assert (
+        is_backfill_fn(
+            previous=None,
+            status=finished_status,
+            was_live=False,
+            events=[],
+            has_stored_row=False,
+        )
+        is True
+    )
+    assert in_transition_fn(True, finished_status) is True
+
+
+def test_stored_row_finished_match_restart_previous_none_does_not_refetch(tmp_path):
+    """Regression test for the ``_stored_status_is_live`` refactor: a
+    ``FINISHED`` match that already has a stored ``matches`` row (from a
+    prior successful backfill or a pre-existing skip-branch persist), polled
+    with ``previous is None`` (a fresh engine instance / post-restart, no
+    in-memory baseline), must NOT trigger the new detection branch and must
+    NOT re-fetch — the ``was_live == False`` ambiguity this refactor exists to
+    resolve is exactly "no stored row at all" vs. "a stored row exists but is
+    non-live"."""
+    from gamecollect.db.connection import connect
+    from gamecollect.engine import CollectorEngine
+
+    db = tmp_path / "engine.db"
+    conn = connect(str(db), side_table_ddl=FAKE_SIDE_TABLE_DDL)
+    try:
+        with conn:
+            _stored_row(
+                conn,
+                "m1",
+                status=MatchStatus.FINISHED,
+                score_home=2,
+                updated_at="2026-06-18T20:00:00Z",
+            )
+    finally:
+        conn.close()
+
+    board = nm("m1", (), status=MatchStatus.FINISHED, score_home=2, score_away=0)
+    provider = DetailProvider([board], {})
+    pack = make_pack(provider, seed_match=default_seed_match)
+    engine = CollectorEngine(pack, str(db), SOURCE, 0.01, provider=provider)
+    try:
+        engine.poll_once()
+    finally:
+        engine.close()
+
+    assert provider.detail_calls == [], (
+        "a FINISHED match with an existing stored row must not be re-fetched "
+        "just because there is no in-memory baseline"
+    )
+
+
+def test_baselined_never_live_scheduled_match_is_backfill_false_no_crash(tmp_path):
+    """Complementary ``has_stored_row`` default-init path: a baselined
+    (``previous is not None``) non-live, never-live match — a repeatedly
+    polled ``SCHEDULED`` fixture — reaching the skip condition on its SECOND
+    poll must evaluate ``is_backfill`` as ``False`` and must not
+    crash/``UnboundLocalError``, pinning the "default-initialize before the
+    restart-gap guard" fix. (The formal ``is_backfill`` predicate is
+    ``previous is None and status not in LIVE_STATUSES and not was_live and
+    not events and not has_stored_row`` — it does not special-case FINISHED
+    vs. SCHEDULED, so a genuinely first-sight, event-empty SCHEDULED match
+    DOES take the new one-time-fetch branch on its first poll; the property
+    under test here is the SECOND poll, where ``previous is not None``
+    forces ``is_backfill`` False regardless of ``has_stored_row``, and that
+    variable must still be a bound, correct value at that point.)"""
+    from gamecollect.engine import CollectorEngine
+
+    db = tmp_path / "engine.db"
+    board = nm(
+        "m1",
+        (),
+        status=MatchStatus.SCHEDULED,
+        minute=None,
+        score_home=None,
+        score_away=None,
+        display_clock=None,
+    )
+    detail = nm(
+        "m1",
+        (),
+        status=MatchStatus.SCHEDULED,
+        minute=None,
+        score_home=None,
+        score_away=None,
+        display_clock=None,
+    )
+    provider = DetailProvider([board], {"m1": detail})
+    engine = CollectorEngine(make_pack(provider), str(db), SOURCE, 0.01, provider=provider)
+    try:
+        engine.poll_once()
+        first_poll_calls = list(provider.detail_calls)
+        engine.poll_once()
+    finally:
+        engine.close()
+
+    assert provider.detail_calls == first_poll_calls, (
+        "the second poll of an already-baselined SCHEDULED match must not "
+        "trigger any additional detail fetch (is_backfill is False once "
+        "previous is not None) and must not crash"
+    )
+    state = reader.get_state(read_db(db), qualified("m1"))
+    assert state is not None and state["status"] == MatchStatus.SCHEDULED.value
+
+
+def test_replay_provider_first_sight_finished_extra_call_is_harmless_and_cursor_unchanged(tmp_path):
+    """Requirements' Replay/fixtures bullet, committed per Phase 1 checklist:
+    a genuinely zero-event first ``ReplayProvider`` poll (e.g. a fixture
+    recorded ``FINISHED`` with no events, or a ``SCHEDULED`` fixture) makes
+    ``not match.events`` True, so the new branch fires one extra
+    ``fetch_match_detail`` call — harmless because it does not advance the
+    step-mode ``_revealed`` cursor (only ``fetch_live_matches`` does). Both
+    the exact call count AND the unchanged cursor must be asserted — the call
+    count alone proves the call happened, not that the harmlessness
+    invariant (the cursor staying put) held."""
+    import math
+
+    from gamecollect.engine import CollectorEngine
+    from gamecollect.fixture_io import Fixture
+    from gamecollect.replay import ReplayProvider
+
+    class _CountingReplayProvider(ReplayProvider):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.detail_calls: list[str] = []
+
+        def fetch_match_detail(self, match_id: str) -> NormalizedMatch:
+            self.detail_calls.append(match_id)
+            return super().fetch_match_detail(match_id)
+
+    db = tmp_path / "engine.db"
+    zero_event_match = nm(
+        "m1",
+        (),
+        status=MatchStatus.FINISHED,
+        score_home=0,
+        score_away=0,
+    )
+    fixture = Fixture(format_version=1, match=zero_event_match)
+    provider = _CountingReplayProvider(fixture, speed=math.inf)
+    engine = CollectorEngine(make_pack(provider), str(db), SOURCE, 0.01, provider=provider)
+    try:
+        engine.poll_once()
+    finally:
+        engine.close()
+
+    assert provider.detail_calls == ["m1"], (
+        "a genuinely zero-event first replay poll makes one harmless extra detail call"
+    )
+    assert provider._revealed == 0, (
+        "the extra backfill detail call must NOT advance the step-mode reveal cursor"
+    )
+
+
+def test_backfill_finished_matches_false_reproduces_todays_skip_branch_behavior(tmp_path):
+    """``backfill_finished_matches=False`` must reproduce today's skip-branch
+    behavior byte-for-byte: the new detection condition is never evaluated,
+    so a first-sight-FINISHED match with a real-ESPN-shaped zero-event
+    scoreboard snapshot is never detail-fetched and lands only its
+    scoreboard-only (score + status, zero events) row."""
+    from gamecollect.engine import CollectorEngine
+
+    db = tmp_path / "engine.db"
+    board = nm("m1", (), status=MatchStatus.FINISHED, score_home=3, score_away=1)
+    detail = nm(
+        "m1",
+        (ev(0, "goal", minute=5),),
+        status=MatchStatus.FINISHED,
+        score_home=3,
+        score_away=1,
+    )
+    provider = DetailProvider([board], {"m1": detail})
+    engine = CollectorEngine(
+        make_pack(provider),
+        str(db),
+        SOURCE,
+        0.01,
+        provider=provider,
+        backfill_finished_matches=False,
+    )
+    try:
+        engine.poll_once()
+    finally:
+        engine.close()
+
+    assert provider.detail_calls == [], (
+        "backfill_finished_matches=False must never evaluate the new detection condition"
+    )
+    assert event_seqs(db, qualified("m1")) == [], (
+        "with backfill disabled only the bare scoreboard snapshot is persisted"
+    )
+    state = reader.get_state(read_db(db), qualified("m1"))
+    assert state is not None and state["status"] == MatchStatus.FINISHED.value
+    assert state["score_home"] == 3 and state["score_away"] == 1
+
+
 @pytest.mark.parametrize(
     ("error", "min_level"),
     [
