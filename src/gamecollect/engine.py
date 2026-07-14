@@ -524,26 +524,30 @@ def _first_sight_finished(
     previous: NormalizedMatch | None,
     status: MatchStatus,
     was_live: bool,
-    events: list[NormalizedEvent],
     has_stored_row: bool,
 ) -> bool:
-    """True on first sight of an already-finished (non-live) match.
+    """True on first sight of an already-finished (i.e. terminal) match.
 
-    Exactly five conjuncts, matching the plan's detection bullet verbatim:
-    no in-memory baseline, a non-live status, never live this poll (neither
-    via the baseline nor a stored row), a bare (event-empty) scoreboard
-    snapshot, and no existing stored row. Deliberately excludes any give-up/
+    Four conjuncts: no in-memory baseline, a genuinely TERMINAL status (per
+    :func:`_is_terminal`, not merely "not live" — see the post-merge Codex
+    review, finding #4), never live this poll (neither via the baseline nor a
+    stored row), and no existing stored row. Using ``_is_terminal`` instead of
+    ``status not in LIVE_STATUSES`` matters: the latter also matches
+    SCHEDULED/UNKNOWN, which would detail-fetch every upcoming/unknown
+    fixture on a cold start — a scope leak the plan never intended (plan line
+    35: "`FINISHED` (or otherwise terminal)"). Deliberately excludes any
+    ``events`` conjunct (round-3 Codex finding #1): the provider ABC
+    (``MatchDataProvider.fetch_live_matches``) explicitly permits a
+    scoreboard-only snapshot to carry a partial event list, so a genuinely
+    first-sight FINISHED match whose bare board already shows some events
+    must still trigger the full detail fetch — treating it as "nothing to
+    do" would persist the partial list directly and permanently foreclose
+    hydration via ``has_stored_row``. Deliberately excludes any give-up/
     at-cap term — that is Phase 2's pre-fetch short-circuit, evaluated
     separately — and deliberately excludes the ``backfill_finished_matches``
     kill switch, which the caller ANDs in on top of this predicate.
     """
-    return (
-        previous is None
-        and status not in LIVE_STATUSES
-        and not was_live
-        and not events
-        and not has_stored_row
-    )
+    return previous is None and _is_terminal(status) and not was_live and not has_stored_row
 
 
 def _live_to_terminal_transition(was_live: bool, status: MatchStatus) -> bool:
@@ -682,6 +686,15 @@ class CollectorEngine:
         # ``_emit_backfill_give_up`` — no vanished-match purge (accepted,
         # in-memory only, bounded by matches-per-slate).
         self._backfill: dict[str, _TransitionTracker] = {}
+        # Poll-scoped set of match ids whose backfill detail fetch SUCCEEDED
+        # this poll (populated in ``_fetch_poll_snapshots``, cleared at the
+        # top of every call so it never carries stale ids across polls).
+        # ``poll_once`` consults it to tell apart a downstream ``_apply``
+        # failure for an ``is_backfill`` match (which must still register a
+        # backfill-tracker failure — see ``_register_backfill_apply_failure``
+        # — post-merge Codex review findings #2/#3) from an ordinary match's
+        # ``_apply`` failure (unrelated to backfill retry accounting).
+        self._backfill_apply_pending: set[str] = set()
         self._backoff_multiplier = 1
         # One-time restart scan latch: on the FIRST successful poll the stored
         # matches table is scanned for rows this source left live at shutdown
@@ -794,6 +807,16 @@ class CollectorEngine:
                     self._source,
                     exc,
                 )
+                # Post-merge Codex review finding #2: this _apply raised AFTER
+                # seed_match may already have durably written the matches row
+                # (seed-before-child-write), so a match this poll's fetch
+                # confirmed as ``is_backfill`` must still count this as a
+                # backfill attempt — otherwise a row now exists with no
+                # tracker to keep is_backfill alive, permanently foreclosing
+                # retry. Not reached for a non-backfill match (absent from
+                # ``self._backfill_apply_pending``).
+                if diff.match.match_id in self._backfill_apply_pending:
+                    self._register_backfill_apply_failure(diff.match)
                 continue
             except (TaxonomyError, UnseededMatchError, CrossPartitionError) as exc:
                 # Undeclared type / unseeded / foreign-partition write: a bad
@@ -806,6 +829,9 @@ class CollectorEngine:
                     self._source,
                     exc,
                 )
+                # Same rationale as the SequenceError branch above (finding #2).
+                if diff.match.match_id in self._backfill_apply_pending:
+                    self._register_backfill_apply_failure(diff.match)
                 continue
             if baseline is not None:
                 self._last[diff.match.match_id] = baseline
@@ -822,6 +848,15 @@ class CollectorEngine:
                     live_resumptions=live_resumptions,
                     state_advanced=True,
                 )
+            elif diff.match.match_id in self._backfill_apply_pending:
+                # Post-merge Codex review finding #3: seed_match returned None
+                # (missing identity) after a successful detail fetch for an
+                # is_backfill match — no durable write landed, so nothing was
+                # foreclosed, but without registering a failure here nothing
+                # ever counts against _BACKFILL_MAX_ATTEMPTS either, and
+                # _first_sight_finished would keep re-firing (fetching detail
+                # again) every poll forever.
+                self._register_backfill_apply_failure(diff.match)
 
     def _apply(self, diff: MatchDiff) -> NormalizedMatch | None:
         """Seed the match through the pack hook, then append its new events.
@@ -1110,6 +1145,11 @@ class CollectorEngine:
         drop a match without ever showing its final status, and the stored
         row must not stay in-play forever.
         """
+        # Poll-scoped: cleared unconditionally before this poll populates it,
+        # so a stale id from a prior poll (whose _apply already resolved one
+        # way or another) can never be misread as "this poll's fetch
+        # succeeded" by poll_once's failure-registration checks below.
+        self._backfill_apply_pending.clear()
         matches = self._provider.fetch_live_matches()
         slate_ids = {m.match_id for m in matches}
         # Provider ids that appeared LIVE on the slate this poll. Poll-scoped
@@ -1164,35 +1204,36 @@ class CollectorEngine:
                 rows = self._stored_liveness_rows(match.match_id)
                 has_stored_row = bool(rows)
                 was_live = _rows_report_live(rows)
-            # Round-3 Codex finding: ``_first_sight_finished``'s ``not events``
-            # conjunct is a DETECTION heuristic, not an invariant the provider
-            # ABC guarantees — ``fetch_live_matches``'s docstring explicitly
-            # allows "partial event lists" on a scoreboard-only snapshot (see
-            # ``MatchDataProvider``), and ``ReplayProvider`` is a first-class
-            # provider that does exactly this by design (a fixture's revealed
-            # event prefix rides on the bare scoreboard snapshot, growing poll
-            # over poll). So a match ALREADY parked in ``self._backfill`` (its
-            # one-time detail fetch failed and is pending retry, per
-            # ``_backfill_tracker``) must keep routing through the retry/fetch
-            # path even if a LATER poll's bare scoreboard happens to carry some
-            # events — otherwise ``_first_sight_finished`` goes False solely on
-            # ``events`` becoming non-empty, this match falls into the
-            # ordinary "already terminal, nothing to do" skip below, the
-            # partial scoreboard snapshot is persisted directly (bypassing
-            # detail fetch entirely), and ``_on_durable_snapshot`` pops the
-            # pending tracker's accrued fallback silently (no give-up log,
-            # since ``give_up_pending`` was never set) — permanently losing any
-            # events absent from that partial snapshot. Gated on ``not
-            # was_live`` and ``status not in LIVE_STATUSES`` (mirroring
-            # ``_first_sight_finished``'s own terms) so a pending-retry match
-            # that reappears genuinely LIVE this poll still takes the ordinary
-            # live path instead of being force-routed into backfill-failure
-            # handling — preserves the ``is_backfill``/``in_transition``
-            # mutual exclusivity invariant by construction.
+            # Post-merge Codex review (findings #1-#4): ``has_stored_row``
+            # alone can no longer stand as "backfill already attempted" —
+            # several paths (a partial scoreboard snapshot persisted
+            # directly, a downstream ``_apply`` failure after ``seed_match``
+            # already durably wrote the row, see ``_register_backfill_apply_failure``)
+            # can durably write a ``matches`` row without ever completing full
+            # detail hydration, which would permanently foreclose retry if
+            # ``has_stored_row`` were the sole gate. ``pending_backfill_retry``
+            # is the fix: once a match has an ACTIVE ``self._backfill``
+            # tracker — created by ANY failed backfill attempt, whether a
+            # ``fetch_match_detail`` exception, a downstream ``_apply``
+            # exception, or ``seed_match`` returning ``None`` — it keeps
+            # routing through ``is_backfill`` on every subsequent poll
+            # regardless of what ``has_stored_row`` reads, because that flag
+            # may now mean "a partial/failed attempt already wrote
+            # something" rather than "backfill fully completed". Uses
+            # ``_is_terminal`` (mirroring ``_first_sight_finished``'s own
+            # term, post round-3-Codex-finding-#4 fix) rather than the wider
+            # ``status not in LIVE_STATUSES`` so a tracked match that flips to
+            # SCHEDULED/UNKNOWN does not force backfill routing either.
+            # Gated additionally on ``not was_live`` so a pending-retry match
+            # that reappears genuinely LIVE this poll still takes the
+            # ordinary live path instead of being force-routed into
+            # backfill-failure handling — preserves the
+            # ``is_backfill``/``in_transition`` mutual exclusivity invariant
+            # by construction.
             pending_backfill_retry = (
                 self._backfill_finished_matches
                 and match.match_id in self._backfill
-                and match.status not in LIVE_STATUSES
+                and _is_terminal(match.status)
                 and not was_live
             )
             is_backfill = self._backfill_finished_matches and (
@@ -1200,7 +1241,6 @@ class CollectorEngine:
                     previous=previous,
                     status=match.status,
                     was_live=was_live,
-                    events=match.events,
                     has_stored_row=has_stored_row,
                 )
                 or pending_backfill_retry
@@ -1248,9 +1288,7 @@ class CollectorEngine:
             except (ProviderUnavailableError, ShapeDriftError) as exc:
                 if is_backfill:
                     self._log_detail_fetch_failure(match.match_id, exc)
-                    backfill_tracker = self._backfill_tracker(match.match_id)
-                    backfill_tracker.fallback = _accrue_fallback(backfill_tracker.fallback, match)
-                    backfill_tracker.consecutive_failures += 1
+                    backfill_tracker = self._register_backfill_apply_failure(match)
                     if _backfill_tracker_at_cap(backfill_tracker):
                         self._emit_backfill_give_up(
                             hydrated, match.match_id, backfill_tracker, fresh=match
@@ -1301,8 +1339,31 @@ class CollectorEngine:
                 continue
             if tracker is not None:
                 tracker.consecutive_failures = 0
-            if backfill_tracker is not None:
-                backfill_tracker.consecutive_failures = 0
+            # NOTE: unlike ``tracker`` above, ``backfill_tracker.consecutive_failures``
+            # is deliberately NOT reset to 0 here on fetch success. Before
+            # findings #2/#3, a successful fetch always led to a durable
+            # apply, which pops the tracker entirely via
+            # ``_resolve_backfill_tracker`` regardless of this field's value
+            # — so resetting it here was a no-op in practice. Now that the
+            # downstream ``_apply`` can still legitimately fail after a
+            # successful fetch (``_register_backfill_apply_failure``,
+            # populated below via ``self._backfill_apply_pending``), zeroing
+            # it here would erase that failure's contribution BEFORE
+            # poll_once's except handler ever increments it, permanently
+            # masking the cap (every poll: reset to 0, then +1 — never
+            # reaching ``_BACKFILL_MAX_ATTEMPTS``).
+            if is_backfill:
+                # The fetch succeeded, but the downstream diff/_apply in
+                # poll_once can still fail (an exception _apply itself does
+                # not reconcile, or seed_match returning None) — post-merge
+                # Codex review findings #2/#3. Mark this match so poll_once
+                # can tell such a failure apart from an ordinary match's
+                # _apply failure and still register it against the backfill
+                # tracker (see _register_backfill_apply_failure), rather than
+                # silently either foreclosing retry (a partial row was
+                # already durably seeded) or retrying unboundedly (no row was
+                # seeded, no tracker exists to bound it).
+                self._backfill_apply_pending.add(match.match_id)
             merged = _merge_detail(match, detail)
             if in_transition and not _is_terminal(merged.status):
                 # The transition hydration succeeded but did NOT yield a
@@ -1480,6 +1541,32 @@ class CollectorEngine:
         tracker = self._backfill.get(match_id)
         if tracker is None:
             tracker = self._backfill[match_id] = _TransitionTracker()
+        return tracker
+
+    def _register_backfill_apply_failure(self, match: NormalizedMatch) -> _TransitionTracker:
+        """Get-or-create ``match``'s backfill tracker and count one failure.
+
+        Shared by three call sites, all post-merge Codex review findings:
+        a ``fetch_match_detail`` exception for an ``is_backfill`` match (the
+        original path), and — new — a downstream ``_apply`` failure in
+        ``poll_once`` for a match whose fetch this poll SUCCEEDED (an
+        exception ``_apply`` itself does not reconcile, finding #2, or
+        ``seed_match`` returning ``None``, finding #3). Both new cases would
+        otherwise never create/advance a tracker: ``self._backfill`` would
+        stay empty (finding #2's ``seed_match`` already durably wrote the row
+        this poll, permanently foreclosing ``_first_sight_finished`` next
+        poll with no tracker to keep ``is_backfill`` alive via
+        ``pending_backfill_retry``) or the retry would be unbounded (finding
+        #3: no row was seeded, so ``_first_sight_finished`` keeps re-firing
+        every poll with nothing counting against ``_BACKFILL_MAX_ATTEMPTS``).
+        Registering the failure here, keyed by the same tracker/cap machinery
+        the fetch-exception path already uses, closes both gaps: the next
+        poll's pre-fetch at-cap check (or ``pending_backfill_retry``) takes
+        over from here.
+        """
+        tracker = self._backfill_tracker(match.match_id)
+        tracker.fallback = _accrue_fallback(tracker.fallback, match)
+        tracker.consecutive_failures += 1
         return tracker
 
     def _age_cooldowns(self, slate_ids: set[str]) -> None:

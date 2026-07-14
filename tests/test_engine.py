@@ -1210,14 +1210,16 @@ def _resolve_backfill_predicates():
 
 
 def test_is_backfill_and_in_transition_are_mutually_exclusive_by_construction():
-    """Structural assertion (Review Focus): ``is_backfill`` (``previous is
-    None and status not in LIVE_STATUSES and not was_live and not events and
-    not has_stored_row``) and ``in_transition`` (``was_live and status not in
-    LIVE_STATUSES``) read ``was_live`` with opposite polarity by construction
-    and can never both be ``True`` for the same input. Calls the factored
-    predicates directly (by keyword, so either implementation's exact
-    parameter names still bind) if the implementer exposed them at module
-    level; otherwise falls back to a documentation-guard note, per the
+    """Structural assertion (Review Focus): ``is_backfill`` (post-merge Codex
+    review findings #1/#4: ``previous is None and _is_terminal(status) and
+    not was_live and not has_stored_row`` — the ``events`` conjunct was
+    dropped and ``status not in LIVE_STATUSES`` tightened to
+    ``_is_terminal(status)``) and ``in_transition`` (``was_live and status
+    not in LIVE_STATUSES``) read ``was_live`` with opposite polarity by
+    construction and can never both be ``True`` for the same input. Calls the
+    factored predicates directly (by keyword, so either implementation's
+    exact parameter names still bind) if the implementer exposed them at
+    module level; otherwise falls back to a documentation-guard note, per the
     plan's named fallback, since the property is also covered behaviorally
     by ``test_first_sight_finished_match_backfills_events_once_with_participant_payload``
     and ``test_live_then_finished_match_does_not_trigger_backfill_branch``."""
@@ -1235,7 +1237,6 @@ def test_is_backfill_and_in_transition_are_mutually_exclusive_by_construction():
             previous=None if not was_live else nm("m1", (), status=MatchStatus.IN_PLAY),
             status=finished_status,
             was_live=was_live,
-            events=[],
             has_stored_row=False,
         )
         in_transition = in_transition_fn(was_live, finished_status)
@@ -1249,7 +1250,6 @@ def test_is_backfill_and_in_transition_are_mutually_exclusive_by_construction():
             previous=None,
             status=finished_status,
             was_live=False,
-            events=[],
             has_stored_row=False,
         )
         is True
@@ -1304,14 +1304,18 @@ def test_baselined_never_live_scheduled_match_is_backfill_false_no_crash(tmp_pat
     polled ``SCHEDULED`` fixture — reaching the skip condition on its SECOND
     poll must evaluate ``is_backfill`` as ``False`` and must not
     crash/``UnboundLocalError``, pinning the "default-initialize before the
-    restart-gap guard" fix. (The formal ``is_backfill`` predicate is
-    ``previous is None and status not in LIVE_STATUSES and not was_live and
-    not events and not has_stored_row`` — it does not special-case FINISHED
-    vs. SCHEDULED, so a genuinely first-sight, event-empty SCHEDULED match
-    DOES take the new one-time-fetch branch on its first poll; the property
-    under test here is the SECOND poll, where ``previous is not None``
-    forces ``is_backfill`` False regardless of ``has_stored_row``, and that
-    variable must still be a bound, correct value at that point.)"""
+    restart-gap guard" fix. (Post-merge Codex review finding #4 changed the
+    formal ``is_backfill`` predicate to require ``_is_terminal(status)``
+    rather than merely ``status not in LIVE_STATUSES``, so a first-sight
+    SCHEDULED fixture — never terminal — is now ``is_backfill`` False even on
+    its FIRST poll, not just its second; this test's original premise (a
+    first-sight SCHEDULED match backfills once) no longer holds, but the
+    property under test here — the SECOND poll, where ``previous is not
+    None`` forces ``is_backfill`` False regardless of ``has_stored_row``, and
+    that variable must still be a bound, correct value at that point — is
+    unaffected either way, since the assertion below only compares the
+    second poll's fetch count against the first poll's, not an absolute
+    count.)"""
     from gamecollect.engine import CollectorEngine
 
     db = tmp_path / "engine.db"
@@ -1442,6 +1446,110 @@ def test_backfill_finished_matches_false_reproduces_todays_skip_branch_behavior(
     assert state["score_home"] == 3 and state["score_away"] == 1
 
 
+def test_first_sight_finished_with_partial_scoreboard_events_still_backfills_full_list(
+    tmp_path,
+):
+    """Post-merge Codex review finding #1 [high]: a genuinely first-sight
+    FINISHED match whose BARE scoreboard snapshot already carries a partial
+    (non-empty) event list — a shape ``MatchDataProvider.fetch_live_matches``'s
+    docstring explicitly permits and ``ReplayProvider`` produces by design —
+    must still trigger the one-time detail fetch, not be treated as "nothing
+    to do" because the OLD ``_first_sight_finished`` also required
+    ``not events``. Before the fix this would persist the partial scoreboard
+    list directly and permanently foreclose full hydration (``has_stored_row``
+    becomes True with no tracker to retry). After the fix the ``events``
+    conjunct is dropped entirely, so detection depends only on
+    previous/status/was_live/has_stored_row."""
+    from gamecollect.engine import CollectorEngine
+
+    db = tmp_path / "engine.db"
+    board = nm(
+        "m1",
+        (ev(0, "goal", minute=23, team="Norway", player="Andreas Schjelderup"),),
+        status=MatchStatus.FINISHED,
+        score_home=2,
+        score_away=1,
+    )
+    detail = nm(
+        "m1",
+        (
+            ev(0, "goal", minute=23, team="Norway", player="Andreas Schjelderup"),
+            ev(1, "goal", minute=67, team="Norway", player="Erling Haaland"),
+        ),
+        status=MatchStatus.FINISHED,
+        score_home=2,
+        score_away=1,
+    )
+    provider = DetailProvider([board], {"m1": detail})
+    engine = CollectorEngine(make_pack(provider), str(db), SOURCE, 0.01, provider=provider)
+    try:
+        engine.poll_once()
+    finally:
+        engine.close()
+
+    assert provider.detail_calls == ["m1"], (
+        "a first-sight FINISHED match with a partial (non-empty) bare "
+        "scoreboard event list must still trigger exactly one detail fetch"
+    )
+    assert event_seqs(db, qualified("m1")) == [0, 1], (
+        "the durably stored event list must be the FULL detail list, not "
+        "the partial scoreboard prefix"
+    )
+    state = reader.get_state(read_db(db), qualified("m1"))
+    assert state is not None and state["status"] == MatchStatus.FINISHED.value
+
+
+@pytest.mark.parametrize(
+    "status",
+    [MatchStatus.SCHEDULED, MatchStatus.UNKNOWN],
+    ids=["scheduled", "unknown"],
+)
+def test_first_sight_non_terminal_match_never_triggers_backfill_fetch(tmp_path, status):
+    """Post-merge Codex review finding #4: a first-sight match whose status
+    is NOT terminal (SCHEDULED or UNKNOWN — neither is in ``LIVE_STATUSES``
+    either, so the OLD ``status not in LIVE_STATUSES`` conjunct wrongly
+    matched them) must never trigger the one-time backfill detail fetch. The
+    plan's detection bullet is scoped to a match "FINISHED (or otherwise
+    terminal)", not merely non-live — a cold start must not detail-fetch
+    every SCHEDULED/UNKNOWN fixture on the slate."""
+    from gamecollect.engine import CollectorEngine
+
+    db = tmp_path / "engine.db"
+    board = nm(
+        "m1",
+        (),
+        status=status,
+        minute=None,
+        score_home=None,
+        score_away=None,
+        display_clock=None,
+    )
+    detail = nm(
+        "m1",
+        (ev(0, "goal", minute=5),),
+        status=status,
+        minute=None,
+        score_home=None,
+        score_away=None,
+        display_clock=None,
+    )
+    provider = DetailProvider([board], {"m1": detail})
+    engine = CollectorEngine(make_pack(provider), str(db), SOURCE, 0.01, provider=provider)
+    try:
+        engine.poll_once()
+    finally:
+        engine.close()
+
+    assert provider.detail_calls == [], (
+        f"a first-sight {status.value} match must never trigger a backfill detail fetch"
+    )
+    assert event_seqs(db, qualified("m1")) == [], (
+        "no detail fetch means only the bare scoreboard snapshot is persisted"
+    )
+    state = reader.get_state(read_db(db), qualified("m1"))
+    assert state is not None and state["status"] == status.value
+
+
 # --------------------------------------------------------------------------- #
 # Finished-on-first-sight event backfill — Phase 2: bounded failure tolerance
 # (docs/dev_plans/20260711-feature-finished-match-backfill.md, Phase 2)
@@ -1516,32 +1624,31 @@ def test_backfill_fetch_fails_once_then_succeeds_retries_and_pops_tracker(tmp_pa
     )
 
 
-def test_backfill_retry_resolving_live_pops_tracker_not_leaked(tmp_path):
-    """Regression for the round-2 Codex finding: a backfill-tracked match
-    (first-sight SCHEDULED, bare/no-event board) whose retried detail fetch
-    resolves the merged snapshot to a LIVE status (a provider correcting a
-    stale SCHEDULED read to IN_PLAY — exactly the scenario documented on
-    ``_on_durable_snapshot``) must still pop ``self._backfill`` once that
-    apply durably lands. ``_resolve_tracker`` (the non-live consume point) is
-    never reached for a live snapshot — ``_on_durable_snapshot`` returns from
-    its live branch before calling it — so the pop must happen unconditionally
-    inside ``_on_durable_snapshot`` itself, not gated behind the terminal
-    path. Board status stays SCHEDULED (not FINISHED) on both polls so
-    ``is_backfill`` re-evaluates True on the retry too (``previous is None``
-    persists: a failed backfill attempt never baselines)."""
-    from gamecollect.engine import CollectorEngine
+def test_backfill_tracker_resolving_live_pops_tracker_not_leaked(tmp_path):
+    """Regression for the round-2 Codex finding, reworked for finding #4.
+
+    Originally this test drove the scenario through ``is_backfill`` itself
+    staying True across a retry that resolved live: a first-sight SCHEDULED
+    board (SCHEDULED was ``not in LIVE_STATUSES``, so the OLD detection fired
+    on it) whose retried detail then merged to IN_PLAY. Post-merge Codex
+    review finding #4 changed detection to require a genuinely TERMINAL
+    status (``_is_terminal`` — today only ``FINISHED``), which is also
+    ``_STATUS_RANK``'s MAXIMUM rank — so ``_merge_detail``'s forward-only rule
+    now makes it IMPOSSIBLE for a still-``is_backfill`` match's merged status
+    to ever resolve live (a FINISHED scoreboard always wins over a lagging
+    live detail). The underlying invariant this test protects — a
+    ``self._backfill`` tracker must never leak when its match's apply
+    eventually lands LIVE — is still reachable, just via a different route:
+    a tracker created by an earlier failed attempt (e.g.
+    ``_register_backfill_apply_failure``, findings #2/#3) whose match later
+    genuinely reports live on the ordinary (non-``is_backfill``) live path.
+    ``_resolve_backfill_tracker``'s pop in ``_on_durable_snapshot`` is
+    unconditional — independent of whether ``is_backfill`` re-evaluates True
+    THIS poll — so it must still fire and not leak the stale tracker."""
+    from gamecollect.engine import CollectorEngine, _TransitionTracker
 
     db = tmp_path / "engine.db"
-    board = nm(
-        "m1",
-        (),
-        status=MatchStatus.SCHEDULED,
-        minute=None,
-        score_home=None,
-        score_away=None,
-        display_clock=None,
-    )
-    detail = nm(
+    live_board = nm(
         "m1",
         (),
         status=MatchStatus.IN_PLAY,
@@ -1550,30 +1657,29 @@ def test_backfill_retry_resolving_live_pops_tracker_not_leaked(tmp_path):
         score_away=0,
         display_clock="5'",
     )
-    provider = ScriptedDetailProvider(
-        [
-            ([board], {"m1": ProviderUnavailableError("summary 503")}),
-            ([board], {"m1": detail}),
-        ]
-    )
+    provider = DetailProvider([live_board], {"m1": live_board})
     engine = CollectorEngine(make_pack(provider), str(db), SOURCE, 0.01, provider=provider)
+    # Simulate a tracker left over from an earlier failed backfill attempt
+    # (the state findings #2/#3's _register_backfill_apply_failure produces)
+    # rather than driving it through a real failed fetch — the point under
+    # test is the pop, not how the tracker got there.
+    engine._restart_scan_done = True
+    engine._backfill["m1"] = _TransitionTracker(consecutive_failures=1)
     try:
-        engine.poll_once()
-        assert "m1" in engine._backfill, "the failed first-sight backfill attempt must be tracked"
         engine.poll_once()
     finally:
         engine.close()
 
-    assert provider.detail_calls == ["m1", "m1"]
+    assert provider.detail_calls == ["m1"]
     state = reader.get_state(read_db(db), qualified("m1"))
     assert state is not None and state["status"] == MatchStatus.IN_PLAY.value, (
-        "the merged detail (forward-only status rank: IN_PLAY > SCHEDULED) "
-        "must durably apply as live"
+        "the genuinely live board/detail must durably apply as live"
     )
     assert "m1" not in engine._backfill, (
-        "self._backfill must not leak once a backfill-tracked match's "
-        "retried apply durably lands as LIVE — the pop must not be gated "
-        "behind the non-live-only _resolve_tracker consume point"
+        "self._backfill must not leak once a tracked match's apply durably "
+        "lands as LIVE — the pop must not be gated behind the non-live-only "
+        "_resolve_tracker consume point, and must not depend on is_backfill "
+        "re-evaluating True this same poll"
     )
 
 
@@ -1995,6 +2101,162 @@ def test_backfill_unpersistable_give_up_bounded_reemits_then_drops_then_refetche
         "fresh fetch_match_detail call — not an unbounded burst"
     )
     assert event_seqs(db, qualified("m1")) == [0]
+
+
+def test_backfill_apply_failure_after_fetch_success_retried_and_bounded_not_lost(tmp_path, caplog):
+    """Post-merge Codex review finding #2 [high]: a first-sight-finished
+    match whose ``fetch_match_detail`` SUCCEEDS but whose downstream
+    ``_apply`` raises (an exception ``_apply`` itself does not reconcile,
+    e.g. a writer failure downstream of ``seed_match`` durably writing the
+    ``matches`` row) must still be tracked in ``self._backfill`` and retried,
+    bounded by ``_BACKFILL_MAX_ATTEMPTS`` — not silently dropped forever with
+    a permanently-blocking stored row (no tracker), and not retried with no
+    cap. Simulated via a writer stub whose ``append_events`` raises
+    ``UnseededMatchError`` (one of the writer exceptions ``poll_once``
+    reconciles by logging + skipping) for the first ``_BACKFILL_MAX_ATTEMPTS``
+    calls, then succeeds — modeling a transient downstream outage that
+    eventually clears, so the bounded give-up's own apply can durably land
+    and the full chain (register failure → reach cap → emit give-up → durable
+    apply → pop tracker, loudly) is exercised end to end."""
+    from gamecollect.db.writer import UnseededMatchError
+    from gamecollect.engine import _BACKFILL_MAX_ATTEMPTS, CollectorEngine
+
+    db = tmp_path / "engine.db"
+    board = nm("m1", (), status=MatchStatus.FINISHED, score_home=1, score_away=0)
+    detail = nm(
+        "m1",
+        (ev(0, "goal", minute=10, team="Canada", player="Jonathan David"),),
+        status=MatchStatus.FINISHED,
+        score_home=1,
+        score_away=0,
+    )
+    polls = [([board], {"m1": detail}) for _ in range(_BACKFILL_MAX_ATTEMPTS)]
+    polls.append(([board], {"m1": detail}))  # one extra poll after the cap is reached
+    provider = ScriptedDetailProvider(polls)
+    engine = CollectorEngine(make_pack(provider), str(db), SOURCE, 0.01, provider=provider)
+
+    real_append_events = engine._writer.append_events
+    call_count = {"n": 0}
+
+    def _flaky_append(match_id, rows):
+        call_count["n"] += 1
+        if call_count["n"] <= _BACKFILL_MAX_ATTEMPTS:
+            raise UnseededMatchError("simulated downstream append_events failure")
+        return real_append_events(match_id, rows)
+
+    engine._writer.append_events = _flaky_append
+
+    with caplog.at_level(logging.ERROR, logger="gamecollect.engine"):
+        try:
+            for _ in range(_BACKFILL_MAX_ATTEMPTS):
+                engine.poll_once()
+            calls_at_cap = list(provider.detail_calls)
+            assert len(calls_at_cap) == _BACKFILL_MAX_ATTEMPTS, (
+                "every fetch succeeds, but the downstream append_events "
+                "failure must still count as a backfill attempt — otherwise "
+                "the cap is bypassed and the match retries unboundedly"
+            )
+            assert "m1" in engine._backfill, (
+                "the tracker must still exist, bounded at the cap — not "
+                "silently dropped with no retry path (seed_match already "
+                "durably wrote the matches row, which would otherwise "
+                "permanently block re-detection via has_stored_row)"
+            )
+            assert engine._stored_rows_for_provider("m1") != [], (
+                "seed_match durably writes the matches row before "
+                "append_events raises (seed-before-child-write) — finding "
+                "#2's partial durable write"
+            )
+            assert event_seqs(db, qualified("m1")) == [], (
+                "append_events never succeeded yet, so no events are stored"
+            )
+            # One more poll: the pre-fetch at-cap short-circuit fires (no
+            # further fetch_match_detail), re-emitting the give-up snapshot;
+            # this time append_events succeeds (the simulated outage cleared)
+            # so the give-up durably lands.
+            engine.poll_once()
+        finally:
+            engine.close()
+
+    assert provider.detail_calls == calls_at_cap, (
+        "once at cap, the pre-fetch give-up short-circuit must fire instead "
+        "of calling fetch_match_detail again — has_stored_row is now True, "
+        "but the tracker keeps is_backfill alive via pending_backfill_retry, "
+        "so the retry is bounded rather than either unbounded or foreclosed"
+    )
+    assert "m1" not in engine._backfill, (
+        "once the give-up write durably lands, the tracker must be popped — not leaked forever"
+    )
+    assert event_seqs(db, qualified("m1")) == [0], (
+        "the give-up snapshot accrues the fetched event from every failed "
+        "attempt's fallback, so once its apply lands the event is not lost"
+    )
+    assert any("giving up on backfill" in r.message for r in caplog.records), (
+        "the bounded give-up must be logged loudly, not silently dropped"
+    )
+
+
+def test_backfill_seed_match_returns_none_after_fetch_success_retried_and_bounded(tmp_path, caplog):
+    """Post-merge Codex review finding #3 [high]: a first-sight-finished
+    match whose ``fetch_match_detail`` SUCCEEDS but whose ``seed_match`` hook
+    returns ``None`` (missing identity) must be tracked and retried, bounded
+    by ``_BACKFILL_MAX_ATTEMPTS`` — not refetched unboundedly (before the
+    fix, no durable row is written so ``_first_sight_finished`` keeps
+    re-firing forever with nothing counting against the cap)."""
+    from gamecollect.engine import _BACKFILL_MAX_ATTEMPTS, CollectorEngine
+
+    db = tmp_path / "engine.db"
+    identityless_board = nm(
+        "m1",
+        (),
+        status=MatchStatus.FINISHED,
+        home_team=None,
+        away_team=None,
+        kickoff_utc=None,
+        score_home=1,
+        score_away=0,
+    )
+    identityless_detail = nm(
+        "m1",
+        (ev(0, "goal", minute=5),),
+        status=MatchStatus.FINISHED,
+        home_team=None,
+        away_team=None,
+        kickoff_utc=None,
+        score_home=1,
+        score_away=0,
+    )
+    polls = [
+        ([identityless_board], {"m1": identityless_detail}) for _ in range(_BACKFILL_MAX_ATTEMPTS)
+    ]
+    polls.append(([identityless_board], {"m1": identityless_detail}))
+    provider = ScriptedDetailProvider(polls)
+    engine = CollectorEngine(make_pack(provider), str(db), SOURCE, 0.01, provider=provider)
+
+    with caplog.at_level(logging.DEBUG, logger="gamecollect.engine"):
+        try:
+            for _ in range(_BACKFILL_MAX_ATTEMPTS):
+                engine.poll_once()
+            calls_at_cap = list(provider.detail_calls)
+            assert len(calls_at_cap) == _BACKFILL_MAX_ATTEMPTS, (
+                "every fetch succeeds but seed_match returns None every time "
+                "(missing identity) — each such failure must count as a "
+                "backfill attempt so the cap is reached, not bypassed"
+            )
+            assert "m1" in engine._backfill, "the tracker must still exist, bounded at the cap"
+            assert engine._stored_rows_for_provider("m1") == [], (
+                "seed_match never seeds (identity always missing), so no "
+                "durable row is ever written"
+            )
+            engine.poll_once()
+        finally:
+            engine.close()
+
+    assert provider.detail_calls == calls_at_cap, (
+        "once at cap, the pre-fetch give-up short-circuit must fire instead "
+        "of refetching — no unbounded retry even though has_stored_row "
+        "stays False the whole time"
+    )
 
 
 def test_backfill_two_matches_same_poll_one_succeeds_one_fails_isolation(tmp_path):
