@@ -149,17 +149,39 @@ never previously seen live — is backfilled once: the engine calls
 `fetch_match_detail` for it and merges the result through the same
 `_event_to_row`/writer path as a live-observed match, so its events land under
 the identical `payload.scorer`/`payload.assist`/`payload.team` contract above,
-not a bare scoreboard-only snapshot. This is current-slate-bounded by
-construction, not by a new rate limiter: ESPN's default (no-`dates`)
-scoreboard response only ever holds the current slate (verified live against
-`fifa.world`), so a match that finished on a prior slate has already rolled
-off the board and is out of scope for this backfill. A failed detail fetch is
+not a bare scoreboard-only snapshot. Detection does NOT require the
+first-sight scoreboard's own event list to be empty: the provider ABC
+explicitly permits `fetch_live_matches` to return a partial (non-empty) event
+list on a scoreboard-only snapshot, so a genuinely first-sight `FINISHED`
+match whose bare board already carries some events still triggers the full
+detail fetch — treating a partial list as "nothing to do" would persist it
+directly and permanently foreclose hydration via the stored-row check.
+This is current-slate-bounded by construction (ESPN's default (no-`dates`)
+scoreboard response only ever holds the current slate, verified live against
+`fifa.world`, so a match that finished on a prior slate has already rolled
+off the board and is out of scope for this backfill) AND by an explicit
+per-poll fetch budget, `_BACKFILL_MAX_FETCHES_PER_POLL = 5`
+(`gamecollect.engine`): a cold start against a slate with many
+already-finished matches, or a provider outage where every fetch times out,
+must not serialize an unbounded burst of `fetch_match_detail` calls inside
+one poll. The budget is shared across BOTH backfill fetch paths in a poll —
+the on-slate loop and the vanished-match backfill pass (a tracked match that
+drops off the slate mid-retry) — as one pool; a candidate past the remaining
+budget is deferred (no fetch, no failure recorded) and retried on a
+subsequent poll once budget is available again. A failed detail fetch is
 retried on subsequent polls up to a pinned cap, `_BACKFILL_MAX_ATTEMPTS = 3`
 (`gamecollect.engine`); once exhausted, the collector gives up and persists
-the scoreboard-only snapshot (final score retained, no further retries for
-that match). The behavior defaults on and can be disabled with
-`collect --no-finished-backfill` (`backfill_finished_matches=False` on
-`CollectorEngine`).
+the scoreboard-only snapshot (final score retained). Give-up permanence is
+conditional, not absolute: an ORDINARY give-up whose snapshot durably lands
+is permanent (no further retries for that match — the stored row forecloses
+re-detection). If the give-up snapshot's OWN apply repeatedly fails to land
+durably (e.g. an unseedable identity), the tracker is instead dropped into a
+bounded, exponentially-spaced cooldown after `_MAX_GIVE_UP_EMISSIONS`
+re-emissions, and detection resumes once that cooldown lapses — bounding
+what would otherwise be a fetch/give-up hot loop, rather than looping
+forever or going permanently silent. The behavior defaults on and can be
+disabled with `collect --no-finished-backfill`
+(`backfill_finished_matches=False` on `CollectorEngine`).
 
 ## 7. Record/replay is a provider, not test scaffolding
 

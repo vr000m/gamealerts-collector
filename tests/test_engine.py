@@ -1265,7 +1265,12 @@ def test_stored_row_finished_match_restart_previous_none_does_not_refetch(tmp_pa
     in-memory baseline), must NOT trigger the new detection branch and must
     NOT re-fetch — the ``was_live == False`` ambiguity this refactor exists to
     resolve is exactly "no stored row at all" vs. "a stored row exists but is
-    non-live"."""
+    non-live". Disables backfill (``backfill_finished_matches=False``) to
+    isolate this from the SEPARATE, deliberate round-3 Codex review finding
+    #2 change: with backfill enabled, this exact terminal-plus-zero-events
+    on-slate row is now supposed to be seeded and re-fetched (see
+    ``test_restart_backfill_scan_seeds_and_hydrates_row_reappearing_non_live_on_slate``)
+    — that is a different invariant than the one this test protects."""
     from gamecollect.db.connection import connect
     from gamecollect.engine import CollectorEngine
 
@@ -1286,7 +1291,9 @@ def test_stored_row_finished_match_restart_previous_none_does_not_refetch(tmp_pa
     board = nm("m1", (), status=MatchStatus.FINISHED, score_home=2, score_away=0)
     provider = DetailProvider([board], {})
     pack = make_pack(provider, seed_match=default_seed_match)
-    engine = CollectorEngine(pack, str(db), SOURCE, 0.01, provider=provider)
+    engine = CollectorEngine(
+        pack, str(db), SOURCE, 0.01, provider=provider, backfill_finished_matches=False
+    )
     try:
         engine.poll_once()
     finally:
@@ -1751,6 +1758,139 @@ def test_backfill_pending_retry_survives_later_partial_nonempty_scoreboard(tmp_p
     )
 
 
+def test_backfill_tracked_match_survives_transient_scheduled_regression_then_resolves(tmp_path):
+    """Round-3 Codex review, finding #1 (the "eventually resolves" case): a
+    match with an ACTIVE ``self._backfill`` tracker (its first detail fetch
+    failed once, retry pending) whose board then regresses to
+    SCHEDULED/UNKNOWN for a poll — a transient provider status glitch the
+    ABC does not forbid — must NOT have ``pending_backfill_retry`` (and
+    therefore ``is_backfill``) flip False. Before the fix, requiring
+    ``_is_terminal(match.status)`` there made a SCHEDULED regression route
+    the match into the generic direct-persist skip branch: the raw SCHEDULED
+    snapshot would be baselined into ``self._last`` and
+    ``_resolve_backfill_tracker`` would silently pop the tracker on that
+    durable apply — permanently foreclosing re-detection via
+    ``_first_sight_finished``'s ``previous is None`` conjunct, even once the
+    match later turned FINISHED again. This test also exercises the second
+    half of the fix: a poll where the regressed board's detail fetch
+    SUCCEEDS but is ALSO still inconclusive (both SCHEDULED) must count as a
+    bounded non-terminal attempt (via ``_register_backfill_apply_failure``)
+    and must NOT durably persist anything — before that branch existed, the
+    unconditional ``hydrated.append(merged)`` fallthrough would have
+    persisted the non-terminal snapshot and popped the tracker the same way.
+    The match must still end up with its FULL event list once a later poll's
+    detail fetch actually resolves to FINISHED."""
+    from gamecollect.engine import CollectorEngine
+
+    db = tmp_path / "engine.db"
+    finished_board = nm("m1", (), status=MatchStatus.FINISHED, score_home=2, score_away=0)
+    scheduled_board = nm("m1", (), status=MatchStatus.SCHEDULED, score_home=2, score_away=0)
+    scheduled_detail = nm("m1", (), status=MatchStatus.SCHEDULED, score_home=2, score_away=0)
+    full_detail = nm(
+        "m1", (ev(0, "goal", minute=30),), status=MatchStatus.FINISHED, score_home=2, score_away=0
+    )
+    provider = ScriptedDetailProvider(
+        [
+            # Poll 1: genuine first-sight-finished detection, fetch fails ->
+            # tracker created, one failure recorded.
+            ([finished_board], {"m1": ProviderUnavailableError("summary 503")}),
+            # Poll 2: transient SCHEDULED regression on the board; the fetch
+            # SUCCEEDS but the detail is ALSO still SCHEDULED (the provider
+            # itself has not resolved this match yet).
+            ([scheduled_board], {"m1": scheduled_detail}),
+            # Poll 3: the provider finally resolves the match to FINISHED,
+            # with the full event list.
+            ([finished_board], {"m1": full_detail}),
+        ]
+    )
+    engine = CollectorEngine(make_pack(provider), str(db), SOURCE, 0.01, provider=provider)
+    try:
+        engine.poll_once()
+        assert "m1" in engine._backfill
+        assert engine._backfill["m1"].consecutive_failures == 1
+        assert engine._stored_rows_for_provider("m1") == [], (
+            "no stored row may exist after the first failed backfill attempt"
+        )
+
+        engine.poll_once()
+        assert "m1" in engine._backfill, (
+            "a transient SCHEDULED regression on an already-tracked match "
+            "must not drop the tracker or foreclose the retry"
+        )
+        assert engine._backfill["m1"].consecutive_failures == 2, (
+            "a fetch success that is ALSO still inconclusive must count as a "
+            "bounded attempt, mirroring the fetch-exception path"
+        )
+        assert engine._stored_rows_for_provider("m1") == [], (
+            "a still-inconclusive merged snapshot must never be durably "
+            "persisted (that would let _resolve_backfill_tracker pop the "
+            "tracker and permanently foreclose re-detection)"
+        )
+
+        engine.poll_once()
+    finally:
+        engine.close()
+
+    assert provider.detail_calls == ["m1", "m1", "m1"], (
+        "every poll while tracked must attempt the detail fetch"
+    )
+    assert event_seqs(db, qualified("m1")) == [0], (
+        "the match must eventually resolve with its full event list, not be silently abandoned"
+    )
+    state = reader.get_state(read_db(db), qualified("m1"))
+    assert state is not None and state["status"] == MatchStatus.FINISHED.value
+    assert "m1" not in engine._backfill, (
+        "the tracker must be popped once the final resolution durably applies"
+    )
+
+
+def test_backfill_stuck_scheduled_detail_bounded_gives_up_not_infinite_loop(tmp_path, caplog):
+    """Round-3 Codex review, finding #1 (the "genuinely stuck" case): a
+    tracked backfill match whose board AND successfully-fetched detail BOTH
+    stay SCHEDULED/UNKNOWN across consecutive polls — the provider itself
+    never resolves the match — must be bounded by ``_BACKFILL_MAX_ATTEMPTS``:
+    the engine gives up loudly and pops the tracker, rather than looping
+    forever (a successful-but-inconclusive fetch that never advanced any
+    counter would never reach the cap) or being silently dropped (the
+    pre-fix bug: is_backfill flipping False mid-retry loses the tracker with
+    no give-up ever emitted)."""
+    from gamecollect.engine import _BACKFILL_MAX_ATTEMPTS, CollectorEngine
+
+    db = tmp_path / "engine.db"
+    finished_board = nm("m1", (), status=MatchStatus.FINISHED, score_home=1, score_away=0)
+    scheduled_board = nm("m1", (), status=MatchStatus.SCHEDULED, score_home=1, score_away=0)
+    scheduled_detail = nm("m1", (), status=MatchStatus.SCHEDULED, score_home=1, score_away=0)
+    polls = [([finished_board], {"m1": ProviderUnavailableError("summary 503")})]
+    polls.extend(
+        ([scheduled_board], {"m1": scheduled_detail}) for _ in range(_BACKFILL_MAX_ATTEMPTS - 1)
+    )
+    provider = ScriptedDetailProvider(polls)
+    engine = CollectorEngine(make_pack(provider), str(db), SOURCE, 0.01, provider=provider)
+    try:
+        with caplog.at_level(logging.DEBUG, logger="gamecollect.engine"):
+            engine.poll_once()
+            assert "m1" in engine._backfill
+            assert engine._backfill["m1"].consecutive_failures == 1
+
+            for _ in range(_BACKFILL_MAX_ATTEMPTS - 2):
+                engine.poll_once()
+                assert "m1" in engine._backfill, "must stay tracked while under the cap"
+
+            engine.poll_once()  # this poll's inconclusive attempt reaches the cap
+    finally:
+        engine.close()
+
+    assert "m1" not in engine._backfill, (
+        "at cap the tracker must be popped via the give-up landing durably, not leaked forever"
+    )
+    assert any("giving up on backfill" in r.getMessage() for r in caplog.records), (
+        "the give-up must be logged loudly, not silently dropped"
+    )
+    assert provider.detail_calls.count("m1") == _BACKFILL_MAX_ATTEMPTS, (
+        "exactly one fetch per poll while tracked, none after give-up"
+    )
+
+
 def test_backfill_stored_row_absent_after_each_pre_give_up_failed_poll(tmp_path):
     """Direct assertion of the plan's central invariant, repeated after EVERY
     pre-give-up failed poll (not only the first): a row erroneously written
@@ -1863,11 +2003,22 @@ def test_backfill_fetch_fails_every_attempt_gives_up_persists_scoreboard_only(tm
     )
 
 
-def test_backfill_given_up_match_not_refetched_after_restart(tmp_path):
-    """A given-up first-sight-finished match, after a simulated collector
-    restart (a fresh engine instance over the same DB), must NOT be
-    re-fetched — its stored row makes the "no stored row" detection
-    condition permanently False."""
+def test_backfill_given_up_match_re_seeded_bounded_after_restart(tmp_path):
+    """Round-3 Codex review, finding #4 [medium], ACCEPTED KNOWN GAP (see
+    ``_seed_restart_backfill_trackers``'s docstring): the restart scan's
+    terminal-plus-zero-events heuristic cannot distinguish a genuinely
+    interrupted backfill from a match that already went through
+    ``_emit_backfill_give_up``'s bounded exhaustion path. A restart now DOES
+    re-seed a tracker for an already-given-up match and re-fetch its detail
+    once — unlike the PRE-fix behavior this test used to assert (no refetch
+    ever), which relied on ``_seed_restart_trackers``'s ON-SLATE-skip guard
+    that finding #2 deliberately narrowed (see that method's docstring).
+    Fully closing this gap needs a durable give-up marker — out of scope
+    here (Fix 4 is documentation-only, mitigated by finding #3's shared
+    per-poll budget bounding the retry, not a full close). This test proves
+    the residual cost is bounded and idempotent: exactly ONE re-fetch after
+    restart (not unbounded), and — since the provider has nothing new to
+    report — no change to the durably stored state."""
     from gamecollect.engine import _BACKFILL_MAX_ATTEMPTS, CollectorEngine
 
     db = tmp_path / "engine.db"
@@ -1885,9 +2036,10 @@ def test_backfill_given_up_match_not_refetched_after_restart(tmp_path):
     finally:
         engine.close()
 
-    restart_detail = nm(
-        "m1", (ev(0, "goal"),), status=MatchStatus.FINISHED, score_home=1, score_away=0
-    )
+    # Nothing new to report (the idempotent "genuinely scoreless" case this
+    # docstring names): the restart's bounded re-fetch must not durably
+    # change anything.
+    restart_detail = nm("m1", (), status=MatchStatus.FINISHED, score_home=1, score_away=0)
     restart_provider = DetailProvider([board], {"m1": restart_detail})
     restart_engine = CollectorEngine(
         make_pack(restart_provider), str(db), SOURCE, 0.01, provider=restart_provider
@@ -1897,8 +2049,21 @@ def test_backfill_given_up_match_not_refetched_after_restart(tmp_path):
     finally:
         restart_engine.close()
 
-    assert restart_provider.detail_calls == [], (
-        "a given-up match's stored row must make detection False across a restart"
+    assert restart_provider.detail_calls == ["m1"], (
+        "a given-up match's stored row no longer makes detection False across "
+        "a restart (finding #2 narrowed the seed guard to look at LIVE "
+        "sibling ids, not slate presence) — this is the accepted, bounded "
+        "cost of finding #4, exactly one re-fetch, not zero and not unbounded"
+    )
+    assert "m1" not in engine._backfill, (
+        "the re-fetch resolves immediately (idempotent no-op) and the "
+        "tracker must not be left behind"
+    )
+    state = reader.get_state(read_db(db), qualified("m1"))
+    assert state is not None and state["status"] == MatchStatus.FINISHED.value
+    assert event_seqs(db, qualified("m1")) == [], (
+        "with nothing new to report, the re-fetch must not change the "
+        "durably stored (still zero) event list"
     )
 
 
@@ -7038,12 +7203,19 @@ def test_restart_seeds_backfill_tracker_for_terminal_zero_event_row_and_hydrates
     assert "m1" not in engine._backfill, "the tracker must be popped once the apply durably lands"
 
 
-def test_restart_backfill_scan_skips_row_whose_id_is_on_slate_or_already_tracked(tmp_path):
-    """The restart backfill scan must reuse ``_seed_restart_trackers``'s two
-    guards verbatim: a terminal zero-event row whose provider id IS on the
-    current slate must not be seeded (it is being collected normally this
-    poll), and a row that already has a ``self._backfill`` entry must not be
-    re-seeded over it."""
+def test_restart_backfill_scan_seeds_and_hydrates_row_reappearing_non_live_on_slate(tmp_path):
+    """Round-3 Codex review, finding #2: unlike ``_seed_restart_trackers``'s
+    sibling guard (valid there because a live slate match is naturally
+    re-detected via ``was_live``), the backfill scan's guard must be NARROWER
+    — skip only when a mapped id is on the slate reporting LIVE right now,
+    not merely "on the slate at all". A terminal zero-event row whose
+    provider id reappears on the current slate STILL reporting the same
+    non-live (FINISHED) status must be seeded and hydrated this very same
+    poll, not skipped: with no tracker seeded, ``has_stored_row`` reads
+    ``True`` forever and ``pending_backfill_retry``'s first conjunct also
+    reads ``False`` (no tracker), so the row would fall into the generic
+    direct-persist skip branch and permanently lose its events — exactly
+    finding #1's bug, via the restart path."""
     from gamecollect.db.connection import connect
     from gamecollect.engine import CollectorEngine
 
@@ -7061,25 +7233,107 @@ def test_restart_backfill_scan_skips_row_whose_id_is_on_slate_or_already_tracked
     finally:
         conn.close()
 
-    # "m1" reappears on the slate this very poll, already FINISHED (not
-    # live): the scan must skip seeding it (it is on the slate).
+    # "m1" reappears on the slate this very poll, still FINISHED (not live):
+    # the narrowed guard must NOT skip seeding it.
     board = nm("m1", (), status=MatchStatus.FINISHED, score_home=1, score_away=0)
-    provider = ScriptedDetailProvider([([board], {})])
+    detail = nm(
+        "m1", (ev(0, "goal", minute=44),), status=MatchStatus.FINISHED, score_home=1, score_away=0
+    )
+    provider = ScriptedDetailProvider([([board], {"m1": detail})])
+    pack = make_pack(provider, seed_match=default_seed_match)
+    engine = CollectorEngine(pack, str(db), SOURCE, 0.01, provider=provider)
+    try:
+        engine.poll_once()
+    finally:
+        engine.close()
+
+    assert provider.detail_calls == ["m1"], (
+        "a terminal zero-event row reappearing non-live on the slate must be "
+        "seeded into self._backfill and detail-fetched this same poll"
+    )
+    assert event_seqs(db, "m1") == [0], "the previously-missing event must land once hydrated"
+    assert "m1" not in engine._backfill, "the tracker must be popped once the apply durably lands"
+
+
+def test_restart_backfill_scan_skips_row_whose_id_is_on_slate_live(tmp_path):
+    """Round-3 Codex review, finding #2 (guard-preservation case): the
+    narrowed guard must still skip seeding when a mapped provider id is on
+    the slate reporting a LIVE status right now — the genuine multi-provider
+    safety concern ``_resolve_stored_provider_id``'s docstring documents. A
+    sibling id that is actually live must not get wedged by seeding a
+    backfill tracker keyed to a different, stale, non-live id."""
+    from gamecollect.db.connection import connect
+    from gamecollect.engine import CollectorEngine
+
+    db = tmp_path / "engine.db"
+    conn = connect(str(db), side_table_ddl=FAKE_SIDE_TABLE_DDL)
+    try:
+        with conn:
+            _stored_row(
+                conn,
+                "m1",
+                status=MatchStatus.FINISHED,
+                score_home=1,
+                updated_at="2026-06-18T20:00:00Z",
+            )
+    finally:
+        conn.close()
+
+    # "m1" reappears on the slate this poll reporting LIVE (simulating the
+    # genuine multi-provider live-sibling case): the guard must still skip it.
+    live = nm("m1", (), status=MatchStatus.IN_PLAY, minute=5, score_home=1, score_away=0)
+    provider = ScriptedDetailProvider([([live], {"m1": live})])
     pack = make_pack(provider, seed_match=default_seed_match)
     engine = CollectorEngine(pack, str(db), SOURCE, 0.01, provider=provider)
     try:
         engine.poll_once()
         assert "m1" not in engine._backfill, (
-            "a stored row whose provider id is on the current slate must not "
-            "be seeded into self._backfill by the restart scan"
+            "a stored row whose provider id is on the slate reporting LIVE "
+            "must not be seeded into self._backfill by the restart scan"
         )
     finally:
         engine.close()
 
-    assert provider.detail_calls == [], (
-        "no detail fetch should happen for a match neither seeded nor "
-        "otherwise flagged is_backfill this poll"
-    )
+
+def test_restart_backfill_scan_skips_row_already_tracked(tmp_path):
+    """The restart backfill scan's second guard (unaffected by finding #2's
+    narrowing): a row that already has a ``self._backfill`` entry must not
+    be re-seeded over it."""
+    from gamecollect.db.connection import connect
+    from gamecollect.engine import CollectorEngine, _TransitionTracker
+
+    db = tmp_path / "engine.db"
+    conn = connect(str(db), side_table_ddl=FAKE_SIDE_TABLE_DDL)
+    try:
+        with conn:
+            _stored_row(
+                conn,
+                "m1",
+                status=MatchStatus.FINISHED,
+                score_home=1,
+                updated_at="2026-06-18T20:00:00Z",
+            )
+    finally:
+        conn.close()
+
+    provider = ScriptedDetailProvider([([], {})])
+    pack = make_pack(provider, seed_match=default_seed_match)
+    engine = CollectorEngine(pack, str(db), SOURCE, 0.01, provider=provider)
+    preexisting = _TransitionTracker(consecutive_failures=1)
+    engine._backfill["m1"] = preexisting
+    try:
+        # Exercise the seed scan in isolation (not via poll_once): "m1" is
+        # already tracked and off-slate, so a full poll would also route it
+        # through the vanished-match backfill pass and resolve/pop it —
+        # unrelated to what this guard protects. The guard itself is a
+        # one-shot scan method whose own behavior is what is under test.
+        engine._seed_restart_backfill_trackers(set())
+        assert engine._backfill["m1"] is preexisting, (
+            "an already-tracked match must not be re-seeded (would reset its "
+            "accrued failure count) by the restart scan"
+        )
+    finally:
+        engine.close()
 
 
 def test_backfill_give_up_exhaustion_enters_cooldown_then_resumes_detection(tmp_path, caplog):
@@ -7294,6 +7548,69 @@ def test_backfill_per_poll_fetch_budget_bounds_burst_and_defers_rest(tmp_path):
 
     assert provider.detail_calls == match_ids, (
         "the deferred matches must be fetched on the very next poll, completing the full set"
+    )
+    for mid in match_ids:
+        assert event_seqs(db, qualified(mid)) == [0], f"{mid}'s event must eventually land"
+
+
+def test_vanished_backfill_pass_shares_per_poll_budget_and_defers_rest(tmp_path):
+    """Round-3 Codex review, finding #3: ``_hydrate_vanished_backfill_matches``
+    must share THIS poll's REMAINING ``_BACKFILL_MAX_FETCHES_PER_POLL``
+    budget with the on-slate loop, not fetch unboundedly. Before the fix, a
+    restart that seeded MANY backfill trackers for historical incomplete
+    rows (finding #2's widened seeding, no longer gated on slate presence)
+    would let this second, previously-unbounded pass fetch all of them in a
+    single poll — reintroducing exactly the unbounded-burst problem the
+    per-poll budget exists to prevent, just via this second path. All
+    candidates here are off-slate (empty scoreboard every poll) so the
+    on-slate loop consumes none of the budget itself, isolating this pass's
+    own deferral behavior."""
+    from gamecollect.engine import (
+        _BACKFILL_MAX_FETCHES_PER_POLL,
+        CollectorEngine,
+        _TransitionTracker,
+    )
+
+    db = tmp_path / "engine.db"
+    n = _BACKFILL_MAX_FETCHES_PER_POLL + 2
+    match_ids = [f"m{i}" for i in range(1, n + 1)]
+    details = {
+        mid: nm(
+            mid,
+            (ev(0, "goal", minute=5),),
+            status=MatchStatus.FINISHED,
+            score_home=i,
+            score_away=0,
+        )
+        for i, mid in enumerate(match_ids, start=1)
+    }
+    # Empty slate every poll: every candidate is off-slate, reachable only
+    # via the vanished-match backfill pass, not the on-slate loop.
+    provider = ScriptedDetailProvider([([], details), ([], details)])
+    engine = CollectorEngine(make_pack(provider), str(db), SOURCE, 0.01, provider=provider)
+    engine._restart_scan_done = True
+    for mid in match_ids:
+        engine._backfill[mid] = _TransitionTracker()
+    deferred = match_ids[_BACKFILL_MAX_FETCHES_PER_POLL:]
+    try:
+        engine.poll_once()
+        assert provider.detail_calls == match_ids[:_BACKFILL_MAX_FETCHES_PER_POLL], (
+            f"only the remaining per-poll budget of fetches may happen via "
+            f"the vanished-match backfill pass this poll, got {provider.detail_calls}"
+        )
+        for mid in deferred:
+            assert mid in engine._backfill, (
+                f"a deferred vanished backfill match must stay tracked: {mid}"
+            )
+            assert engine._backfill[mid].consecutive_failures == 0, (
+                "a deferral is not a failure — the tracker must be untouched"
+            )
+        engine.poll_once()
+    finally:
+        engine.close()
+
+    assert provider.detail_calls == match_ids, (
+        "the deferred matches must be fetched on a subsequent poll, completing the full set"
     )
     for mid in match_ids:
         assert event_seqs(db, qualified(mid)) == [0], f"{mid}'s event must eventually land"
