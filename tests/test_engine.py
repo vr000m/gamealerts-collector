@@ -2035,19 +2035,24 @@ def test_backfill_give_up_short_circuits_refetch_while_apply_not_durable_then_la
     assert state["score_home"] == 2
 
 
-def test_backfill_unpersistable_give_up_bounded_reemits_then_drops_then_refetches_once(
+def test_backfill_unpersistable_give_up_bounded_reemits_then_cools_then_refetches_once(
     tmp_path, caplog
 ):
-    """Emission-cap test: a backfill give-up whose write is repeatedly
-    REJECTED (missing identity, ``seed_match`` returns ``None`` every poll —
-    never durably lands) must be re-emitted by the at-cap short-circuit only
-    up to ``_MAX_GIVE_UP_EMISSIONS`` times, then ``self._backfill`` is
-    dropped rather than re-emitted forever. Since no stored row was ever
-    written and no cooldown exists, ``is_backfill`` legitimately re-fires on
-    the NEXT poll after the drop — this must produce exactly ONE fresh
-    ``fetch_match_detail`` call, not an unbounded burst."""
+    """Emission-cap test, updated for post-merge Codex review round 2 finding
+    #2: a backfill give-up whose write is repeatedly REJECTED (missing
+    identity, ``seed_match`` returns ``None`` every poll — never durably
+    lands) must be re-emitted by the at-cap short-circuit only up to
+    ``_MAX_GIVE_UP_EMISSIONS`` times, then ``self._backfill`` is dropped
+    rather than re-emitted forever. Unlike the pre-fix behavior, the drop now
+    ALSO enters an abandonment cooldown (mirroring ``_abandon``): since no
+    stored row was ever written, ``_first_sight_finished`` would otherwise
+    re-fire from scratch on the very next poll — the exact fetch/give-up
+    hot-loop finding #2 closes. No ``fetch_match_detail`` call may happen
+    while cooling; detection resumes, with exactly ONE fresh fetch, only
+    once the cooldown gate lapses."""
     from gamecollect.engine import (
         _BACKFILL_MAX_ATTEMPTS,
+        _COOLDOWN_BASE_POLLS,
         _MAX_GIVE_UP_EMISSIONS,
         CollectorEngine,
         _TransitionTracker,
@@ -2067,11 +2072,19 @@ def test_backfill_unpersistable_give_up_bounded_reemits_then_drops_then_refetche
     # Enough polls to exceed the emission cap (each poll re-emits an
     # unpersistable give-up via the short-circuit; no detail fetch happens).
     reemission_polls = [([identityless_board], {}) for _ in range(_MAX_GIVE_UP_EMISSIONS + 1)]
+    # Once the cap is exceeded the tracker is dropped and a cooldown entered
+    # (epoch 1: ``_COOLDOWN_BASE_POLLS`` polls). Keep the board identity-less
+    # throughout the cooldown so a stray durable write can never sneak in and
+    # confound the "no stored row yet" assumption; on the LAST of these polls
+    # the cooldown gate lapses (``_age_cooldowns`` decrements before the
+    # gating read, so the poll that brings ``remaining`` to 0 already sees
+    # ``not cooling`` this same poll) — resuming detection immediately.
+    cooling_polls = [([identityless_board], {}) for _ in range(_COOLDOWN_BASE_POLLS - 1)]
     real_board = nm("m1", (), status=MatchStatus.FINISHED, score_home=1, score_away=0)
     fresh_detail = nm(
         "m1", (ev(0, "goal", minute=5),), status=MatchStatus.FINISHED, score_home=1, score_away=0
     )
-    polls = reemission_polls + [([real_board], {"m1": fresh_detail})]
+    polls = reemission_polls + cooling_polls + [([real_board], {"m1": fresh_detail})]
     provider = ScriptedDetailProvider(polls)
     engine = CollectorEngine(make_pack(provider), str(db), SOURCE, 0.01, provider=provider)
     engine._restart_scan_done = True
@@ -2087,18 +2100,27 @@ def test_backfill_unpersistable_give_up_bounded_reemits_then_drops_then_refetche
             "an unpersistable backfill give-up must be dropped once its "
             "re-emission count exceeds the emission cap, not re-emitted forever"
         )
+        assert "m1" in engine._cooldowns, (
+            "the drop must enter an abandonment cooldown (finding #2) so "
+            "detection cannot hot-loop every poll off the just-dropped tracker"
+        )
         assert provider.detail_calls == [], (
             "the pre-fetch at-cap short-circuit must prevent any detail "
             "fetch while the give-up is being re-emitted"
+        )
+        for _ in range(_COOLDOWN_BASE_POLLS - 1):
+            engine.poll_once()
+        assert provider.detail_calls == [], (
+            "while cooling, no fetch_match_detail call may happen even "
+            "though the match still has no stored row"
         )
         engine.poll_once()
     finally:
         engine.close()
 
     assert provider.detail_calls == ["m1"], (
-        "after the emission-cap drop, the match has no stored row, so the "
-        "next poll re-detects it as first-sight and issues exactly ONE "
-        "fresh fetch_match_detail call — not an unbounded burst"
+        "once the cooldown gate lapses, detection resumes and issues "
+        "exactly ONE fresh fetch_match_detail call — not an unbounded burst"
     )
     assert event_seqs(db, qualified("m1")) == [0]
 
@@ -6960,6 +6982,321 @@ def test_stored_events_round_trips_non_goal_player_key(tmp_path, event_type):
     assert event.team == "Canada"
     assert event.player == "Booked Player"
     assert event.assist == "Second Player"
+
+
+# --------------------------------------------------------------------------- #
+# Post-merge Codex review round 2: backfill-tracker/transitions-mechanism
+# reuse findings #1-#4
+# --------------------------------------------------------------------------- #
+
+
+def test_restart_seeds_backfill_tracker_for_terminal_zero_event_row_and_hydrates(tmp_path):
+    """Finding #1 [high]: a stored ``matches`` row that is TERMINAL but has
+    ZERO stored ``events`` (its backfill retry was tracked only in the
+    process-local ``self._backfill`` dict and lost across a restart) must be
+    seeded into ``self._backfill`` by the one-time restart scan
+    (:meth:`_seed_restart_backfill_trackers`) and hydrated by the new
+    vanished-match backfill pass (:meth:`_hydrate_vanished_backfill_matches`)
+    on the very first post-restart poll — not left permanently stuck with a
+    partial/missing event list, invisible to every hydration path (before the
+    fix: ``has_stored_row`` reads ``True`` forever with no tracker to keep
+    ``is_backfill`` alive)."""
+    from gamecollect.db.connection import connect
+    from gamecollect.engine import CollectorEngine
+
+    db = tmp_path / "engine.db"
+    conn = connect(str(db), side_table_ddl=FAKE_SIDE_TABLE_DDL)
+    try:
+        with conn:
+            _stored_row(
+                conn,
+                "m1",
+                status=MatchStatus.FINISHED,
+                score_home=1,
+                updated_at="2026-06-18T20:00:00Z",
+            )
+    finally:
+        conn.close()
+
+    detail = nm(
+        "m1", (ev(0, "goal", minute=44),), status=MatchStatus.FINISHED, score_home=1, score_away=0
+    )
+    provider = ScriptedDetailProvider([([], {"m1": detail})])
+    pack = make_pack(provider, seed_match=default_seed_match)
+    engine = CollectorEngine(pack, str(db), SOURCE, 0.01, provider=provider)
+    try:
+        engine.poll_once()
+    finally:
+        engine.close()
+
+    assert provider.detail_calls == ["m1"], (
+        "the restart scan must seed a backfill tracker for the zero-event "
+        "terminal row, and the vanished-match backfill pass must hydrate it "
+        "the very same poll"
+    )
+    assert event_seqs(db, "m1") == [0], "the previously-missing event must land once hydrated"
+    assert "m1" not in engine._backfill, "the tracker must be popped once the apply durably lands"
+
+
+def test_restart_backfill_scan_skips_row_whose_id_is_on_slate_or_already_tracked(tmp_path):
+    """The restart backfill scan must reuse ``_seed_restart_trackers``'s two
+    guards verbatim: a terminal zero-event row whose provider id IS on the
+    current slate must not be seeded (it is being collected normally this
+    poll), and a row that already has a ``self._backfill`` entry must not be
+    re-seeded over it."""
+    from gamecollect.db.connection import connect
+    from gamecollect.engine import CollectorEngine
+
+    db = tmp_path / "engine.db"
+    conn = connect(str(db), side_table_ddl=FAKE_SIDE_TABLE_DDL)
+    try:
+        with conn:
+            _stored_row(
+                conn,
+                "m1",
+                status=MatchStatus.FINISHED,
+                score_home=1,
+                updated_at="2026-06-18T20:00:00Z",
+            )
+    finally:
+        conn.close()
+
+    # "m1" reappears on the slate this very poll, already FINISHED (not
+    # live): the scan must skip seeding it (it is on the slate).
+    board = nm("m1", (), status=MatchStatus.FINISHED, score_home=1, score_away=0)
+    provider = ScriptedDetailProvider([([board], {})])
+    pack = make_pack(provider, seed_match=default_seed_match)
+    engine = CollectorEngine(pack, str(db), SOURCE, 0.01, provider=provider)
+    try:
+        engine.poll_once()
+        assert "m1" not in engine._backfill, (
+            "a stored row whose provider id is on the current slate must not "
+            "be seeded into self._backfill by the restart scan"
+        )
+    finally:
+        engine.close()
+
+    assert provider.detail_calls == [], (
+        "no detail fetch should happen for a match neither seeded nor "
+        "otherwise flagged is_backfill this poll"
+    )
+
+
+def test_backfill_give_up_exhaustion_enters_cooldown_then_resumes_detection(tmp_path, caplog):
+    """Finding #2 [high]: once a backfill give-up's OWN apply fails to land
+    durably ``_MAX_GIVE_UP_EMISSIONS`` times, the tracker is popped AND a
+    cooldown is entered (mirroring ``_abandon``) — closing the hot loop where
+    ``has_stored_row`` never becomes ``True`` (the write never lands) so
+    ``_first_sight_finished`` would otherwise re-fire from scratch on the
+    very next poll. No ``fetch_match_detail`` call may happen while cooling;
+    detection resumes, with the fetch actually firing, once the cooldown
+    gate lapses."""
+    from gamecollect.engine import (
+        _BACKFILL_MAX_ATTEMPTS,
+        _COOLDOWN_BASE_POLLS,
+        _MAX_GIVE_UP_EMISSIONS,
+        CollectorEngine,
+        _TransitionTracker,
+    )
+
+    db = tmp_path / "engine.db"
+    identityless_board = nm(
+        "m1",
+        (),
+        status=MatchStatus.FINISHED,
+        home_team=None,
+        away_team=None,
+        kickoff_utc=None,
+        score_home=1,
+        score_away=0,
+    )
+    reemission_polls = [([identityless_board], {}) for _ in range(_MAX_GIVE_UP_EMISSIONS + 1)]
+    cooling_polls = [([identityless_board], {}) for _ in range(_COOLDOWN_BASE_POLLS - 1)]
+    real_board = nm("m1", (), status=MatchStatus.FINISHED, score_home=1, score_away=0)
+    fresh_detail = nm(
+        "m1", (ev(0, "goal", minute=5),), status=MatchStatus.FINISHED, score_home=1, score_away=0
+    )
+    polls = reemission_polls + cooling_polls + [([real_board], {"m1": fresh_detail})]
+    provider = ScriptedDetailProvider(polls)
+    engine = CollectorEngine(make_pack(provider), str(db), SOURCE, 0.01, provider=provider)
+    engine._restart_scan_done = True
+    engine._backfill["m1"] = _TransitionTracker(
+        fallback=identityless_board,
+        consecutive_failures=_BACKFILL_MAX_ATTEMPTS,
+    )
+    try:
+        with caplog.at_level(logging.DEBUG, logger="gamecollect.engine"):
+            for _ in range(_MAX_GIVE_UP_EMISSIONS + 1):
+                engine.poll_once()
+        assert "m1" not in engine._backfill
+        assert "m1" in engine._cooldowns, (
+            "the exhausted give-up must enter a cooldown, not leave the "
+            "match free to re-fire from scratch next poll"
+        )
+        for _ in range(_COOLDOWN_BASE_POLLS - 1):
+            engine.poll_once()
+        assert provider.detail_calls == [], (
+            "no fetch_match_detail call may happen while the cooldown is "
+            "still active, even though the match has no stored row"
+        )
+        engine.poll_once()
+    finally:
+        engine.close()
+
+    assert provider.detail_calls == ["m1"], (
+        "once the cooldown gate lapses, detection resumes and issues a "
+        "fresh fetch_match_detail call"
+    )
+    assert event_seqs(db, qualified("m1")) == [0]
+    assert any(
+        "abandoning backfill tracker and entering a cooldown" in r.message for r in caplog.records
+    ), "the bounded exhaustion must be logged loudly"
+
+
+def test_vanished_backfill_match_is_retried_and_given_up_via_vanished_hydration(tmp_path):
+    """Finding #3 [medium]: a first-sight-finished match with an ACTIVE
+    ``self._backfill`` tracker (its detail fetch already failed once, retry
+    pending) that then drops OFF the slate before its next poll must be
+    picked up by ``_hydrate_vanished_backfill_matches`` — retried while
+    still under the ``_BACKFILL_MAX_ATTEMPTS`` cap, then given up on (and its
+    tracker popped, not leaked) once the cap is reached — rather than
+    leaking its tracker in memory forever with events never hydrated."""
+    from gamecollect.engine import _BACKFILL_MAX_ATTEMPTS, CollectorEngine
+
+    db = tmp_path / "engine.db"
+    board = nm("m1", (), status=MatchStatus.FINISHED, score_home=2, score_away=0)
+    polls = [
+        ([board], {"m1": ProviderUnavailableError("summary 503 #1 (on-slate)")}),
+        # "m1" vanishes from the slate for the remaining polls: only the
+        # vanished-match backfill pass can see it now.
+        *[
+            ([], {"m1": ProviderUnavailableError(f"summary 503 #{i} (vanished)")})
+            for i in range(2, _BACKFILL_MAX_ATTEMPTS + 1)
+        ],
+    ]
+    provider = ScriptedDetailProvider(polls)
+    engine = CollectorEngine(make_pack(provider), str(db), SOURCE, 0.01, provider=provider)
+    try:
+        # Poll 1: on-slate first-sight-finished fetch fails; tracker created.
+        engine.poll_once()
+        assert "m1" in engine._backfill
+        assert engine._backfill["m1"].consecutive_failures == 1
+
+        # Polls 2..cap-1: vanished, retried by the new pass, still under cap.
+        for expected_failures in range(2, _BACKFILL_MAX_ATTEMPTS):
+            engine.poll_once()
+            assert "m1" in engine._backfill, (
+                "a vanished backfill match must stay tracked and retried, "
+                "not leaked with no further attempts"
+            )
+            assert engine._backfill["m1"].consecutive_failures == expected_failures
+
+        # Final poll: the cap is reached while still vanished — the give-up
+        # must fire via the SAME backfill give-up shape/helpers, persisting
+        # the best-known (board-only) state and popping the tracker.
+        engine.poll_once()
+    finally:
+        engine.close()
+
+    assert "m1" not in engine._backfill, (
+        "once given up on, the tracker must be popped, not leaked forever"
+    )
+    state = reader.get_state(read_db(db), qualified("m1"))
+    assert state is not None and state["status"] == MatchStatus.FINISHED.value
+    assert state["score_home"] == 2 and state["score_away"] == 0
+    assert event_seqs(db, qualified("m1")) == [], (
+        "the give-up persists the best-known board-only snapshot: zero events"
+    )
+
+
+def test_vanished_backfill_match_never_touches_transitions_tracker(tmp_path):
+    """Guards the ``is_backfill``/``in_transition`` mutual-exclusivity
+    invariant this file repeatedly documents: the new vanished-match
+    backfill pass must never create or touch a ``self._transitions`` entry,
+    even while retrying a vanished backfill match."""
+    from gamecollect.engine import CollectorEngine
+
+    db = tmp_path / "engine.db"
+    board = nm("m1", (), status=MatchStatus.FINISHED, score_home=1, score_away=0)
+    detail = nm(
+        "m1", (ev(0, "goal", minute=10),), status=MatchStatus.FINISHED, score_home=1, score_away=0
+    )
+    provider = ScriptedDetailProvider(
+        [
+            ([board], {"m1": ProviderUnavailableError("summary 503")}),
+            ([], {"m1": detail}),
+        ]
+    )
+    engine = CollectorEngine(make_pack(provider), str(db), SOURCE, 0.01, provider=provider)
+    try:
+        engine.poll_once()
+        assert "m1" in engine._backfill
+        assert engine._transitions == {}
+        engine.poll_once()
+        assert engine._transitions == {}, (
+            "the vanished-match backfill pass must never populate self._transitions"
+        )
+    finally:
+        engine.close()
+
+    assert event_seqs(db, qualified("m1")) == [0]
+
+
+def test_backfill_per_poll_fetch_budget_bounds_burst_and_defers_rest(tmp_path):
+    """Finding #4 [medium]: a poll with more ``is_backfill``-eligible matches
+    than ``_BACKFILL_MAX_FETCHES_PER_POLL`` must only fetch up to the cap
+    this poll. The rest are DEFERRED — no fetch, and critically no durable
+    write of their bare scoreboard snapshot either (that would reintroduce
+    the finding-#1-class permanent-block bug) — and are fetched on a
+    subsequent poll instead."""
+    from gamecollect.engine import _BACKFILL_MAX_FETCHES_PER_POLL, CollectorEngine
+
+    db = tmp_path / "engine.db"
+    n = _BACKFILL_MAX_FETCHES_PER_POLL + 2
+    match_ids = [f"m{i}" for i in range(1, n + 1)]
+    boards = [
+        nm(mid, (), status=MatchStatus.FINISHED, score_home=i, score_away=0)
+        for i, mid in enumerate(match_ids, start=1)
+    ]
+    details = {
+        mid: nm(
+            mid,
+            (ev(0, "goal", minute=5),),
+            status=MatchStatus.FINISHED,
+            score_home=i,
+            score_away=0,
+        )
+        for i, mid in enumerate(match_ids, start=1)
+    }
+    provider = ScriptedDetailProvider([(boards, details), (boards, details)])
+    engine = CollectorEngine(make_pack(provider), str(db), SOURCE, 0.01, provider=provider)
+    deferred = match_ids[_BACKFILL_MAX_FETCHES_PER_POLL:]
+    try:
+        engine.poll_once()
+        assert provider.detail_calls == match_ids[:_BACKFILL_MAX_FETCHES_PER_POLL], (
+            f"exactly {_BACKFILL_MAX_FETCHES_PER_POLL} fetches must happen this "
+            f"poll, in slate order, got {provider.detail_calls}"
+        )
+        for mid in deferred:
+            assert engine._stored_rows_for_provider(mid) == [], (
+                f"a deferred match's bare scoreboard snapshot must NOT be durably persisted: {mid}"
+            )
+            assert mid in engine._backfill, (
+                f"a deferred first-sight match must get a fresh pending-retry "
+                f"tracker so it is retried next poll: {mid}"
+            )
+            assert engine._backfill[mid].consecutive_failures == 0, (
+                "a deferral is not a failure — the fresh tracker must start at zero"
+            )
+        engine.poll_once()
+    finally:
+        engine.close()
+
+    assert provider.detail_calls == match_ids, (
+        "the deferred matches must be fetched on the very next poll, completing the full set"
+    )
+    for mid in match_ids:
+        assert event_seqs(db, qualified(mid)) == [0], f"{mid}'s event must eventually land"
 
 
 def test_client_goal_family_matches_engine():
