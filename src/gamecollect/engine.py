@@ -1312,14 +1312,38 @@ class CollectorEngine:
                 and match.status not in LIVE_STATUSES
                 and not was_live
             )
+            first_sight = _first_sight_finished(
+                previous=previous,
+                status=match.status,
+                was_live=was_live,
+                has_stored_row=has_stored_row,
+            )
+            # Round-4 fix: an unpersistable backfill give-up drops its
+            # tracker AND enters a cooldown (:meth:`_emit_backfill_give_up`),
+            # so on the very next poll ``pending_backfill_retry`` reads False
+            # (tracker gone) and the ``first_sight``-driven half of
+            # ``is_backfill`` below is ALSO gated off by the
+            # ``not self._cooling_down`` conjunct — leaving ``is_backfill``
+            # False while still cooling. Without this early defer, that
+            # combination fell through to the ordinary skip-branch below,
+            # which raw-persists a bare scoreboard snapshot (no detail
+            # fetch): if identity has since become resolvable, ``seed_match``
+            # can succeed, durably seeding a permanent zero-event row that
+            # forecloses backfill forever. Placed before the skip-branch,
+            # the fetch-budget/in_transition-at-cap checks, and the ordinary
+            # fetch/try path so this poll is a pure no-op for the match — no
+            # fetch, no persist, no tracker touched — deferred exactly like
+            # the per-poll fetch-budget-exhaustion deferral below.
+            backfill_cooling_deferred = (
+                self._backfill_finished_matches
+                and first_sight
+                and self._cooling_down(match.match_id)
+            )
+            if backfill_cooling_deferred:
+                continue
             is_backfill = self._backfill_finished_matches and (
                 (
-                    _first_sight_finished(
-                        previous=previous,
-                        status=match.status,
-                        was_live=was_live,
-                        has_stored_row=has_stored_row,
-                    )
+                    first_sight
                     # Caller-side gate (post-merge Codex review round 2,
                     # finding #2), NOT folded into the pure predicate — its
                     # own docstring already says it "deliberately excludes
@@ -1537,7 +1561,13 @@ class CollectorEngine:
                 # counts toward the retry cap, exactly like a fetch exception
                 # does (:meth:`_register_backfill_apply_failure` is shared
                 # with that path).
-                backfill_tracker = self._register_backfill_apply_failure(match)
+                #
+                # Round-4 fix: accrue ``merged`` (scoreboard+detail), not the
+                # bare ``match`` — a successful-but-inconclusive detail fetch
+                # supplies richer data than the scoreboard alone, and passing
+                # ``match`` here silently discarded it from the tracker's
+                # fallback.
+                backfill_tracker = self._register_backfill_apply_failure(merged)
                 if _backfill_tracker_at_cap(backfill_tracker):
                     self._emit_backfill_give_up(
                         hydrated, match.match_id, backfill_tracker, fresh=merged
@@ -1794,6 +1824,22 @@ class CollectorEngine:
             self._backfill_apply_pending.add(match_id)
             base = tracker.fallback
             merged = _merge_over_base(base, detail) if base is not None else detail
+            if merged.status not in LIVE_STATUSES and not _is_terminal(merged.status):
+                # Mirrors the on-slate loop's inconclusive branch
+                # (:meth:`_fetch_poll_snapshots`'s ``elif is_backfill and ...
+                # not _is_terminal`` branch): a non-terminal merged snapshot
+                # (SCHEDULED/UNKNOWN reset) must NOT be durably appended to
+                # ``snapshots`` here — :meth:`_resolve_backfill_tracker` pops
+                # the tracker on ANY durable apply, not just terminal ones,
+                # so appending would permanently foreclose retry the moment
+                # this off-slate candidate happens to read back as
+                # inconclusive. Instead, treat this as an inconclusive
+                # attempt that counts toward the retry cap, exactly like a
+                # fetch exception does just above.
+                backfill_tracker = self._register_backfill_apply_failure(merged)
+                if _backfill_tracker_at_cap(backfill_tracker):
+                    self._emit_backfill_give_up(snapshots, match_id, backfill_tracker, fresh=merged)
+                continue
             snapshots.append(merged)
         return snapshots
 
