@@ -6,7 +6,7 @@ Index of dev plans for gamealerts-collector. The plan file is the source of trut
 
 | Plan | Comp | Status | Branch | Notes |
 |------|------|--------|--------|-------|
-| [20260711-feature-finished-match-backfill](20260711-feature-finished-match-backfill.md) | collector | Not Started | feature/finished-match-backfill | Backfill a match's full event list on first sight if it's already FINISHED. Raised by gamealerts game-worker (PR #2 note ask #4), triaged out of `20260710-feature-goal-event-participants`. |
+| [20260711-feature-finished-match-backfill](20260711-feature-finished-match-backfill.md) | collector | In Review | feature/finished-match-backfill | Backfill a match's full event list on first sight if it's already FINISHED. Raised by gamealerts game-worker (PR #2 note ask #4), triaged out of `20260710-feature-goal-event-participants`. |
 
 ## Completed Tasks
 
