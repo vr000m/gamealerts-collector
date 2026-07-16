@@ -268,3 +268,85 @@ class TestSideTableHelpersRejectNonIdentifierTable:
         _path, conn = collector_db
         with pytest.raises(ValueError):
             reader.get_team_side_table_rows(conn, garbage_table, "Australia")
+
+
+class TestSideTableHelpersRejectGarbageOrderBy:
+    """``order_by`` is also f-string-interpolated (currently unreachable --
+    every caller passes a hardcoded literal) but, unlike ``table``, cannot use
+    a bare-identifier regex: real callers pass multi-column clauses with
+    commas and ``IS NULL`` (see ``gamecollect_football.readport``). This
+    checks both that garbage is rejected and that the real call sites'
+    ``order_by`` values still pass.
+    """
+
+    @pytest.mark.parametrize(
+        "garbage_order_by",
+        [
+            "number; DROP TABLE matches",
+            "number -- comment",
+            "number /* comment */",
+            "number); DELETE FROM matches WHERE (1=1",
+            "UPDATE matches SET status = 'x'",
+        ],
+    )
+    def test_get_side_table_rows_rejects_garbage_order_by(self, collector_db, garbage_order_by):
+        _path, conn = collector_db
+        with pytest.raises(ValueError):
+            reader.get_side_table_rows(
+                conn, "football_lineups", SOURCE, MATCH_ID, order_by=garbage_order_by
+            )
+
+    @pytest.mark.parametrize(
+        "garbage_order_by",
+        [
+            "number; DROP TABLE matches",
+            "number -- comment",
+            "number /* comment */",
+        ],
+    )
+    def test_get_team_side_table_rows_rejects_garbage_order_by(
+        self, collector_db, garbage_order_by
+    ):
+        _path, conn = collector_db
+        with pytest.raises(ValueError):
+            reader.get_team_side_table_rows(
+                conn, "football_roster", "Australia", order_by=garbage_order_by
+            )
+
+    @pytest.mark.parametrize(
+        "garbage_order_by",
+        [
+            "number; DROP TABLE matches",
+            "number -- comment",
+        ],
+    )
+    def test_get_all_team_side_table_rows_rejects_garbage_order_by(
+        self, collector_db, garbage_order_by
+    ):
+        _path, conn = collector_db
+        with pytest.raises(ValueError):
+            reader.get_all_team_side_table_rows(conn, "football_roster", order_by=garbage_order_by)
+
+    def test_real_lineups_order_by_passes(self, collector_db):
+        """The order_by used by gamecollect_football.readport for lineups
+        must not be rejected by the new validation."""
+        _path, conn = collector_db
+        assert (
+            reader.get_side_table_rows(
+                conn,
+                "football_lineups",
+                SOURCE,
+                MATCH_ID,
+                order_by="team, formation_place IS NULL, formation_place, athlete_id",
+            )
+            == []
+        )
+
+    def test_real_roster_order_by_passes(self, collector_db):
+        """The order_by used by gamecollect_football.readport for roster
+        must not be rejected by the new validation."""
+        _path, conn = collector_db
+        assert (
+            reader.get_team_side_table_rows(conn, "football_roster", "Australia", order_by="number")
+            == []
+        )

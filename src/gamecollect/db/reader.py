@@ -292,6 +292,21 @@ def find_entities_by_name(
 
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
+# order_by legitimately needs commas, "IS NULL"/"IS NOT NULL", ASC/DESC, and
+# multiple qualified column names (e.g. "team, formation_place IS NULL,
+# formation_place, athlete_id") -- unlike `table`, a bare-identifier regex
+# would reject every real caller. Instead this allowlists the character set
+# such a clause can plausibly need (letters, digits, underscore, dot, comma,
+# whitespace) and separately blocks the SQL constructs that would let an
+# order_by value do something other than order rows: statement separators,
+# comment markers (which can truncate/hide the rest of a query), and DML
+# keywords. This is defense-in-depth for a currently-unreachable parameter
+# (every caller passes a literal), not a full grammar-level parser.
+_ORDER_BY_CHARS_RE = re.compile(r"^[A-Za-z0-9_.,\s]+$")
+_ORDER_BY_DANGEROUS_RE = re.compile(
+    r";|--|/\*|\*/|\b(DROP|DELETE|UPDATE|INSERT|ALTER|ATTACH|PRAGMA)\b", re.IGNORECASE
+)
+
 
 def _assert_identifier_shaped(table: str) -> None:
     """Cheap defense-in-depth for the ``table`` params below.
@@ -306,6 +321,24 @@ def _assert_identifier_shaped(table: str) -> None:
     """
     if not _IDENTIFIER_RE.match(table):
         raise ValueError(f"table must be a bare SQL identifier, got {table!r}")
+
+
+def _assert_order_by_shaped(order_by: str) -> None:
+    """Cheap defense-in-depth for the ``order_by`` params below.
+
+    Same rationale and unreachable-today status as
+    :func:`_assert_identifier_shaped`, but ``order_by`` cannot use a bare
+    single-identifier regex: real callers pass multi-column clauses with
+    ``IS NULL``/``ASC``/``DESC`` (e.g. ``"team, formation_place IS NULL,
+    formation_place, athlete_id"``). Instead this restricts the character set
+    to what such a clause could plausibly need (letters, digits, underscore,
+    dot, comma, whitespace) and separately rejects statement separators,
+    comment markers, and DML/DDL keywords.
+    """
+    if not order_by or not _ORDER_BY_CHARS_RE.match(order_by):
+        raise ValueError(f"order_by contains disallowed characters, got {order_by!r}")
+    if _ORDER_BY_DANGEROUS_RE.search(order_by):
+        raise ValueError(f"order_by contains a disallowed keyword or token, got {order_by!r}")
 
 
 def get_side_table_row(
@@ -341,6 +374,7 @@ def get_side_table_rows(
     _assert_identifier_shaped(table)
     sql = f"SELECT * FROM {table} WHERE source = ? AND match_id = ?"  # noqa: S608
     if order_by:
+        _assert_order_by_shaped(order_by)
         sql += f" ORDER BY {order_by}"
     return _query(conn, sql, (source, match_id))
 
@@ -356,6 +390,7 @@ def get_team_side_table_rows(
     _assert_identifier_shaped(table)
     sql = f"SELECT * FROM {table} WHERE team = ?"  # noqa: S608
     if order_by:
+        _assert_order_by_shaped(order_by)
         sql += f" ORDER BY {order_by}"
     return _query(conn, sql, (team,))
 
@@ -374,6 +409,7 @@ def get_all_team_side_table_rows(
     _assert_identifier_shaped(table)
     sql = f"SELECT * FROM {table}"  # noqa: S608
     if order_by:
+        _assert_order_by_shaped(order_by)
         sql += f" ORDER BY {order_by}"
     return _query(conn, sql)
 
