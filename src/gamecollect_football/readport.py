@@ -79,9 +79,13 @@ class FootballReadPort:
         }
 
     def _current_phase(self, match_id: str, status: Any) -> str | None:
-        for event in reversed(self.events_for_match(match_id)):
-            if event["phase"] is not None:
-                return event["phase"]
+        # latest_state() is a per-poll hot path; a targeted "last matching
+        # event" query (get_latest_event_of_type, ORDER BY seq DESC LIMIT 1)
+        # avoids fetching and decoding every event for the match just to find
+        # the last phase marker.
+        row = reader.get_latest_event_of_type(self._conn, match_id, _PHASE_MARKER_TYPES)
+        if row is not None:
+            return row["type"]
         return str(status).lower() if status else None
 
     def _project_event(self, row: dict[str, Any]) -> dict[str, Any]:

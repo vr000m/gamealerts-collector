@@ -440,3 +440,63 @@ class TestLegacyGoalScorerFallback:
         adapter = FootballReadPort(db)
         events = adapter.events_for_match(self.MATCH_ID)
         assert [e["player"] for e in events] == ["Legacy Scorer"]
+
+
+class TestCurrentPhaseTargetedLookup:
+    """latest_state() is a per-poll hot path; _current_phase must find the
+    last phase-marker event via a targeted query (reader.get_latest_event_of_type,
+    ORDER BY seq DESC LIMIT 1) rather than decoding the full event history on
+    every call. This is a behavior test (correct last-marker result across
+    several events, including non-marker events interleaved after the last
+    marker) -- it does not assert on query plan."""
+
+    MATCH_ID = "760421"
+
+    def _seed(self, db):
+        writer = PartitionWriter(db, SOURCE)
+        writer.upsert_match(
+            {
+                "match_id": self.MATCH_ID,
+                "source": SOURCE,
+                "status": "IN_PLAY",
+                "kickoff_utc": "2026-06-14T04:00:00+00:00",
+                "score_home": 0,
+                "score_away": 0,
+                "display_clock": "1'",
+                "payload": {"home_team": "Turkey", "away_team": "Australia"},
+            }
+        )
+        writer.append_events(
+            self.MATCH_ID,
+            [
+                {"seq": 0, "type": "kickoff", "minute": 0},
+                {"seq": 1, "type": "goal", "minute": 10, "payload": {"team": "Turkey"}},
+                {"seq": 2, "type": "half_time", "minute": 45},
+                {"seq": 3, "type": "goal", "minute": 50, "payload": {"team": "Australia"}},
+            ],
+        )
+        db.commit()
+
+    def test_current_phase_returns_last_marker_past_later_non_marker_events(self, db):
+        self._seed(db)
+        adapter = FootballReadPort(db)
+        state = adapter.latest_state(self.MATCH_ID)
+        assert state["phase"] == "half_time"
+
+    def test_get_latest_event_of_type_returns_last_matching_row(self, db):
+        from gamecollect.db import reader
+
+        self._seed(db)
+        row = reader.get_latest_event_of_type(
+            db, self.MATCH_ID, frozenset({"kickoff", "half_time", "full_time"})
+        )
+        assert row is not None
+        assert row["type"] == "half_time"
+        assert row["seq"] == 2
+
+    def test_get_latest_event_of_type_returns_none_when_no_match(self, db):
+        from gamecollect.db import reader
+
+        self._seed(db)
+        row = reader.get_latest_event_of_type(db, self.MATCH_ID, frozenset({"full_time"}))
+        assert row is None

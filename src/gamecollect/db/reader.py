@@ -25,6 +25,7 @@ import json
 import re
 import sqlite3
 import urllib.parse
+from collections.abc import Collection
 from pathlib import Path
 from typing import Any
 
@@ -40,6 +41,7 @@ __all__ = [
     "get_state",
     "get_stored_payload",
     "get_events_since",
+    "get_latest_event_of_type",
     "get_standings",
     "get_entity",
     "find_entities_by_name",
@@ -172,6 +174,33 @@ def get_events_since(
         "SELECT * FROM events WHERE match_id = ? AND seq > ? ORDER BY seq",
         (match_id, seq),
     )
+
+
+def get_latest_event_of_type(
+    conn: sqlite3.Connection, match_id: str, types: Collection[str]
+) -> dict[str, Any] | None:
+    """Return the most recent event row for ``match_id`` whose ``type`` is in
+    ``types`` (ordered by ``seq DESC``, one row), or ``None`` if there is none.
+
+    Targeted alternative to decoding the full event history just to find one
+    marker event (e.g. a football pack's last phase-marker event on every
+    ``latest_state()`` poll tick) -- a per-poll hot path where
+    ``get_events_since`` + full decode-and-scan does needless work every
+    call. ``types`` is expected to be a small, caller-controlled set of
+    literal type strings (not user input), so it is passed as bound
+    parameters (safe) rather than interpolated.
+    """
+    types = tuple(types)
+    if not types:
+        return None
+    placeholders = ",".join("?" for _ in types)
+    rows = _query(
+        conn,
+        f"SELECT * FROM events WHERE match_id = ? AND type IN ({placeholders}) "
+        "ORDER BY seq DESC LIMIT 1",
+        (match_id, *types),
+    )
+    return rows[0] if rows else None
 
 
 def get_standings(
