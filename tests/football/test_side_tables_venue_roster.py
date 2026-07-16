@@ -192,6 +192,60 @@ class TestVenueSideTable:
 
 
 class TestRosterSideTable:
+    def test_roster_falls_back_to_stored_schedule_team_names(self, db):
+        """Regression: when the CURRENT poll's snapshot carries neither
+        home_team nor away_team (e.g. a summary response whose
+        header.competitions was empty/malformed, so the ESPN adapter never
+        set NormalizedMatch.home_team/away_team even though the same
+        response's rosters/lineups are otherwise intact), the roster persist
+        calls must not silently no-op if the canonical schedule row already
+        has team names on its stored payload."""
+        roster_table = _find_table_name("roster")
+        if roster_table is None:
+            pytest.skip("no football_*roster* side table wired yet")
+        conn, writer = db
+        # Seed the canonical schedule row's stored payload with team names
+        # (mirrors what reconcile.py's seed path writes for a resolved
+        # canonical row -- schedule-owned home_team/away_team).
+        writer.upsert_match(
+            {
+                "match_id": MATCH_ID,
+                "source": SOURCE,
+                "status": "IN_PLAY",
+                "kickoff_utc": "2026-06-14T04:00:00+00:00",
+                "score_home": 1,
+                "score_away": 0,
+                "display_clock": "27'",
+                "payload": {"home_team": "Morocco", "away_team": "Haiti"},
+            }
+        )
+        conn.commit()
+
+        # This poll's NormalizedMatch carries NO home_team/away_team.
+        match = NormalizedMatch(
+            match_id="760421",
+            status=MatchStatus.IN_PLAY,
+            minute=27,
+            score_home=1,
+            score_away=0,
+            display_clock="27'",
+            home_team=None,
+            away_team=None,
+            kickoff_utc="2026-06-14T04:00:00+00:00",
+            payload={},
+        )
+        persist_football_side_tables(conn, writer, match, MATCH_ID)
+
+        (count,) = conn.execute(
+            f"SELECT COUNT(*) FROM {roster_table} WHERE team IN (?, ?)",  # noqa: S608
+            ("Morocco", "Haiti"),
+        ).fetchone()
+        assert count > 0, (
+            "expected roster rows for Morocco/Haiti derived from the canonical "
+            "schedule row's stored payload when the current snapshot carries no "
+            "home_team/away_team"
+        )
+
     def test_roster_table_exists_in_side_table_ddl(self):
         table = _find_table_name("roster")
         assert table is not None, (

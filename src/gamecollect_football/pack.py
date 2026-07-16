@@ -522,8 +522,18 @@ def persist_football_side_tables(
                 seeded_match_id,
                 venue_rows,
             )
-        _persist_roster_for_team(conn, match.home_team)
-        _persist_roster_for_team(conn, match.away_team)
+        # Fall back to the canonical schedule row's stored team names when
+        # this poll's snapshot carries neither (e.g. a summary response whose
+        # header.competitions is empty/malformed, so the ESPN adapter never
+        # set NormalizedMatch.home_team/away_team, even though the SAME
+        # response's rosters/lineups are otherwise intact). stored_payload is
+        # already fetched above; per reconcile.py's seed_or_reconcile_match
+        # docstring, a resolved canonical row's payload home_team/away_team
+        # are schedule-owned and never overwritten with provider values, so
+        # this is a safe, already-verified fallback source rather than a
+        # guess at an unverified payload shape.
+        _persist_roster_for_team(conn, match.home_team or stored_payload.get("home_team"))
+        _persist_roster_for_team(conn, match.away_team or stored_payload.get("away_team"))
 
 
 def pack() -> SportPack:
