@@ -258,6 +258,29 @@ def test_lineup_team_is_canonicalized_to_match_roster_and_state_vocabulary(db):
     )
 
 
+def test_stats_team_is_canonicalized_to_match_roster_and_state_vocabulary(db):
+    """Round 2 review finding: football_stats.team had the same bug class
+    round 1 fixed for football_lineups.team — the write hook never ran the
+    boxscore ``stats`` section's ``team`` through canonical_display_name, so
+    an alias-mapped team (Türkiye -> Turkey) stored the raw provider
+    spelling. get_player_stats(team=...) does an exact match, so a caller
+    passing the canonical name (as it always does elsewhere) got a
+    false-empty result. This pins that football_stats.team is canonicalized
+    the same way football_lineups.team already is."""
+    conn, writer = db
+    payload = {"stats": [{"team": "Türkiye", "shots": 5}]}
+    persist_football_side_tables(conn, writer, _match(payload), MATCH_ID)
+    teams = {
+        row[0]
+        for row in conn.execute("SELECT team FROM football_stats WHERE match_id = ?", (MATCH_ID,))
+    }
+    assert teams == {"Turkey"}, (
+        "football_stats.team must be canonicalized (Türkiye -> Turkey) so it "
+        "agrees with football_roster.team, football_lineups.team, and "
+        "payload home_team/away_team"
+    )
+
+
 def test_integral_float_and_string_athlete_id_collapse_to_one_row(db):
     """The same athlete spelled as JSON float ``760421.0`` and string
     ``"760421"`` must collapse to ONE primary-key row (last-wins), not two."""
