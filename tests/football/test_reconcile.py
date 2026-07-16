@@ -1308,3 +1308,64 @@ class TestMigratableSideTablesDerivation:
         )
         derived = tuple(name for name, match_keyed, _ddl in fake_specs if match_keyed)
         assert "football_fake_new_table" in derived
+
+
+class TestSideTableSpecStructuralValidation:
+    """Round 2 review finding: the derivation tests above are tautological —
+    they re-derive the same filter production code uses, so a wrong
+    ``match_keyed`` TAG (as opposed to a missing spec entry) is never caught.
+    ``test_a_new_match_keyed_spec_is_automatically_migratable`` above even
+    feeds the mechanism a fabricated table with NO ``match_id`` column tagged
+    ``match_keyed=True`` and it is accepted as migratable. This class checks
+    the structural cross-check added in reconcile.py
+    (``_assert_side_table_specs_structurally_consistent``, run at import time
+    over the real specs) actually rejects a mistagged entry like that one."""
+
+    def test_real_specs_pass_structural_validation(self):
+        """The production specs must already satisfy their own validator —
+        this is what actually runs at import time (see reconcile.py's
+        module-level call), so a regression here would fail on every import,
+        not just in this test."""
+        from gamecollect_football.reconcile import (
+            _FOOTBALL_SIDE_TABLE_SPECS,
+            _assert_side_table_specs_structurally_consistent,
+        )
+
+        _assert_side_table_specs_structurally_consistent(_FOOTBALL_SIDE_TABLE_SPECS)
+
+    def test_match_keyed_true_without_match_id_column_is_rejected(self):
+        """The exact fabricated table from the test above — no match_id
+        column, tagged match_keyed=True — must now fail loudly."""
+        from gamecollect_football.reconcile import (
+            SideTableSpec,
+            _assert_side_table_specs_structurally_consistent,
+        )
+
+        bad_specs = (
+            SideTableSpec(
+                "football_fake_new_table",
+                True,
+                "CREATE TABLE IF NOT EXISTS football_fake_new_table (x TEXT);",
+            ),
+        )
+        with pytest.raises(AssertionError, match="match_id"):
+            _assert_side_table_specs_structurally_consistent(bad_specs)
+
+    def test_match_keyed_false_with_match_id_column_is_rejected(self):
+        """The reverse mistag: a table that DOES declare match_id but is
+        tagged match_keyed=False must also fail loudly."""
+        from gamecollect_football.reconcile import (
+            SideTableSpec,
+            _assert_side_table_specs_structurally_consistent,
+        )
+
+        bad_specs = (
+            SideTableSpec(
+                "football_fake_match_keyed_table",
+                False,
+                "CREATE TABLE IF NOT EXISTS football_fake_match_keyed_table "
+                "(source TEXT, match_id TEXT);",
+            ),
+        )
+        with pytest.raises(AssertionError, match="match_id"):
+            _assert_side_table_specs_structurally_consistent(bad_specs)

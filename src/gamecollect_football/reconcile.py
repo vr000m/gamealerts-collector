@@ -29,14 +29,16 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sqlite3
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, NamedTuple
 
 from gamecollect.db import reader
 from gamecollect.db.writer import PartitionWriter
 from gamecollect.fold import fold
 from gamecollect.provider import NormalizedMatch, merge_payload_preserving_richer
+
 
 # Pack-owned side tables (typed homes for the football-specific shapes the
 # adapter carries in NormalizedMatch.payload: boxscore stats and lineups).
@@ -57,8 +59,63 @@ from gamecollect.provider import NormalizedMatch, merge_payload_preserving_riche
 # instead of two hand-synced lists that can drift (this exact drift bug fired
 # once already: football_venue was omitted from a hand-maintained migration
 # tuple).
-_FOOTBALL_SIDE_TABLE_SPECS: tuple[tuple[str, bool, str], ...] = (
-    (
+class SideTableSpec(NamedTuple):
+    """One football pack-owned side table's migration-relevant metadata.
+
+    A ``NamedTuple`` (not a bare 3-tuple) so the two unpack sites
+    (``FOOTBALL_SIDE_TABLE_DDL`` below, ``_MIGRATABLE_SIDE_TABLES`` in this
+    module) are self-documenting and IDE-checkable against field reordering."""
+
+    name: str
+    match_keyed: bool
+    ddl: str
+
+
+# Strips SQL line comments (`-- ...` to end of line) before the match_id
+# check below — a DDL string's PROSE comment can legitimately mention
+# "match_id" (e.g. football_roster's DDL explains it is deliberately
+# unscoped by match_id) without the table declaring any such column; only
+# checking live (non-comment) text avoids a false positive there.
+_SQL_LINE_COMMENT_RE = re.compile(r"--[^\n]*")
+
+# A heuristic (substring, not a SQL parser) check that a bare `match_id`
+# column name appears in the DDL (column declaration or PRIMARY KEY clause)
+# — enough to catch an obviously wrong match_keyed tag (e.g. a table with no
+# match_id column tagged match_keyed=True, or vice versa) without needing
+# real DDL parsing.
+_MATCH_ID_COLUMN_RE = re.compile(r"\bmatch_id\b")
+
+
+def _assert_side_table_specs_structurally_consistent(
+    specs: tuple[SideTableSpec, ...],
+) -> None:
+    """Guard against ``match_keyed`` drifting from the DDL sitting next to it.
+
+    ``match_keyed`` is a hand-set boolean (see the module comment above) with
+    nothing else checking it against the DDL string — a mistagged entry would
+    otherwise migrate (or fail to migrate) that table's rows on stub adoption
+    with no loud failure. Runs at import time so a wrong tag on a newly added
+    table fails immediately, not only if/when stub adoption happens to
+    exercise it."""
+    for spec in specs:
+        ddl_without_comments = _SQL_LINE_COMMENT_RE.sub("", spec.ddl)
+        has_match_id = _MATCH_ID_COLUMN_RE.search(ddl_without_comments) is not None
+        if spec.match_keyed and not has_match_id:
+            raise AssertionError(
+                f"{spec.name!r} is tagged match_keyed=True but its DDL declares no "
+                "match_id column — _adopt_stub_rows would migrate a table that "
+                "structurally isn't match-keyed"
+            )
+        if not spec.match_keyed and has_match_id:
+            raise AssertionError(
+                f"{spec.name!r} is tagged match_keyed=False but its DDL declares a "
+                "match_id column — _adopt_stub_rows would SKIP migrating a table "
+                "that structurally is match-keyed"
+            )
+
+
+_FOOTBALL_SIDE_TABLE_SPECS: tuple[SideTableSpec, ...] = (
+    SideTableSpec(
         "football_stats",
         True,
         """
@@ -78,7 +135,7 @@ _FOOTBALL_SIDE_TABLE_SPECS: tuple[tuple[str, bool, str], ...] = (
     );
     """,
     ),
-    (
+    SideTableSpec(
         "football_lineups",
         True,
         """
@@ -103,7 +160,7 @@ _FOOTBALL_SIDE_TABLE_SPECS: tuple[tuple[str, bool, str], ...] = (
         ON football_lineups (source, name_folded);
     """,
     ),
-    (
+    SideTableSpec(
         "football_venue",
         True,
         """
@@ -116,7 +173,7 @@ _FOOTBALL_SIDE_TABLE_SPECS: tuple[tuple[str, bool, str], ...] = (
     );
     """,
     ),
-    (
+    SideTableSpec(
         "football_roster",
         False,
         """
@@ -140,9 +197,9 @@ _FOOTBALL_SIDE_TABLE_SPECS: tuple[tuple[str, bool, str], ...] = (
     ),
 )
 
-FOOTBALL_SIDE_TABLE_DDL: tuple[str, ...] = tuple(
-    ddl for _name, _match_keyed, ddl in _FOOTBALL_SIDE_TABLE_SPECS
-)
+_assert_side_table_specs_structurally_consistent(_FOOTBALL_SIDE_TABLE_SPECS)
+
+FOOTBALL_SIDE_TABLE_DDL: tuple[str, ...] = tuple(spec.ddl for spec in _FOOTBALL_SIDE_TABLE_SPECS)
 
 __all__ = [
     "TEAM_ALIASES",
@@ -699,7 +756,7 @@ def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
 # team-keyed (PRIMARY KEY (team, number)), not match-keyed, so it has no
 # per-match row to migrate.
 _MIGRATABLE_SIDE_TABLES: tuple[str, ...] = tuple(
-    name for name, match_keyed, _ddl in _FOOTBALL_SIDE_TABLE_SPECS if match_keyed
+    spec.name for spec in _FOOTBALL_SIDE_TABLE_SPECS if spec.match_keyed
 )
 
 
@@ -780,6 +837,16 @@ def _adopt_stub_rows(
     merged_payload = dict(stub_payload)
     _merge_preserving_richer(merged_payload, reader.get_stored_payload(conn, canonical_id))
     with conn:
+        # Deliberately hardcoded to football_lineups by name rather than
+        # generalized via a "has home/away orientation" tag on
+        # SideTableSpec: today football_lineups is the ONLY side table
+        # carrying a per-row home/away orientation column, so a third tag
+        # dimension on the spec tuple would be speculative scaffolding for a
+        # hypothetical second table, not a real generalization (round 2
+        # review finding #5 — deferred deliberately). If a second
+        # orientation-carrying side table is ever added, generalize this into
+        # a spec-driven loop (mirroring _MIGRATABLE_SIDE_TABLES above) at
+        # that point.
         if reverse_oriented and _table_exists(conn, "football_lineups"):
             conn.execute(
                 "UPDATE football_lineups "
