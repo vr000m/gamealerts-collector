@@ -171,9 +171,10 @@ budget is deferred (no fetch, no failure recorded) and retried on a
 subsequent poll once budget is available again. A failed detail fetch is
 retried on subsequent polls up to a pinned cap, `_BACKFILL_MAX_ATTEMPTS = 3`
 (`gamecollect.engine`); once exhausted, the collector gives up and persists
-the best-known snapshot (the scoreboard merged with any partial fallback
-detail accrued across the failed attempts, never a bare scoreboard-only
-snapshot). Give-up permanence is conditional, not absolute: an ORDINARY
+the richest state actually accrued: the scoreboard merged with any partial
+fallback detail accrued across the failed attempts, or a bare
+scoreboard-only snapshot when every detail fetch failed before the apply
+itself failed (merging over a `None` base is a no-op). Give-up permanence is conditional, not absolute: an ORDINARY
 give-up whose snapshot durably lands is permanent (no further retries for
 that match — the stored row forecloses re-detection). If the give-up
 snapshot's OWN apply cannot be relied on to land durably — no snapshot could
