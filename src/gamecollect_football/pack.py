@@ -186,12 +186,20 @@ def _stats_rows(
     payload collapses last-wins (the old ON CONFLICT semantics). Non-scalar
     values are coerced to ``None`` rather than passed to sqlite; the ``team``
     PK component goes through :func:`_to_key_text` (bool rejected, integral
-    float canonicalized) so numeric spellings cannot mint duplicate keys."""
+    float canonicalized) so numeric spellings cannot mint duplicate keys.
+    ``team`` is then run through :func:`canonical_display_name`, mirroring
+    :func:`_lineup_rows`, so ``football_stats.team`` agrees with
+    ``football_roster.team``/``football_lineups.team`` and
+    ``payload["home_team"]``/``["away_team"]`` on alias-mapped teams — a
+    mismatch here silently breaks ``get_player_stats(team=...)`` for a caller
+    passing the canonical name."""
     rows: dict[tuple[str, str, str], tuple] = {}
     for row in stats:
         if not isinstance(row, dict):
             continue
         team = _to_key_text(row.get("team"))
+        if team:
+            team = canonical_display_name(team)
         if not team:
             _warn_skip_once(
                 source,
