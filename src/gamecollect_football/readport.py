@@ -23,7 +23,7 @@ from typing import Any
 from gamecollect.db import reader
 from gamecollect.fold import fold
 from gamecollect_football.operations import resolve_source
-from gamecollect_football.reconcile import canonical_display_name, canonical_team_name
+from gamecollect_football.reconcile import canonical_team_name
 
 __all__ = ["FootballReadPort"]
 
@@ -86,6 +86,11 @@ class FootballReadPort:
         row = reader.get_latest_event_of_type(self._conn, match_id, _PHASE_MARKER_TYPES)
         if row is not None:
             return row["type"]
+        # No phase-marker event yet (e.g. pre-kickoff): fall back to the
+        # lowercased match `status` string. NOT itself a phase-marker type —
+        # a consumer must not treat this fallback value as interchangeable
+        # with a real `_PHASE_MARKER_TYPES` member just because it shares the
+        # `phase` field name.
         return str(status).lower() if status else None
 
     def _project_event(self, row: dict[str, Any]) -> dict[str, Any]:
@@ -179,16 +184,20 @@ class FootballReadPort:
     def _roster_rows(self, participant: str) -> list[dict[str, Any]]:
         # football_roster.team is always written through canonical_display_name
         # (pack.py's _persist_roster_for_team), so a raw provider alias (e.g.
-        # "Türkiye") passed in here must be canonicalized the same way before
-        # the exact-match query. Round 1 fixed this exact bug class for
-        # _lineup_rows but missed this sibling method, silently dropping rows
-        # for a caller using an alias name.
-        return reader.get_team_side_table_rows(
+        # "Türkiye") passed in here must be canonicalized before matching.
+        # Compare through canonical_team_name (fold + alias), same as
+        # _lineup_rows above, rather than canonical_display_name (alias-dict
+        # lookup only, no casefold/diacritic-fold): a participant string that
+        # folds to the same team but isn't byte-identical to a TEAM_ALIASES
+        # key (e.g. a casing or diacritic variant not itself an alias key)
+        # would still miss an exact-match query against the display name.
+        target = canonical_team_name(participant)
+        rows = reader.get_all_team_side_table_rows(
             self._conn,
             "football_roster",
-            canonical_display_name(participant),
             order_by="number",
         )
+        return [r for r in rows if canonical_team_name(r.get("team") or "") == target]
 
     def roster_for_team(self, participant: str) -> list[dict[str, Any]]:
         return [

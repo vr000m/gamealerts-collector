@@ -351,6 +351,24 @@ def get_team_side_table_rows(
     return _query(conn, sql, (team,))
 
 
+def get_all_team_side_table_rows(
+    conn: sqlite3.Connection, table: str, *, order_by: str | None = None
+) -> list[dict[str, Any]]:
+    """Return every row from a pack's team-keyed side table, unfiltered.
+
+    Companion to :func:`get_team_side_table_rows` for callers that need to
+    match ``team`` through a fold-based comparison (casefold + diacritic
+    strip, not just an exact string) rather than an exact SQL equality — the
+    caller fetches the full (small, team-level) table and filters in Python.
+    Empty list for an empty table.
+    """
+    _assert_identifier_shaped(table)
+    sql = f"SELECT * FROM {table}"  # noqa: S608
+    if order_by:
+        sql += f" ORDER BY {order_by}"
+    return _query(conn, sql)
+
+
 def get_recent_commentary(
     conn: sqlite3.Connection, match_id: str, limit: int = 20
 ) -> list[dict[str, Any]]:

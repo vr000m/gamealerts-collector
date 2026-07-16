@@ -432,6 +432,22 @@ class TestRosterAliasCanonicalization:
         adapter = FootballReadPort(db)
         assert adapter.roster_contains("Türkiye", "Roster Player") is True
 
+    def test_roster_for_team_matches_casing_variant_not_an_alias_key(self, db):
+        """Round 3 review finding: ``_roster_rows`` compared through
+        ``canonical_display_name`` (alias-dict lookup only — exact-key
+        substitution, no casefold/diacritic-fold), a weaker comparison than
+        ``_lineup_rows``'s ``canonical_team_name`` (fold-based: casefolds and
+        strips diacritics in addition to alias lookup). A participant string
+        that folds to the same team but is neither byte-identical to the
+        stored display name NOR itself a ``TEAM_ALIASES`` key — e.g. an
+        all-caps variant — would fail to match in the (old) roster path while
+        succeeding in the lineup path. This pins that both paths now use the
+        same fold-based comparison strength."""
+        self._seed_roster_row(db)
+        adapter = FootballReadPort(db)
+        result = adapter.roster_for_team("TURKEY")
+        assert [r["player"] for r in result] == ["Roster Player"]
+
 
 class TestLegacyGoalScorerFallback:
     """Regression: existing databases can contain goal/own_goal event rows
