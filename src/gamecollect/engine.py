@@ -121,21 +121,19 @@ _MAX_GIVE_UP_EMISSIONS = 3
 # detail-fetch attempt), so one cap suffices, mirroring the order of
 # magnitude of ``_MAX_TRANSITION_DETAIL_FAILURES``.
 _BACKFILL_MAX_ATTEMPTS = 3
-# Per-poll cap on ``is_backfill`` detail fetches (post-merge Codex review
-# round 2, finding #4): a cold start against a slate with many
-# already-finished matches (or a provider outage where every fetch times
-# out) must not serialize an unbounded burst of ``fetch_match_detail`` calls
-# inside one poll and block the daemon. Shared by both first-sight and
-# pending-retry candidates (one poll-scoped budget; see
-# ``_fetch_poll_snapshots``'s local ``backfill_fetches_this_poll`` counter).
-# Bounds worst-case per-poll fetch volume at the cost of a possibly
+# Per-poll cap on ``is_backfill`` detail fetches: a cold start against a
+# slate with many already-finished matches (or a provider outage where every
+# fetch times out) must not serialize an unbounded burst of
+# ``fetch_match_detail`` calls inside one poll and block the daemon. Shared
+# by both first-sight and pending-retry candidates (one poll-scoped budget;
+# see ``_fetch_poll_snapshots``'s local ``backfill_fetches_this_poll``
+# counter). Bounds worst-case per-poll fetch volume at the cost of a possibly
 # multi-poll delay before a large finished slate is fully backfilled —
 # acceptable, since backfill is best-effort enrichment, not the live-match
-# critical path. Also shared (round-3 Codex review, finding #3) with
+# critical path. Also shared with
 # :meth:`CollectorEngine._hydrate_vanished_backfill_matches`'s vanished-match
 # backfill pass, threaded in as the REMAINING budget left over from this
-# poll's on-slate loop — see that method's docstring for why it is no longer
-# left unbounded.
+# poll's on-slate loop — see that method's docstring for why it is bounded.
 _BACKFILL_MAX_FETCHES_PER_POLL = 5
 # Abandonment COOLDOWN (see :class:`_Cooldown` and the ``_TransitionTracker``
 # docstring): after a match is abandoned it may be re-tracked only once this
@@ -399,7 +397,7 @@ class _TransitionTracker:
 
     One tracker per provider-native match id, held in
     ``CollectorEngine._transitions``. Lifecycle invariants (enforced by
-    construction — every round-5 review defect traced to violating one):
+    construction, since violating any one of them corrupts the tracker):
 
     * **Created/updated** whenever a live-tracked match needs terminal
       hydration it did not durably get this poll: a live→non-live transition
@@ -446,8 +444,8 @@ class _TransitionTracker:
       (identity missing, ``seed_match`` → ``None`` forever) is abandoned with
       one final ERROR after ``_MAX_GIVE_UP_EMISSIONS`` emissions.
     * **Abandonment enters a capped-exponential COOLDOWN, not a permanent
-      boolean latch** (round-9 redesign — a boolean could not satisfy the
-      behaviour matrix below). When a give-up snapshot's apply never lands
+      boolean latch**, since a boolean cannot satisfy the behaviour matrix
+      below. When a give-up snapshot's apply never lands
       (``_MAX_GIVE_UP_EMISSIONS`` exhausted, or nothing was ever known to
       persist) the tracker is popped AND a :class:`_Cooldown` is entered for the
       id in ``CollectorEngine._cooldowns``. While the cooldown's ``remaining``
@@ -545,15 +543,15 @@ def _first_sight_finished(
     """True on first sight of an already-finished (i.e. terminal) match.
 
     Four conjuncts: no in-memory baseline, a genuinely TERMINAL status (per
-    :func:`_is_terminal`, not merely "not live" — see the post-merge Codex
-    review, finding #4), never live this poll (neither via the baseline nor a
-    stored row), and no existing stored row. Using ``_is_terminal`` instead of
+    :func:`_is_terminal`, not merely "not live" — a match must be checked
+    against the full terminal-status set, not just excluded from the live
+    set), never live this poll (neither via the baseline nor a stored row),
+    and no existing stored row. Using ``_is_terminal`` instead of
     ``status not in LIVE_STATUSES`` matters: the latter also matches
     SCHEDULED/UNKNOWN, which would detail-fetch every upcoming/unknown
-    fixture on a cold start — a scope leak the plan never intended (plan line
-    35: "`FINISHED` (or otherwise terminal)"). Deliberately excludes any
-    ``events`` conjunct (round-3 Codex finding #1): the provider ABC
-    (``MatchDataProvider.fetch_live_matches``) explicitly permits a
+    fixture on a cold start — a scope leak beyond "`FINISHED` (or otherwise
+    terminal)". Deliberately excludes any ``events`` conjunct: the provider
+    ABC (``MatchDataProvider.fetch_live_matches``) explicitly permits a
     scoreboard-only snapshot to carry a partial event list, so a genuinely
     first-sight FINISHED match whose bare board already shows some events
     must still trigger the full detail fetch — treating it as "nothing to
@@ -562,7 +560,7 @@ def _first_sight_finished(
     at-cap term — that is Phase 2's pre-fetch short-circuit, evaluated
     separately — and deliberately excludes the ``backfill_finished_matches``
     kill switch, which the caller ANDs in on top of this predicate.
-    Likewise deliberately excludes any cooldown term (finding #2): the
+    Likewise deliberately excludes any cooldown term: the
     caller ANDs in ``not self._cooling_down(...)`` on top of this
     predicate too, so an unpersistable give-up's abandonment cooldown
     (:meth:`CollectorEngine._emit_backfill_give_up`) can suppress
@@ -585,14 +583,11 @@ def _live_to_terminal_transition(was_live: bool, status: MatchStatus) -> bool:
 def _rows_report_live(rows: list[tuple]) -> bool:
     """True when the best (authority-first, then freshest) stored row is live.
 
-    Shared derivation for the two ``_stored_liveness_rows`` consumers: the
-    restart-gap ``was_live``/``has_stored_row`` computation in
-    :meth:`CollectorEngine._fetch_poll_snapshots` (which also needs the raw
-    ``rows`` for ``has_stored_row``, so it cannot call
-    :meth:`CollectorEngine._stored_status_is_live` directly — that method
-    discards its rows and returns only a bool) and
-    :meth:`CollectorEngine._stored_status_is_live` itself. Empty ``rows``
-    (no stored row) is not live.
+    Shared derivation for :meth:`CollectorEngine._stored_liveness_rows`
+    readers, notably the restart-gap ``was_live``/``has_stored_row``
+    computation in :meth:`CollectorEngine._fetch_poll_snapshots`, which also
+    needs the raw ``rows`` for ``has_stored_row`` alongside the liveness
+    bool. Empty ``rows`` (no stored row) is not live.
     """
     return bool(rows) and rows[0][0] in LIVE_STATUS_VALUES
 
@@ -701,16 +696,15 @@ class CollectorEngine:
         # onto the live→terminal transition path on its very next poll. Only
         # the give-up SHAPE and its emission cap are shared with
         # ``_TransitionTracker``'s pattern — NOT the cooldown side-effect, with
-        # ONE exception (post-merge Codex review round 2, finding #2): an
-        # ordinary backfill give-up landing durably IS permanent (no cooldown
-        # needed, since ``has_stored_row`` forecloses re-detection), but when
-        # the give-up snapshot's OWN apply never lands within
-        # ``_MAX_GIVE_UP_EMISSIONS`` re-emissions, ``_emit_backfill_give_up``
-        # now also enters a cooldown (mirroring ``_abandon``) so detection
-        # cannot hot-loop every poll — see that method's docstring. Popped
-        # ONLY by ``_resolve_backfill_tracker`` (consume-side, any non-live
-        # durable apply), by emission-cap exhaustion in
-        # ``_emit_backfill_give_up``, or (finding #3) by
+        # ONE exception: an ordinary backfill give-up landing durably IS
+        # permanent (no cooldown needed, since ``has_stored_row`` forecloses
+        # re-detection), but when the give-up snapshot's OWN apply never
+        # lands within ``_MAX_GIVE_UP_EMISSIONS`` re-emissions,
+        # ``_emit_backfill_give_up`` also enters a cooldown (mirroring
+        # ``_abandon``) so detection cannot hot-loop every poll — see that
+        # method's docstring. Popped ONLY by ``_resolve_backfill_tracker``
+        # (consume-side, any non-live durable apply), by emission-cap
+        # exhaustion in ``_emit_backfill_give_up``, or by
         # ``_hydrate_vanished_backfill_matches`` reaching its own cap/give-up
         # for an entry that dropped off the slate mid-retry — no OTHER
         # vanished-match purge beyond that dedicated pass (bounded, in-memory
@@ -721,9 +715,9 @@ class CollectorEngine:
         # top of every call so it never carries stale ids across polls).
         # ``poll_once`` consults it to tell apart a downstream ``_apply``
         # failure for an ``is_backfill`` match (which must still register a
-        # backfill-tracker failure — see ``_register_backfill_apply_failure``
-        # — post-merge Codex review findings #2/#3) from an ordinary match's
-        # ``_apply`` failure (unrelated to backfill retry accounting).
+        # backfill-tracker failure — see ``_register_backfill_apply_failure``)
+        # from an ordinary match's ``_apply`` failure (unrelated to backfill
+        # retry accounting).
         self._backfill_apply_pending: set[str] = set()
         self._backoff_multiplier = 1
         # One-time restart scan latch: on the FIRST successful poll the stored
@@ -837,13 +831,13 @@ class CollectorEngine:
                     self._source,
                     exc,
                 )
-                # Post-merge Codex review finding #2: this _apply raised AFTER
-                # seed_match may already have durably written the matches row
-                # (seed-before-child-write), so a match this poll's fetch
-                # confirmed as ``is_backfill`` must still count this as a
-                # backfill attempt — otherwise a row now exists with no
-                # tracker to keep is_backfill alive, permanently foreclosing
-                # retry. Not reached for a non-backfill match (absent from
+                # This _apply raised AFTER seed_match may already have
+                # durably written the matches row (seed-before-child-write),
+                # so a match this poll's fetch confirmed as ``is_backfill``
+                # must still count this as a backfill attempt — otherwise a
+                # row now exists with no tracker to keep is_backfill alive,
+                # permanently foreclosing retry. Not reached for a
+                # non-backfill match (absent from
                 # ``self._backfill_apply_pending``).
                 if diff.match.match_id in self._backfill_apply_pending:
                     self._register_backfill_apply_failure(diff.match)
@@ -859,7 +853,7 @@ class CollectorEngine:
                     self._source,
                     exc,
                 )
-                # Same rationale as the SequenceError branch above (finding #2).
+                # Same rationale as the SequenceError branch above.
                 if diff.match.match_id in self._backfill_apply_pending:
                     self._register_backfill_apply_failure(diff.match)
                 continue
@@ -879,13 +873,13 @@ class CollectorEngine:
                     state_advanced=True,
                 )
             elif diff.match.match_id in self._backfill_apply_pending:
-                # Post-merge Codex review finding #3: seed_match returned None
-                # (missing identity) after a successful detail fetch for an
-                # is_backfill match — no durable write landed, so nothing was
-                # foreclosed, but without registering a failure here nothing
-                # ever counts against _BACKFILL_MAX_ATTEMPTS either, and
-                # _first_sight_finished would keep re-firing (fetching detail
-                # again) every poll forever.
+                # seed_match returned None (missing identity) after a
+                # successful detail fetch for an is_backfill match — no
+                # durable write landed, so nothing was foreclosed, but without
+                # registering a failure here nothing ever counts against
+                # _BACKFILL_MAX_ATTEMPTS either, and _first_sight_finished
+                # would keep re-firing (fetching detail again) every poll
+                # forever.
                 self._register_backfill_apply_failure(diff.match)
 
     def _apply(self, diff: MatchDiff) -> NormalizedMatch | None:
@@ -1182,9 +1176,9 @@ class CollectorEngine:
         self._backfill_apply_pending.clear()
         matches = self._provider.fetch_live_matches()
         slate_ids = {m.match_id for m in matches}
-        # Subset of ``slate_ids`` reporting a LIVE status THIS poll (round-3
-        # Codex review, finding #2). Narrower than ``slate_ids``: it exists
-        # only so :meth:`_seed_restart_backfill_trackers` can distinguish "a
+        # Subset of ``slate_ids`` reporting a LIVE status THIS poll. Narrower
+        # than ``slate_ids``: it exists only so
+        # :meth:`_seed_restart_backfill_trackers` can distinguish "a
         # sibling id is genuinely live right now" (must not seed, would wedge
         # a live row) from "a mapped id merely reappeared on the slate,
         # non-live" (must still seed — see that method's docstring for why
@@ -1207,9 +1201,9 @@ class CollectorEngine:
             # AFTER fetch_live_matches so a provider outage at startup does
             # not consume the one-shot scan on a slate we never saw.
             self._seed_restart_trackers(slate_ids)
-            # Sibling one-shot scan for the OTHER restart gap (post-merge
-            # Codex review round 2, finding #1): a terminal stored row whose
-            # backfill retry was tracked only in the process-local
+            # Sibling one-shot scan for the OTHER restart gap: a terminal
+            # stored row whose backfill retry was tracked only in the
+            # process-local
             # ``self._backfill`` dict. Gated on the kill switch — with
             # backfill disabled, ``is_backfill`` can never be True, so
             # seeding a tracker here would be inert bookkeeping only.
@@ -1217,11 +1211,10 @@ class CollectorEngine:
                 self._seed_restart_backfill_trackers(live_slate_ids)
             self._restart_scan_done = True
         hydrated: list[NormalizedMatch] = []
-        # Poll-scoped budget (post-merge Codex review round 2, finding #4):
-        # bounds how many ``is_backfill`` detail fetches THIS poll may issue
-        # — see ``_BACKFILL_MAX_FETCHES_PER_POLL``'s docstring for the
-        # rationale. A local, NOT an instance attribute: it must not survive
-        # past this poll.
+        # Poll-scoped budget: bounds how many ``is_backfill`` detail fetches
+        # THIS poll may issue — see ``_BACKFILL_MAX_FETCHES_PER_POLL``'s
+        # docstring for the rationale. A local, NOT an instance attribute: it
+        # must not survive past this poll.
         backfill_fetches_this_poll = 0
         for match in matches:
             if match.status in LIVE_STATUSES:
@@ -1256,9 +1249,8 @@ class CollectorEngine:
                 rows = self._stored_liveness_rows(match.match_id)
                 has_stored_row = bool(rows)
                 was_live = _rows_report_live(rows)
-            # Post-merge Codex review (findings #1-#4): ``has_stored_row``
-            # alone can no longer stand as "backfill already attempted" —
-            # several paths (a partial scoreboard snapshot persisted
+            # ``has_stored_row`` alone cannot stand as "backfill already
+            # attempted" — several paths (a partial scoreboard snapshot persisted
             # directly, a downstream ``_apply`` failure after ``seed_match``
             # already durably wrote the row, see ``_register_backfill_apply_failure``)
             # can durably write a ``matches`` row without ever completing full
@@ -1273,8 +1265,8 @@ class CollectorEngine:
             # may now mean "a partial/failed attempt already wrote
             # something" rather than "backfill fully completed". Uses
             # ``_is_terminal`` (mirroring ``_first_sight_finished``'s own
-            # term, post round-3-Codex-finding-#4 fix) rather than the wider
-            # ``status not in LIVE_STATUSES`` so a tracked match that flips to
+            # term) rather than the wider ``status not in LIVE_STATUSES`` so
+            # a tracked match that flips to
             # SCHEDULED/UNKNOWN does not force backfill routing either.
             # Gated additionally on ``not was_live`` so a pending-retry match
             # that reappears genuinely LIVE this poll still takes the
@@ -1283,8 +1275,8 @@ class CollectorEngine:
             # ``is_backfill``/``in_transition`` mutual exclusivity invariant
             # by construction.
             #
-            # Round-3 Codex review, finding #1: the status conjunct here is
-            # ``status not in LIVE_STATUSES`` — NOT ``_is_terminal`` (unlike
+            # The status conjunct here is ``status not in LIVE_STATUSES`` —
+            # NOT ``_is_terminal`` (unlike
             # ``_first_sight_finished``, whose OWN terminal-only conjunct is
             # unrelated and unchanged). This predicate's job is narrower than
             # first-sight detection: "keep an ALREADY-tracked match (an
@@ -1318,7 +1310,7 @@ class CollectorEngine:
                 was_live=was_live,
                 has_stored_row=has_stored_row,
             )
-            # Round-4 fix: an unpersistable backfill give-up drops its
+            # An unpersistable backfill give-up drops its
             # tracker AND enters a cooldown (:meth:`_emit_backfill_give_up`),
             # so on the very next poll ``pending_backfill_retry`` reads False
             # (tracker gone) and the ``first_sight``-driven half of
@@ -1344,9 +1336,8 @@ class CollectorEngine:
             is_backfill = self._backfill_finished_matches and (
                 (
                     first_sight
-                    # Caller-side gate (post-merge Codex review round 2,
-                    # finding #2), NOT folded into the pure predicate — its
-                    # own docstring already says it "deliberately excludes
+                    # Caller-side gate, NOT folded into the pure predicate —
+                    # its own docstring already says it "deliberately excludes
                     # any give-up/at-cap term... evaluated separately". An
                     # unpersistable backfill give-up (its OWN apply never
                     # durably lands) now pops the tracker AND enters a
@@ -1397,7 +1388,7 @@ class CollectorEngine:
                 self._emit_backfill_give_up(hydrated, match.match_id, backfill_tracker, fresh=match)
                 continue
             if is_backfill and backfill_fetches_this_poll >= _BACKFILL_MAX_FETCHES_PER_POLL:
-                # Finding #4: the per-poll fetch budget is exhausted. One
+                # The per-poll fetch budget is exhausted. One
                 # shared budget covers both candidate shapes:
                 if backfill_tracker is not None:
                     # Pending-retry candidate: DEFER without touching the
@@ -1410,8 +1401,8 @@ class CollectorEngine:
                 # a failed attempt) but do NOT append it to ``hydrated`` this
                 # poll. Appending the bare scoreboard snapshot here would
                 # durably write it via ``_apply``'s ``seed_match`` and
-                # reintroduce exactly the finding-#1-class permanent-block
-                # bug this branch exists to prevent (a durable row with no
+                # reintroduce exactly the permanent-block bug this branch
+                # exists to prevent (a durable row with no
                 # tracker, foreclosing retry forever). It becomes eligible
                 # again next poll via ``pending_backfill_retry``, budget
                 # permitting again.
@@ -1491,8 +1482,7 @@ class CollectorEngine:
             if is_backfill:
                 # The fetch succeeded, but the downstream diff/_apply in
                 # poll_once can still fail (an exception _apply itself does
-                # not reconcile, or seed_match returning None) — post-merge
-                # Codex review findings #2/#3. Mark this match so poll_once
+                # not reconcile, or seed_match returning None). Mark this match so poll_once
                 # can tell such a failure apart from an ordinary match's
                 # _apply failure and still register it against the backfill
                 # tracker (see _register_backfill_apply_failure), rather than
@@ -1541,8 +1531,8 @@ class CollectorEngine:
                 and merged.status not in LIVE_STATUSES
                 and not _is_terminal(merged.status)
             ):
-                # Round-3 Codex review, finding #1 (second half): the fetch
-                # succeeded but the detail is ALSO still inconclusive — both
+                # The fetch succeeded but the detail is ALSO still
+                # inconclusive — both
                 # the scoreboard and the detail report SCHEDULED/UNKNOWN, the
                 # provider itself has not resolved this match yet. Structurally
                 # mutually exclusive with the ``in_transition`` branch above
@@ -1562,7 +1552,7 @@ class CollectorEngine:
                 # does (:meth:`_register_backfill_apply_failure` is shared
                 # with that path).
                 #
-                # Round-4 fix: accrue ``merged`` (scoreboard+detail), not the
+                # Accrue ``merged`` (scoreboard+detail), not the
                 # bare ``match`` — a successful-but-inconclusive detail fetch
                 # supplies richer data than the scoreboard alone, and passing
                 # ``match`` here silently discarded it from the tracker's
@@ -1622,18 +1612,18 @@ class CollectorEngine:
         provider id — the scan WARNs and leaves it alone (same as pre-fix)
         rather than detail-fetching a non-provider id into a forced close.
 
-        SECOND, BACKFILL-SPECIFIC PASS (post-merge Codex review round 2,
-        finding #3): a match with an ACTIVE ``self._backfill`` tracker (its
+        SECOND, BACKFILL-SPECIFIC PASS: a match with an ACTIVE
+        ``self._backfill`` tracker (its
         first-sight-finished detail fetch failed at least once, retry
         pending) that then drops off the slate before its next poll is
         tracked the same way — off-slate and not cooling — but against
         ``self._backfill`` instead of ``self._last``/``self._transitions``,
         via the separate :meth:`_hydrate_vanished_backfill_matches` helper
         (own docstring has the details: base resolution, cap/give-up
-        handling, and — since round-3 Codex review finding #3 — how it now
-        shares THIS poll's remaining ``_BACKFILL_MAX_FETCHES_PER_POLL``
-        budget via ``remaining_backfill_budget`` rather than being
-        unbounded). The "Residual gap" paragraph above does not apply to it: this pass's ids
+        handling, and how it shares THIS poll's remaining
+        ``_BACKFILL_MAX_FETCHES_PER_POLL`` budget via
+        ``remaining_backfill_budget`` rather than being unbounded). The
+        "Residual gap" paragraph above does not apply to it: this pass's ids
         are already-resolved provider ids sitting in ``self._backfill``'s
         keys, not stored ids needing map resolution — that only matters for
         the restart scan (:meth:`_seed_restart_backfill_trackers`). CRITICAL
@@ -1719,7 +1709,7 @@ class CollectorEngine:
     def _hydrate_vanished_backfill_matches(
         self, slate_ids: set[str], *, remaining_backfill_budget: int
     ) -> list[NormalizedMatch]:
-        """Second vanished-match pass, keyed to ``self._backfill`` (finding #3).
+        """Second vanished-match pass, keyed to ``self._backfill``.
 
         Mirrors the transitions pass in :meth:`_hydrate_vanished_matches`'s
         shape but uses ONLY the backfill give-up/cap helpers
@@ -1730,7 +1720,7 @@ class CollectorEngine:
         file repeatedly documents.
 
         Tracked set: every ``self._backfill`` id off the current slate and
-        not cooling (the same give-up hot-loop guard, Fix 2, the transitions
+        not cooling (the same give-up hot-loop guard the transitions
         pass already applies via ``_cooling_down``). A cooling id is skipped
         here for the identical reason: a match whose give-up snapshot could
         not be durably applied is re-tracked only after its cooldown gate
@@ -1749,9 +1739,8 @@ class CollectorEngine:
         fetch-success comment in :meth:`_fetch_poll_snapshots` verbatim): the
         match id is marked in ``self._backfill_apply_pending`` so a
         downstream ``_apply`` failure in ``poll_once`` still registers
-        against this tracker (post-merge Codex review findings #2/#3) rather
-        than resetting the counter here and erasing that later failure's
-        contribution before it can count.
+        against this tracker rather than resetting the counter here and
+        erasing that later failure's contribution before it can count.
 
         Base resolution deliberately does NOT call :meth:`_transition_base`
         — that helper reads ``self._last`` then falls back to the STORED row
@@ -1769,20 +1758,17 @@ class CollectorEngine:
         candidates either — that gating is an ``in_transition``-only
         concept, and the two are mutually exclusive by construction).
 
-        NO LONGER UNBOUNDED (round-3 Codex review, finding #3 — corrects
-        this docstring's prior claim, which is no longer true and must not
-        be left contradicting the code): this pass now shares THIS poll's
+        BOUNDED: this pass shares THIS poll's
         REMAINING ``_BACKFILL_MAX_FETCHES_PER_POLL`` budget with the on-slate
         loop in :meth:`_fetch_poll_snapshots`, threaded in as
         ``remaining_backfill_budget`` (that budget minus
-        ``backfill_fetches_this_poll`` at the call site). The original
-        "structurally much smaller" reasoning broke once round-3 finding #2's
-        fix (:meth:`_seed_restart_backfill_trackers` now seeds regardless of
-        slate presence, only skipping a LIVE sibling) let a single restart
+        ``backfill_fetches_this_poll`` at the call site). This matters
+        because :meth:`_seed_restart_backfill_trackers` seeds regardless of
+        slate presence, only skipping a LIVE sibling — a single restart can
         seed MANY backfill trackers for historical incomplete rows in one
-        call — most immediately eligible for this pass in the very same
-        poll (off today's slate), reintroducing the unbounded-burst problem
-        the per-poll cap exists to prevent, just via this second path. Once
+        call, most immediately eligible for this pass in the very same
+        poll (off today's slate), so this pass must share the per-poll cap
+        rather than run unbounded. Once
         the local fetch count over this method's own loop reaches
         ``remaining_backfill_budget``, every subsequent id in ``sorted``
         order is ``continue``d without a fetch or a failure-count change —
@@ -1802,14 +1788,19 @@ class CollectorEngine:
         snapshots: list[NormalizedMatch] = []
         fetches_this_pass = 0
         for match_id in sorted(backfill_tracked):
+            tracker = self._backfill_tracker(match_id)
+            if _backfill_tracker_at_cap(tracker):
+                # An at-cap give-up costs no fetch — check this BEFORE the
+                # budget-exhaustion deferral (mirrors the on-slate loop's own
+                # ordering in ``_fetch_poll_snapshots``), so an already-
+                # exhausted off-slate tracker can still resolve even when
+                # this poll's on-slate loop already spent the whole budget.
+                self._emit_backfill_give_up(snapshots, match_id, tracker, fresh=None)
+                continue
             if fetches_this_pass >= remaining_backfill_budget:
                 # Budget exhausted: defer without touching the failure count
                 # (a deferral, not a failure) — retried next poll once this
                 # match is (still) off-slate and eligible again.
-                continue
-            tracker = self._backfill_tracker(match_id)
-            if _backfill_tracker_at_cap(tracker):
-                self._emit_backfill_give_up(snapshots, match_id, tracker, fresh=None)
                 continue
             try:
                 detail = self._provider.fetch_match_detail(match_id)
@@ -1854,7 +1845,7 @@ class CollectorEngine:
         still carries a ``fallback`` — the richest state accrued WHILE cooling,
         since no tracker existed then — the new tracker is SEEDED from it, so a
         rich terminal observation from the quiet window still closes the eventual
-        give-up (round-11 R2). Get-or-create is only reached OUTSIDE an active
+        give-up (the R2 carry-forward rule). Get-or-create is only reached OUTSIDE an active
         cooldown (the cooling branches accrue into the entry directly and never
         call this), so this cannot re-arm a still-suppressed give-up.
         """
@@ -1869,35 +1860,40 @@ class CollectorEngine:
     def _backfill_tracker(self, match_id: str) -> _TransitionTracker:
         """Get-or-create the backfill retry tracker for ``match_id``.
 
-        Unlike :meth:`_tracker`, never seeds from ``self._cooldowns``: a
-        backfill retry only ever enters a cooldown at give-up EXHAUSTION
-        (finding #2, see ``self._backfill``'s docstring in ``__init__`` and
-        :meth:`_emit_backfill_give_up`), and the caller-side
-        ``not self._cooling_down(...)`` gate on ``_first_sight_finished``
-        means a fresh get-or-create is never reached while still cooling —
-        so there is never a cooldown fallback to seed from here.
+        A backfill cooldown entered at give-up exhaustion (see
+        ``self._backfill``'s docstring in ``__init__`` and
+        :meth:`_emit_backfill_give_up`) lapses (``remaining`` hits 0) before
+        its ``_Cooldown`` entry is purged (:meth:`_age_cooldowns` only purges
+        an UNSEEN entry after a much longer window) — so a fresh
+        get-or-create here can land in that lapsed-but-unpurged window, same
+        as :meth:`_tracker`. Mirror :meth:`_tracker`'s seeding so a richer
+        partial-detail fallback accrued across prior failed attempts is not
+        silently discarded by a bare fresh tracker.
         """
         tracker = self._backfill.get(match_id)
         if tracker is None:
             tracker = self._backfill[match_id] = _TransitionTracker()
+            cooldown = self._cooldowns.get(match_id)
+            if cooldown is not None and cooldown.fallback is not None:
+                tracker.fallback = _accrue_fallback(tracker.fallback, cooldown.fallback)
         return tracker
 
     def _register_backfill_apply_failure(self, match: NormalizedMatch) -> _TransitionTracker:
         """Get-or-create ``match``'s backfill tracker and count one failure.
 
-        Shared by three call sites, all post-merge Codex review findings:
+        Shared by three call sites:
         a ``fetch_match_detail`` exception for an ``is_backfill`` match (the
-        original path), and — new — a downstream ``_apply`` failure in
-        ``poll_once`` for a match whose fetch this poll SUCCEEDED (an
-        exception ``_apply`` itself does not reconcile, finding #2, or
-        ``seed_match`` returning ``None``, finding #3). Both new cases would
-        otherwise never create/advance a tracker: ``self._backfill`` would
-        stay empty (finding #2's ``seed_match`` already durably wrote the row
-        this poll, permanently foreclosing ``_first_sight_finished`` next
+        original path), and two downstream-``_apply``-failure cases in
+        ``poll_once`` for a match whose fetch this poll SUCCEEDED: an
+        exception where ``_apply`` itself does not reconcile, or
+        ``seed_match`` returning ``None``. Both of those cases would
+        otherwise never create/advance a tracker: if ``seed_match`` already
+        durably wrote the row this poll, ``self._backfill`` would stay empty,
+        permanently foreclosing ``_first_sight_finished`` next
         poll with no tracker to keep ``is_backfill`` alive via
-        ``pending_backfill_retry``) or the retry would be unbounded (finding
-        #3: no row was seeded, so ``_first_sight_finished`` keeps re-firing
-        every poll with nothing counting against ``_BACKFILL_MAX_ATTEMPTS``).
+        ``pending_backfill_retry``; if no row was seeded, the retry would be
+        unbounded, since ``_first_sight_finished`` keeps re-firing
+        every poll with nothing counting against ``_BACKFILL_MAX_ATTEMPTS``.
         Registering the failure here, keyed by the same tracker/cap machinery
         the fetch-exception path already uses, closes both gaps: the next
         poll's pre-fetch at-cap check (or ``pending_backfill_retry``) takes
@@ -2214,24 +2210,18 @@ class CollectorEngine:
         :meth:`_abandon` directly: unlike the transition give-up, a backfill
         give-up landing durably IS permanent (``_first_sight_finished``'s
         ``has_stored_row`` term goes ``False`` → permanently foreclosed once
-        the row exists), so there is nothing to cooldown-space in that case.
-        It DOES preserve ``_abandon``'s emission-cap BOUND, but past
-        ``_MAX_GIVE_UP_EMISSIONS`` re-emissions whose apply never durably
-        landed (post-merge Codex review round 2, finding #2), the
-        ``self._backfill`` entry is dropped AND a cooldown is entered
-        (:meth:`_enter_cooldown`, mirroring :meth:`_abandon`'s own call):
-        when the give-up snapshot's OWN apply never lands (e.g. a
-        permanently unseedable identity — ``seed_match`` returns ``None``
-        every poll), the row never becomes durable, so
-        ``_first_sight_finished`` would otherwise re-fire from scratch on
+        the row exists), so a LANDED write needs no cooldown. But in either
+        branch below where the give-up's OWN apply cannot be relied on to
+        land — no snapshot could even be built, or every emission has been
+        exhausted without a durable write — the ``self._backfill`` entry is
+        dropped AND a cooldown is entered (:meth:`_enter_cooldown`, mirroring
+        :meth:`_abandon`'s own call), carrying the best-known state forward:
+        without it, ``_first_sight_finished`` would re-fire from scratch on
         the very next poll — a full fetch/give-up cycle hot-looping forever.
         The cooldown bounds that: detection is gated on ``not
         self._cooling_down(...)`` at the call site (see the ``is_backfill``
         computation in :meth:`_fetch_poll_snapshots`), so re-detection is
-        loud and bounded, but not truly permanent, once the cooldown lapses
-        — a DELIBERATE, more correct replacement for the "permanent-by-
-        design" framing this docstring used before finding #2: that framing
-        is only valid when the give-up snapshot's apply DOES durably land.
+        loud and bounded, but not truly permanent, once the cooldown lapses.
         This is pop path 2 of 2 (the other is
         :meth:`_resolve_backfill_tracker`, consume-side, on a durable apply
         landing).
@@ -2255,6 +2245,7 @@ class CollectorEngine:
                 tracker.consecutive_failures,
             )
             self._backfill.pop(match_id, None)
+            self._enter_cooldown(match_id, fallback=tracker.fallback)
             return
         tracker.give_up_emissions += 1
         if tracker.give_up_emissions > _MAX_GIVE_UP_EMISSIONS:
@@ -2268,7 +2259,7 @@ class CollectorEngine:
                 _MAX_GIVE_UP_EMISSIONS,
             )
             self._backfill.pop(match_id, None)
-            # Finding #2: an unpersistable give-up must not restart the full
+            # An unpersistable give-up must not restart the full
             # first-sight-finished cycle on the very next poll (the row never
             # became durable, so ``has_stored_row`` cannot foreclose
             # re-detection). Enter the same capped-exponential cooldown
@@ -2362,7 +2353,7 @@ class CollectorEngine:
         *,
         force_terminal: bool = True,
     ) -> NormalizedMatch:
-        """Round-11 give-up decision table: emit a monotonic, non-regressing close.
+        """Give-up decision table: emit a monotonic, non-regressing close.
 
         The single emission choke point (shared, per design, between the
         transition and backfill give-up paths — see :meth:`_emit_give_up` /
@@ -2421,8 +2412,14 @@ class CollectorEngine:
         score_home = _non_regressing_score(snap.score_home, stored_home)  # G1
         score_away = _non_regressing_score(snap.score_away, stored_away)  # G1
         if stored is not None and _is_terminal(stored.status):
-            if coerced:
-                status = stored.status  # G2: stored terminal kind wins over a coerced close
+            if coerced or not _is_terminal(snap.status):
+                # G2: a stored terminal status is never regressed to
+                # non-terminal — whether our own candidate was force-coerced
+                # (``coerced``) or is simply non-terminal on its own (e.g. a
+                # ``force_terminal=False`` backfill give-up whose candidate is
+                # still SCHEDULED/UNKNOWN); a genuinely terminal candidate
+                # still wins per G2's other half (this branch is not taken).
+                status = stored.status
             # G3: a null candidate clock (coerced, or a genuinely-terminal
             # candidate whose detail nulled it) fills from the stored terminal
             # row; a non-null candidate clock stands.
@@ -2516,7 +2513,7 @@ class CollectorEngine:
         "payload",
         "updated_at",
     )
-    # Narrow shape for the :meth:`_stored_status_is_live` hot path: no payload
+    # Narrow shape for the :meth:`_stored_liveness_rows` hot path: no payload
     # JSON blob, just what deciding + ordering needs.
     _STORED_LIVENESS_COLUMNS: tuple[str, ...] = ("status", "updated_at")
 
@@ -2530,7 +2527,7 @@ class CollectorEngine:
         source-qualified ``f"{source}:{id}"`` stub, and the canonical
         (reconciled) row reached through ``provider_match_map`` — and returns
         the single BEST row (``LIMIT 1``): both callers
-        (:meth:`_stored_match_snapshot`, :meth:`_stored_status_is_live`) read
+        (:meth:`_stored_match_snapshot`, :meth:`_stored_liveness_rows`) read
         only ``rows[0]``. The map join is skipped for ``default_seed_match``
         packs: that hook writes provider-native ids verbatim, so no
         ``provider_match_map`` entry can exist and the join would only cost a
@@ -2761,7 +2758,7 @@ class CollectorEngine:
         """One-time restart scan: seed backfill-retry trackers for incomplete rows.
 
         The sibling of :meth:`_seed_restart_trackers`, for the OTHER restart
-        gap (post-merge Codex review round 2, finding #1): a first-sight-
+        gap: a first-sight-
         finished match whose ``seed_match`` durably wrote the ``matches`` row
         (seed-before-child-write) while its detail-hydration retry was
         tracked only in the process-local ``self._backfill`` dict. A restart
@@ -2781,7 +2778,7 @@ class CollectorEngine:
 
         Reuses :meth:`_resolve_stored_provider_id` VERBATIM, but its SLATE
         guard is deliberately NARROWER than :meth:`_seed_restart_trackers`'s
-        sibling guard (round-3 Codex review, finding #2) — the caller passes
+        sibling guard — the caller passes
         ``live_slate_ids`` (only ids reporting a LIVE status THIS poll), not
         the full slate. ``_seed_restart_trackers``'s "skip if any mapped id
         is on the slate AT ALL" rationale is valid for the transitions scan:
@@ -2795,7 +2792,7 @@ class CollectorEngine:
         current slate, even still reporting the SAME terminal/non-live
         status, would fall straight into the generic direct-persist skip
         branch on this very first restart poll and permanently lose its
-        events, exactly like round-3 finding #1's bug. Narrowing to "skip
+        events. Narrowing to "skip
         only if a mapped id is on the slate reporting LIVE right now"
         preserves the genuine multi-provider safety concern
         :meth:`_resolve_stored_provider_id`'s docstring documents (a sibling
@@ -2820,7 +2817,7 @@ class CollectorEngine:
         ``seed_match``/``append_events`` no-op when there is nothing new to
         write.
 
-        ACCEPTED, KNOWN GAP (round-3 Codex review, finding #4 — do NOT
+        ACCEPTED, KNOWN GAP (do NOT
         "fix" this without a deliberate, separately-considered schema/payload
         change): this heuristic also cannot distinguish a genuinely
         interrupted backfill from a match that already went through
@@ -2832,7 +2829,7 @@ class CollectorEngine:
         distinguishing "interrupted" from "already gave up" (e.g. a new
         column or a new engine-reserved ``matches.payload`` key) — a
         larger, separately-considered change intentionally left out of scope
-        here. What bounds the harm instead: finding #3's shared per-poll
+        here. What bounds the harm instead: the shared per-poll
         fetch budget (threaded into :meth:`_hydrate_vanished_backfill_matches`
         too) means this redundant retry is now bounded per poll, not an
         unbounded burst — the practical cost is a bounded, occasional,

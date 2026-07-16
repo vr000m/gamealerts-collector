@@ -7467,6 +7467,140 @@ def test_vanished_backfill_match_is_retried_and_given_up_via_vanished_hydration(
     )
 
 
+def test_backfill_give_up_cannot_regress_stored_terminal_status_to_nonterminal(tmp_path):
+    """``_nonregress_over_stored`` must never regress a stored terminal status
+    to non-terminal — not only when its own candidate was force-coerced
+    (``coerced``), but whenever the candidate itself is non-terminal. A
+    backfill give-up always passes ``force_terminal=False``, so a
+    restart-seeded retry candidate that reads back SCHEDULED/UNKNOWN must not
+    overwrite an already-stored FINISHED row with that non-terminal status —
+    doing so would permanently regress terminal state and foreclose future
+    event hydration (a stored row forever forecloses re-detection)."""
+    from gamecollect.db.connection import connect
+    from gamecollect.engine import CollectorEngine
+
+    db = tmp_path / "engine.db"
+    conn = connect(str(db), side_table_ddl=FAKE_SIDE_TABLE_DDL)
+    try:
+        with conn:
+            _full_stored_row(
+                conn, "m1", status=MatchStatus.FINISHED, minute=90, score_home=2, score_away=1
+            )
+    finally:
+        conn.close()
+
+    provider = ScriptedDetailProvider([])
+    engine = CollectorEngine(
+        make_pack(provider, seed_match=default_seed_match), str(db), SOURCE, 0.01, provider=provider
+    )
+    # A non-terminal backfill give-up candidate (a restart-seeded retry
+    # against a SCHEDULED/UNKNOWN detail) over an already-stored FINISHED row.
+    candidate = nm("m1", (), status=MatchStatus.SCHEDULED, minute=None, score_home=None)
+    try:
+        emitted = engine._nonregress_over_stored("m1", candidate, force_terminal=False)
+    finally:
+        engine.close()
+
+    assert emitted.status is MatchStatus.FINISHED, (
+        "a stored terminal status must never be regressed to non-terminal by "
+        "a non-coerced, non-terminal give-up candidate"
+    )
+    assert emitted.score_home == 2 and emitted.score_away == 1, (
+        "the stored score must survive since the candidate carries no score"
+    )
+
+
+def test_backfill_give_up_with_no_known_state_enters_cooldown(tmp_path):
+    """When a backfill give-up cannot build ANY snapshot (no baseline,
+    fallback, or stored row known — ``_build_give_up_snapshot`` returns
+    ``None``), the tracker must still be dropped into a cooldown, mirroring
+    the emission-cap-exceeded branch and ``_abandon``. Without this, a
+    first-sight-finished match with nothing to persist would have its tracker
+    dropped with no cooldown; since ``has_stored_row`` stays ``False``,
+    detection could re-fire on the very next poll and hot-loop the identical
+    fetch/fail/give-up cycle forever."""
+    from gamecollect.engine import _BACKFILL_MAX_ATTEMPTS, CollectorEngine, _TransitionTracker
+
+    db = tmp_path / "engine.db"
+    provider = ScriptedDetailProvider([])
+    engine = CollectorEngine(make_pack(provider), str(db), SOURCE, 0.01, provider=provider)
+    tracker = _TransitionTracker(fallback=None, consecutive_failures=_BACKFILL_MAX_ATTEMPTS)
+    engine._backfill["m1"] = tracker
+    out: list = []
+    try:
+        # No baseline (self._last empty), no fallback, no fresh snapshot, and
+        # no stored row: _build_give_up_snapshot has nothing to work with.
+        engine._emit_backfill_give_up(out, "m1", tracker, fresh=None)
+    finally:
+        engine.close()
+
+    assert out == [], "nothing could be built, so nothing is queued for persistence"
+    assert "m1" not in engine._backfill, "the tracker must not be leaked"
+    assert "m1" in engine._cooldowns, (
+        "an unpersistable give-up must still enter a cooldown so detection "
+        "cannot hot-loop the fetch/fail/give-up cycle every poll"
+    )
+
+
+def test_lapsed_backfill_cooldown_seeds_fallback_into_fresh_tracker(tmp_path):
+    """A lapsed-but-unpurged backfill cooldown entry's ``fallback`` must be
+    seeded into a fresh ``self._backfill`` tracker on the next get-or-create,
+    mirroring ``_tracker``'s seeding for the transitions path — otherwise
+    richer partial-detail fallback data accrued across prior failed attempts
+    is silently discarded when detection re-fires after the cooldown lapses."""
+    from gamecollect.engine import CollectorEngine, _Cooldown
+
+    db = tmp_path / "engine.db"
+    provider = ScriptedDetailProvider([])
+    engine = CollectorEngine(make_pack(provider), str(db), SOURCE, 0.01, provider=provider)
+    carried = nm("m1", (), status=MatchStatus.FINISHED, score_home=2, score_away=1)
+    # Lapsed (remaining == 0) but not yet purged by _age_cooldowns.
+    engine._cooldowns["m1"] = _Cooldown(remaining=0, epoch=1, fallback=carried)
+    try:
+        tracker = engine._backfill_tracker("m1")
+    finally:
+        engine.close()
+
+    assert tracker.fallback is not None, (
+        "a fresh backfill tracker must be seeded from a lapsed cooldown's "
+        "fallback, not created bare"
+    )
+    assert tracker.fallback.score_home == 2 and tracker.fallback.score_away == 1
+
+
+def test_at_cap_offslate_backfill_tracker_gives_up_despite_exhausted_fetch_budget(tmp_path):
+    """The at-cap check in ``_hydrate_vanished_backfill_matches`` must run
+    BEFORE the per-poll fetch-budget check: an at-cap tracker's give-up
+    emission costs zero fetches, so an already-exhausted off-slate tracker
+    must still resolve even when this poll's on-slate loop already consumed
+    the entire shared backfill fetch budget — otherwise it can never resolve
+    as long as the slate stays busy every poll."""
+    from gamecollect.engine import _BACKFILL_MAX_ATTEMPTS, CollectorEngine, _TransitionTracker
+
+    db = tmp_path / "engine.db"
+    provider = ScriptedDetailProvider([])
+    engine = CollectorEngine(make_pack(provider), str(db), SOURCE, 0.01, provider=provider)
+    fallback = nm("m1", (), status=MatchStatus.FINISHED, score_home=1, score_away=0)
+    engine._backfill["m1"] = _TransitionTracker(
+        fallback=fallback, consecutive_failures=_BACKFILL_MAX_ATTEMPTS
+    )
+    try:
+        # Budget fully exhausted this poll (0 remaining) and "m1" is off-slate.
+        snapshots = engine._hydrate_vanished_backfill_matches(set(), remaining_backfill_budget=0)
+    finally:
+        engine.close()
+
+    assert provider.detail_calls == [], "an at-cap tracker's give-up costs no fetch"
+    assert len(snapshots) == 1 and snapshots[0].match_id == "m1", (
+        "the at-cap give-up must still be emitted even with zero fetch budget "
+        "remaining, not deferred until the slate frees up"
+    )
+    assert engine._backfill["m1"].give_up_pending, (
+        "the give-up snapshot must be queued for a durable apply — the "
+        "tracker itself is popped only once that apply lands"
+    )
+
+
 def test_vanished_backfill_match_never_touches_transitions_tracker(tmp_path):
     """Guards the ``is_backfill``/``in_transition`` mutual-exclusivity
     invariant this file repeatedly documents: the new vanished-match
