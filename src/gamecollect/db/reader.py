@@ -42,6 +42,10 @@ __all__ = [
     "get_standings",
     "get_entity",
     "find_entities_by_name",
+    "get_side_table_row",
+    "get_side_table_rows",
+    "get_team_side_table_rows",
+    "get_recent_commentary",
 ]
 
 
@@ -222,3 +226,83 @@ def find_entities_by_name(
         f"SELECT * FROM entities WHERE {' AND '.join(clauses)} ORDER BY source, entity_id",
         params,
     )
+
+
+# ---------------------------------------------------------------------------
+# Generic side-table reads (table-name-parameterized helpers backing
+# pack-owned read adapters, e.g. gamecollect_football's MatchReadPort
+# adapter). Table/column names are supplied by the caller — core stays
+# sport-agnostic; only the calling pack module knows its own table names.
+# ---------------------------------------------------------------------------
+
+
+def get_side_table_row(
+    conn: sqlite3.Connection, table: str, source: str, match_id: str
+) -> dict[str, Any] | None:
+    """Return one ``(source, match_id)``-keyed row from a pack's side table.
+
+    For per-match, single-row side tables (e.g. a venue table). Returns None
+    for an unrecorded match rather than raising.
+    """
+    rows = _query(
+        conn,
+        f"SELECT * FROM {table} WHERE source = ? AND match_id = ?",  # noqa: S608
+        (source, match_id),
+    )
+    return rows[0] if rows else None
+
+
+def get_side_table_rows(
+    conn: sqlite3.Connection,
+    table: str,
+    source: str,
+    match_id: str,
+    *,
+    order_by: str | None = None,
+) -> list[dict[str, Any]]:
+    """Return all ``(source, match_id)``-keyed rows from a pack's side table.
+
+    For per-match, multi-row side tables (e.g. a lineup table). Empty list
+    for an unrecorded match rather than raising.
+    """
+    sql = f"SELECT * FROM {table} WHERE source = ? AND match_id = ?"  # noqa: S608
+    if order_by:
+        sql += f" ORDER BY {order_by}"
+    return _query(conn, sql, (source, match_id))
+
+
+def get_team_side_table_rows(
+    conn: sqlite3.Connection, table: str, team: str, *, order_by: str | None = None
+) -> list[dict[str, Any]]:
+    """Return all ``team``-keyed rows from a pack's side table.
+
+    For team-level (not per-match) side tables (e.g. a static squad roster).
+    Empty list when the team has no recorded rows.
+    """
+    sql = f"SELECT * FROM {table} WHERE team = ?"  # noqa: S608
+    if order_by:
+        sql += f" ORDER BY {order_by}"
+    return _query(conn, sql, (team,))
+
+
+def get_recent_commentary(
+    conn: sqlite3.Connection, match_id: str, limit: int = 20
+) -> list[dict[str, Any]]:
+    """Return the most recent ``commentary`` rows for ``match_id``, newest first.
+
+    The collector never writes commentary (DESIGN.md §3) — the table is
+    created lazily by the consuming app on its own scoped connection, so a
+    collector-first boot / pre-match / replay may have no such table yet.
+    Tolerated here: returns ``[]`` instead of letting
+    ``sqlite3.OperationalError`` escape.
+    """
+    try:
+        return _query(
+            conn,
+            "SELECT * FROM commentary WHERE match_id = ? ORDER BY created_at DESC, id DESC LIMIT ?",
+            (match_id, limit),
+        )
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc):
+            return []
+        raise
