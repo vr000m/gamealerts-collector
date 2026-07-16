@@ -237,6 +237,14 @@ def build_parser(registry: Registry) -> argparse.ArgumentParser:
         default=None,
         help="Write a replayable fixture of the session here (file or directory).",
     )
+    collect.add_argument(
+        "--no-finished-backfill",
+        action="store_true",
+        help=(
+            "Disable one-time event backfill for a match first seen already "
+            "FINISHED (default: enabled)."
+        ),
+    )
 
     tools = subs.add_parser(
         "tools",
@@ -338,7 +346,14 @@ def _run_collect(
         except PackError as exc:
             print(f"error: pack {args.pack!r} failed to load: {exc}", file=sys.stderr)
             return 2
-    engine = engine_factory(pack, args.db, args.source, provider=provider, record_path=args.record)
+    engine = engine_factory(
+        pack,
+        args.db,
+        args.source,
+        provider=provider,
+        record_path=args.record,
+        backfill_finished_matches=not args.no_finished_backfill,
+    )
     try:
         (runner or _default_runner)(engine)
     finally:

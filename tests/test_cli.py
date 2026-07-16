@@ -644,8 +644,17 @@ def test_collect_reuses_registry_loaded_pack_without_double_load(tmp_path, monke
 
     built: list[_FakeEngine] = []
 
-    def engine_factory(pack, db_path, source, *, provider, record_path):  # noqa: A002
-        engine = _FakeEngine(pack, db_path, source, provider=provider, record_path=record_path)
+    def engine_factory(
+        pack, db_path, source, *, provider, record_path, backfill_finished_matches=True
+    ):  # noqa: A002
+        engine = _FakeEngine(
+            pack,
+            db_path,
+            source,
+            provider=provider,
+            record_path=record_path,
+            backfill_finished_matches=backfill_finished_matches,
+        )
         built.append(engine)
         return engine
 
@@ -681,12 +690,22 @@ class _FakeProvider:
 class _FakeEngine:
     """Records the args the CLI constructs it with and its lifecycle calls."""
 
-    def __init__(self, pack: Any, db: Any, source: Any, *, provider: Any, record_path: Any) -> None:
+    def __init__(
+        self,
+        pack: Any,
+        db: Any,
+        source: Any,
+        *,
+        provider: Any,
+        record_path: Any,
+        backfill_finished_matches: bool = True,
+    ) -> None:
         self.pack = pack
         self.db = db
         self.source = source
         self.provider = provider
         self.record_path = record_path
+        self.backfill_finished_matches = backfill_finished_matches
         self.closed = False
         self.poll_count = 0
 
@@ -714,8 +733,17 @@ def test_collect_wires_pack_provider_engine_and_runs_one_poll(tmp_path):
         loaded.append(name)
         return sentinel_pack
 
-    def engine_factory(pack, db_path, source, *, provider, record_path):  # noqa: A002
-        engine = _FakeEngine(pack, db_path, source, provider=provider, record_path=record_path)
+    def engine_factory(
+        pack, db_path, source, *, provider, record_path, backfill_finished_matches=True
+    ):  # noqa: A002
+        engine = _FakeEngine(
+            pack,
+            db_path,
+            source,
+            provider=provider,
+            record_path=record_path,
+            backfill_finished_matches=backfill_finished_matches,
+        )
         built.append(engine)
         return engine
 
@@ -753,6 +781,96 @@ def test_collect_wires_pack_provider_engine_and_runs_one_poll(tmp_path):
     assert engine.poll_count == 1, "the one-shot runner must poll exactly once"
     assert provider.polls == 1, "the single poll must reach the fake provider"
     assert engine.closed, "collect must close the engine after the runner returns"
+    assert engine.backfill_finished_matches is True, (
+        "absent --no-finished-backfill, the engine must be constructed with "
+        "backfill_finished_matches=True"
+    )
+
+
+def test_collect_no_finished_backfill_flag_constructs_engine_with_backfill_disabled(tmp_path):
+    """``gamecollect collect --no-finished-backfill`` must construct the
+    engine with ``backfill_finished_matches=False`` — the Phase 1 kill
+    switch, shipped alongside the constructor flag it wires into, not
+    deferred to a later phase."""
+    db = tmp_path / "collect.db"
+    provider = _FakeProvider()
+    built: list[_FakeEngine] = []
+
+    def engine_factory(
+        pack, db_path, source, *, provider, record_path, backfill_finished_matches=True
+    ):  # noqa: A002
+        engine = _FakeEngine(
+            pack,
+            db_path,
+            source,
+            provider=provider,
+            record_path=record_path,
+            backfill_finished_matches=backfill_finished_matches,
+        )
+        built.append(engine)
+        return engine
+
+    rc = cli.main(
+        [
+            "collect",
+            "--pack",
+            PACK_NAME,
+            "--db",
+            str(db),
+            "--source",
+            "test-src",
+            "--no-finished-backfill",
+        ],
+        registry=_registry(),
+        provider=provider,
+        engine_factory=engine_factory,
+        runner=lambda engine: engine.poll_once(),
+        pack_loader=lambda name: object(),
+    )
+
+    assert rc == 0
+    assert len(built) == 1
+    assert built[0].backfill_finished_matches is False, (
+        "--no-finished-backfill must construct the engine with backfill_finished_matches=False"
+    )
+
+
+def test_collect_absent_no_finished_backfill_flag_defaults_engine_backfill_to_true(tmp_path):
+    """Absence of ``--no-finished-backfill`` must default the engine's
+    ``backfill_finished_matches`` to ``True`` — the feature ships ON by
+    default from the moment Phase 1 lands."""
+    db = tmp_path / "collect.db"
+    provider = _FakeProvider()
+    built: list[_FakeEngine] = []
+
+    def engine_factory(
+        pack, db_path, source, *, provider, record_path, backfill_finished_matches=True
+    ):  # noqa: A002
+        engine = _FakeEngine(
+            pack,
+            db_path,
+            source,
+            provider=provider,
+            record_path=record_path,
+            backfill_finished_matches=backfill_finished_matches,
+        )
+        built.append(engine)
+        return engine
+
+    rc = cli.main(
+        ["collect", "--pack", PACK_NAME, "--db", str(db), "--source", "test-src"],
+        registry=_registry(),
+        provider=provider,
+        engine_factory=engine_factory,
+        runner=lambda engine: engine.poll_once(),
+        pack_loader=lambda name: object(),
+    )
+
+    assert rc == 0
+    assert len(built) == 1
+    assert built[0].backfill_finished_matches is True, (
+        "absent --no-finished-backfill, the engine must default to backfill_finished_matches=True"
+    )
 
 
 def test_collect_closes_engine_even_when_runner_raises(tmp_path):
@@ -761,8 +879,17 @@ def test_collect_closes_engine_even_when_runner_raises(tmp_path):
     db = tmp_path / "collect.db"
     built: list[_FakeEngine] = []
 
-    def engine_factory(pack, db_path, source, *, provider, record_path):  # noqa: A002
-        engine = _FakeEngine(pack, db_path, source, provider=provider, record_path=record_path)
+    def engine_factory(
+        pack, db_path, source, *, provider, record_path, backfill_finished_matches=True
+    ):  # noqa: A002
+        engine = _FakeEngine(
+            pack,
+            db_path,
+            source,
+            provider=provider,
+            record_path=record_path,
+            backfill_finished_matches=backfill_finished_matches,
+        )
         built.append(engine)
         return engine
 
