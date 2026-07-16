@@ -202,6 +202,15 @@ def get_latest_event_of_type(
     populated, ``ANALYZE``'d table. The per-type subquery form lets each seek
     use the composite index directly; the outer query then picks the overall
     max-``seq`` row among the (at most ``len(types)``) candidates.
+
+    Honest trade-off: this wins big when the caller must scan far back (many
+    events since the last marker of interest — the common case during an
+    active, ongoing match), but is slightly slower than a plain
+    ``type IN (...)`` scan in the steady-state case where the marker is
+    already near the tail (e.g. every poll once ``full_time`` has fired),
+    since it always issues ``len(types)`` index seeks regardless of how close
+    the answer is. Not an unqualified win — do not assume it dominates both
+    cases.
     """
     types = tuple(types)
     if not types:

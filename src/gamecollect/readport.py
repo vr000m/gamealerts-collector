@@ -61,6 +61,12 @@ class MatchReadPort(Protocol):
         ...], "extra": {...}}``. ``extra`` carries adapter/sport-specific
         additions (e.g. a knockout ``result_type``) that do not belong in the
         generic shape.
+
+        Note on ``phase`` here vs. on an event (see ``events_for_match``):
+        an adapter MAY fall back to a lowercased ``status`` string when no
+        phase-marker event has fired yet (e.g. pre-kickoff) — that fallback
+        value is not itself a phase-marker type, even though it shares the
+        ``phase`` field name with the event shape's stricter meaning.
         """
         ...
 
