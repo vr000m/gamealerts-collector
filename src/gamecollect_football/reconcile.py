@@ -586,8 +586,10 @@ def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
 
 
 # Pack-owned side tables keyed by match_id that must follow a stub row when it
-# is adopted onto a late-appearing canonical schedule row.
-_MIGRATABLE_SIDE_TABLES = ("football_stats", "football_lineups")
+# is adopted onto a late-appearing canonical schedule row. football_roster is
+# deliberately excluded — it is team-keyed (PRIMARY KEY (team, number)), not
+# match-keyed, so it has no per-match row to migrate.
+_MIGRATABLE_SIDE_TABLES = ("football_stats", "football_lineups", "football_venue")
 
 
 def _adopt_stub_rows(

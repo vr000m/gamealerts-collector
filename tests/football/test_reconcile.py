@@ -725,6 +725,56 @@ class TestStubAdoption:
         finally:
             conn.close()
 
+    def test_football_venue_row_follows_the_stub(self, tmp_path):
+        """Adversarial-review finding: football_venue was absent from
+        _MIGRATABLE_SIDE_TABLES, so adoption left a canonical match with no
+        venue (readers see None) while the venue row stayed orphaned on the
+        deleted stub id. Mirrors test_football_side_table_rows_follow_the_stub
+        for the venue table."""
+        from gamecollect_football.pack import FOOTBALL_SIDE_TABLE_DDL
+
+        conn = connect(tmp_path / "adopt_venue.db", side_table_ddl=FOOTBALL_SIDE_TABLE_DDL)
+        try:
+            writer = PartitionWriter(conn, SOURCE_A)
+            assert seed_or_reconcile_match(conn, writer, _match(), PROVIDER) == self.STUB
+            with conn:
+                conn.execute(
+                    "INSERT INTO football_venue (source, match_id, stadium, city) "
+                    "VALUES (?, ?, ?, ?)",
+                    (SOURCE_A, self.STUB, "Estadio Azteca", "Mexico City"),
+                )
+                # A foreign partition's row keyed to the same stub-looking id
+                # must NOT be touched (partition discipline).
+                conn.execute(
+                    "INSERT INTO football_venue (source, match_id, stadium, city) "
+                    "VALUES (?, ?, ?, ?)",
+                    (SOURCE_B, self.STUB, "NRG Stadium", "Houston"),
+                )
+            self._seed_schedule_row(writer)
+            assert seed_or_reconcile_match(conn, writer, _match(), PROVIDER) == self.CANONICAL
+
+            canonical_venue = conn.execute(
+                "SELECT stadium, city FROM football_venue WHERE source = ? AND match_id = ?",
+                (SOURCE_A, self.CANONICAL),
+            ).fetchone()
+            assert tuple(canonical_venue) == ("Estadio Azteca", "Mexico City"), (
+                "the canonical match must be immediately venue-visible after adoption"
+            )
+            (stub_remaining,) = conn.execute(
+                "SELECT COUNT(*) FROM football_venue WHERE source = ? AND match_id = ?",
+                (SOURCE_A, self.STUB),
+            ).fetchone()
+            assert stub_remaining == 0, "no venue row may remain orphaned on the deleted stub"
+            foreign_partition_venue = conn.execute(
+                "SELECT stadium, city FROM football_venue WHERE source = ? AND match_id = ?",
+                (SOURCE_B, self.STUB),
+            ).fetchone()
+            assert tuple(foreign_partition_venue) == ("NRG Stadium", "Houston"), (
+                "a foreign partition's venue row must survive untouched"
+            )
+        finally:
+            conn.close()
+
     def test_stub_with_no_events_still_migrates_and_dedupes_rows(self, db):
         """A stub with no events (state-only strip row) is trivially adopted:
         mappings move, the stub matches row is deleted, one row remains."""
