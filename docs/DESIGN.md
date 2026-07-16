@@ -156,7 +156,7 @@ list on a scoreboard-only snapshot, so a genuinely first-sight `FINISHED`
 match whose bare board already carries some events still triggers the full
 detail fetch — treating a partial list as "nothing to do" would persist it
 directly and permanently foreclose hydration via the stored-row check.
-This is current-slate-bounded by construction (ESPN's default (no-`dates`)
+This is same-slate-bounded by construction (ESPN's default (no-`dates`)
 scoreboard response only ever holds the current slate, verified live against
 `fifa.world`, so a match that finished on a prior slate has already rolled
 off the board and is out of scope for this backfill) AND by an explicit
@@ -171,15 +171,18 @@ budget is deferred (no fetch, no failure recorded) and retried on a
 subsequent poll once budget is available again. A failed detail fetch is
 retried on subsequent polls up to a pinned cap, `_BACKFILL_MAX_ATTEMPTS = 3`
 (`gamecollect.engine`); once exhausted, the collector gives up and persists
-the scoreboard-only snapshot (final score retained). Give-up permanence is
-conditional, not absolute: an ORDINARY give-up whose snapshot durably lands
-is permanent (no further retries for that match — the stored row forecloses
-re-detection). If the give-up snapshot's OWN apply repeatedly fails to land
-durably (e.g. an unseedable identity), the tracker is instead dropped into a
-bounded, exponentially-spaced cooldown after `_MAX_GIVE_UP_EMISSIONS`
-re-emissions, and detection resumes once that cooldown lapses — bounding
-what would otherwise be a fetch/give-up hot loop, rather than looping
-forever or going permanently silent. The behavior defaults on and can be
+the best-known snapshot (the scoreboard merged with any partial fallback
+detail accrued across the failed attempts, never a bare scoreboard-only
+snapshot). Give-up permanence is conditional, not absolute: an ORDINARY
+give-up whose snapshot durably lands is permanent (no further retries for
+that match — the stored row forecloses re-detection). If the give-up
+snapshot's OWN apply cannot be relied on to land durably — no snapshot could
+even be built (no baseline, fallback, or stored row is known), or it
+repeatedly fails to land after `_MAX_GIVE_UP_EMISSIONS` re-emissions — the
+tracker is instead dropped into a bounded, exponentially-spaced cooldown,
+and detection resumes once that cooldown lapses — bounding what would
+otherwise be a fetch/give-up hot loop, rather than looping forever or going
+permanently silent. The behavior defaults on and can be
 disabled with `collect --no-finished-backfill`
 (`backfill_finished_matches=False` on `CollectorEngine`).
 
