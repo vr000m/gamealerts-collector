@@ -91,9 +91,10 @@ tournament (e.g. Champions League) should be ~configuration on that pack.
 
 ## 6. Interfaces
 
-- **Client library** (canonical): the four **core** ops `list_matches`,
-  `get_state`, `get_events_since`, `get_standings` (plus historical lookups,
-  later) live in `gamecollect.client`. Sync, typed returns. Packs contribute
+- **Client library** (canonical): the five **core** ops `list_matches`,
+  `get_state`, `get_events_since`, `get_standings`, `get_vocabulary` (plus
+  historical lookups, later) live in `gamecollect.client`. Sync, typed
+  returns. Packs contribute
   further read ops over their side tables — football adds `get_squad` and
   `get_player_stats`, implemented in `gamecollect_football` — so core never
   imports a pack module.
