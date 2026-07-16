@@ -28,6 +28,7 @@ __all__ = [
     "PlayerStats",
     "get_squad",
     "get_player_stats",
+    "resolve_source",
     "SQUAD_OPERATION",
     "PLAYER_STATS_OPERATION",
     "FOOTBALL_OPERATIONS",
@@ -52,7 +53,7 @@ def _rows(conn: sqlite3.Connection, sql: str, params: tuple[Any, ...]) -> list[d
     return [dict(zip(names, row, strict=True)) for row in cursor.fetchall()]
 
 
-def _resolve_source(conn: sqlite3.Connection, match_id: str) -> str | None:
+def resolve_source(conn: sqlite3.Connection, match_id: str) -> str | None:
     """Return the partition ``source`` that owns ``match_id``, or ``None``."""
     state = reader.get_state(conn, match_id)
     return state["source"] if state is not None else None
@@ -138,7 +139,7 @@ def get_squad(
     Resolves the partition ``source`` from the ``matches`` row; returns an
     empty list for an unknown match or a match with no lineups recorded.
     """
-    source = _resolve_source(conn, match_id)
+    source = resolve_source(conn, match_id)
     if source is None:
         return []
     sql = "SELECT * FROM football_lineups WHERE source = ? AND match_id = ?"
@@ -158,7 +159,7 @@ def get_player_stats(
     Resolves the partition ``source`` from the ``matches`` row; returns an
     empty list for an unknown match or a match with no stats recorded.
     """
-    source = _resolve_source(conn, match_id)
+    source = resolve_source(conn, match_id)
     if source is None:
         return []
     sql = "SELECT * FROM football_stats WHERE source = ? AND match_id = ?"
