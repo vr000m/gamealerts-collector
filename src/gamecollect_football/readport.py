@@ -23,6 +23,7 @@ from typing import Any
 from gamecollect.db import reader
 from gamecollect.fold import fold
 from gamecollect_football.operations import resolve_source
+from gamecollect_football.reconcile import canonical_team_name
 
 __all__ = ["FootballReadPort"]
 
@@ -86,9 +87,15 @@ class FootballReadPort:
     def _project_event(self, row: dict[str, Any]) -> dict[str, Any]:
         payload = reader.decode_payload(row.get("payload"))
         event_type = row["type"]
-        player = (
-            payload.get("scorer") if event_type in _GOAL_FAMILY_TYPES else payload.get("player")
-        )
+        if event_type in _GOAL_FAMILY_TYPES:
+            # Rows written before the goal-event participant-contract rename
+            # (docs/dev_plans/20260710-feature-goal-event-participants.md)
+            # stored the scorer under "player" instead of "scorer". Mirror
+            # gamecollect.client._normalize_legacy_payload's fallback so
+            # historical rows still surface a scorer name here.
+            player = payload.get("scorer") or payload.get("player")
+        else:
+            player = payload.get("player")
         return {
             "seq": row["seq"],
             "minute": row.get("minute"),
@@ -118,7 +125,14 @@ class FootballReadPort:
             order_by="team, formation_place IS NULL, formation_place, athlete_id",
         )
         if participant is not None:
-            rows = [r for r in rows if r.get("team") == participant]
+            # Compare through canonical_team_name (fold + alias) rather than
+            # exact string equality: rows written before write-side team-name
+            # canonicalization (or by legacy code) can carry a raw provider
+            # name (e.g. "Türkiye") while ``participant`` is always the
+            # canonical name (e.g. "Turkey") from latest_state(). An exact
+            # match would silently drop legacy rows.
+            target = canonical_team_name(participant)
+            rows = [r for r in rows if canonical_team_name(r.get("team") or "") == target]
         return rows
 
     def _project_lineup(self, row: dict[str, Any]) -> dict[str, Any]:

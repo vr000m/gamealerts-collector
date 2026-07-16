@@ -30,6 +30,7 @@ from _football_helpers import KNOCKOUT_FIXTURES, replay_fixture
 from gamecollect.db.connection import connect
 from gamecollect.db.writer import PartitionWriter
 from gamecollect_football.pack import FOOTBALL_SIDE_TABLE_DDL, persist_football_side_tables
+from gamecollect_football.readport import FootballReadPort
 
 SOURCE = "wc2026"
 
@@ -329,3 +330,113 @@ class TestMissingVenueAndRoster:
         else:
             result = getattr(adapter, name)(fx["match_id"], match.home_team)
         assert result is None or result == {} or result == []
+
+
+class TestLegacyRowCanonicalization:
+    """Regression: rows written before write-side team-name canonicalization
+    (or by legacy code) can carry a raw provider name (e.g. "Türkiye") in
+    football_lineups.team, while ``participant`` passed to the adapter is
+    always the canonical display name (e.g. "Turkey") from latest_state().
+    An exact-string filter in ``_lineup_rows`` would silently drop these rows;
+    the fix compares through ``canonical_team_name`` on both sides."""
+
+    MATCH_ID = "760421"
+
+    def test_lineup_for_match_matches_legacy_raw_team_name(self, db):
+        writer = PartitionWriter(db, SOURCE)
+        writer.upsert_match(
+            {
+                "match_id": self.MATCH_ID,
+                "source": SOURCE,
+                "status": "IN_PLAY",
+                "kickoff_utc": "2026-06-14T04:00:00+00:00",
+                "score_home": 1,
+                "score_away": 0,
+                "display_clock": "27'",
+                "payload": {"home_team": "Turkey", "away_team": "Australia"},
+            }
+        )
+        with db:
+            # Legacy/raw provider spelling stored directly, never passed
+            # through canonical_display_name at write time.
+            db.execute(
+                "INSERT INTO football_lineups "
+                "(source, match_id, team, athlete_id, display_name, name_folded, starter) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (SOURCE, self.MATCH_ID, "Türkiye", "tur-1", "Legacy Starter", "legacy starter", 1),
+            )
+        db.commit()
+
+        adapter = FootballReadPort(db)
+        # Query with the canonical participant name, as latest_state() would
+        # supply it.
+        rows = adapter.lineup_for_match(self.MATCH_ID, participant="Turkey")
+        assert [r["player"] for r in rows] == ["Legacy Starter"]
+
+    def test_lineup_team_announced_matches_legacy_raw_team_name(self, db):
+        writer = PartitionWriter(db, SOURCE)
+        writer.upsert_match(
+            {
+                "match_id": self.MATCH_ID,
+                "source": SOURCE,
+                "status": "IN_PLAY",
+                "kickoff_utc": "2026-06-14T04:00:00+00:00",
+                "score_home": 1,
+                "score_away": 0,
+                "display_clock": "27'",
+                "payload": {"home_team": "Turkey", "away_team": "Australia"},
+            }
+        )
+        with db:
+            db.execute(
+                "INSERT INTO football_lineups "
+                "(source, match_id, team, athlete_id, display_name, name_folded, starter) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (SOURCE, self.MATCH_ID, "Türkiye", "tur-1", "Legacy Starter", "legacy starter", 1),
+            )
+        db.commit()
+
+        adapter = FootballReadPort(db)
+        assert adapter.lineup_team_announced(self.MATCH_ID, "Turkey") is True
+
+
+class TestLegacyGoalScorerFallback:
+    """Regression: existing databases can contain goal/own_goal event rows
+    written before the scorer-field rename, using payload.player instead of
+    payload.scorer (see gamecollect.client._normalize_legacy_payload for the
+    same fallback on the core read path). The adapter must still surface the
+    scorer name for these legacy-shaped rows."""
+
+    MATCH_ID = "760421"
+
+    def test_project_event_falls_back_to_legacy_player_key(self, db):
+        writer = PartitionWriter(db, SOURCE)
+        writer.upsert_match(
+            {
+                "match_id": self.MATCH_ID,
+                "source": SOURCE,
+                "status": "IN_PLAY",
+                "kickoff_utc": "2026-06-14T04:00:00+00:00",
+                "score_home": 1,
+                "score_away": 0,
+                "display_clock": "27'",
+                "payload": {"home_team": "Turkey", "away_team": "Australia"},
+            }
+        )
+        writer.append_events(
+            self.MATCH_ID,
+            [
+                {
+                    "seq": 0,
+                    "type": "goal",
+                    "minute": 27,
+                    # Legacy shape: scorer under "player", not "scorer".
+                    "payload": {"team": "Turkey", "player": "Legacy Scorer"},
+                }
+            ],
+        )
+        db.commit()
+
+        adapter = FootballReadPort(db)
+        events = adapter.events_for_match(self.MATCH_ID)
+        assert [e["player"] for e in events] == ["Legacy Scorer"]
