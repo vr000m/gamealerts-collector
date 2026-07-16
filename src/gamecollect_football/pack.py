@@ -9,11 +9,14 @@ altered by a pack.
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import re
 import sqlite3
 from decimal import Decimal
+from functools import lru_cache
+from pathlib import Path
 
 from gamecollect.db import reader
 from gamecollect.db.writer import PartitionWriter
@@ -22,7 +25,11 @@ from gamecollect.packs.spec import SportPack
 from gamecollect.provider import NormalizedMatch
 from gamecollect_football.espn import ESPNAdapter
 from gamecollect_football.operations import FOOTBALL_OPERATIONS
-from gamecollect_football.reconcile import seed_or_reconcile_match
+from gamecollect_football.reconcile import (
+    canonical_display_name,
+    canonical_team_name,
+    seed_or_reconcile_match,
+)
 from gamecollect_football.taxonomy import TAXONOMY
 
 __all__ = ["FOOTBALL_SIDE_TABLE_DDL", "pack", "persist_football_side_tables"]
@@ -72,6 +79,33 @@ FOOTBALL_SIDE_TABLE_DDL: tuple[str, ...] = (
     );
     CREATE INDEX IF NOT EXISTS idx_football_lineups_folded
         ON football_lineups (source, name_folded);
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS football_venue (
+        source          TEXT NOT NULL,
+        match_id        TEXT NOT NULL,   -- soft ref -> matches.match_id
+        stadium         TEXT,
+        city            TEXT,
+        PRIMARY KEY (source, match_id)
+    );
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS football_roster (
+        -- Team-level squad data (static tournament fixture, NOT per-match) —
+        -- deliberately unscoped by `source`/`match_id`: one canonical roster
+        -- per team serves every match/source that team appears in.
+        team            TEXT NOT NULL,   -- canonical display name (see reconcile.py)
+        fifa_code       TEXT,
+        group_name      TEXT,
+        number          INTEGER NOT NULL,
+        position        TEXT,
+        player_name     TEXT NOT NULL,
+        name_folded     TEXT,            -- fold(player_name), for folded lookups
+        date_of_birth   TEXT,
+        PRIMARY KEY (team, number)
+    );
+    CREATE INDEX IF NOT EXISTS idx_football_roster_folded
+        ON football_roster (name_folded);
     """,
 )
 
@@ -200,6 +234,10 @@ _LINEUP_COLUMNS = (
     "jersey, position, starter, subbed_in, subbed_out, "
     "formation_place, home_away, formation"
 )
+_VENUE_COLUMNS = "source, match_id, stadium, city"
+_ROSTER_COLUMNS = (
+    "team, fifa_code, group_name, number, position, player_name, name_folded, date_of_birth"
+)
 
 
 def _stats_rows(
@@ -313,6 +351,113 @@ def _lineup_rows(
     return rows
 
 
+def _venue_rows(
+    source: str, seeded_match_id: str, stadium: object, city: object
+) -> dict[tuple[str, str], tuple]:
+    """Project a payload's ``stadium``/``city`` onto a single football_venue row.
+
+    Returns an empty dict when both are missing — the caller only invokes
+    :func:`_replace_if_changed` when there is something to persist, so a poll
+    that carries no venue data at all leaves any already-stored row alone."""
+    stadium_text = _to_text(stadium)
+    city_text = _to_text(city)
+    if stadium_text is None and city_text is None:
+        return {}
+    return {(source, seeded_match_id): (source, seeded_match_id, stadium_text, city_text)}
+
+
+@lru_cache(maxsize=1)
+def _load_squads_fixture() -> tuple[dict, ...]:
+    """Load the static WC2026 squads fixture (team-level rosters).
+
+    There is no ESPN team-squad fetch — the ESPN ``rosters[]`` block is
+    per-match and already becomes ``football_lineups``. This is the only
+    source for team-level squad data. Cached (the fixture never changes at
+    runtime) and never raises: a missing/malformed fixture must not crash the
+    per-poll side-table hook, mirroring the payload-coercion posture above."""
+    fixture_path = Path(__file__).parent / "fixtures" / "worldcup.squads.json"
+    try:
+        with fixture_path.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        log.warning("football_roster: could not load squads fixture %s", fixture_path)
+        return ()
+    if not isinstance(data, list):
+        return ()
+    return tuple(squad for squad in data if isinstance(squad, dict) and squad.get("name"))
+
+
+@lru_cache(maxsize=1)
+def _squads_by_canonical_name() -> dict[str, dict]:
+    """Index the squads fixture by :func:`canonical_team_name` for team lookup."""
+    return {canonical_team_name(squad["name"]): squad for squad in _load_squads_fixture()}
+
+
+_WARNED_ROSTER_TEAMS: set[str] = set()
+
+
+def _warn_roster_unmatched_once(team_name: str) -> None:
+    if team_name in _WARNED_ROSTER_TEAMS:
+        return
+    if len(_WARNED_ROSTER_TEAMS) >= 128:
+        _WARNED_ROSTER_TEAMS.clear()
+    _WARNED_ROSTER_TEAMS.add(team_name)
+    log.warning("football_roster: no squad fixture entry for team %r", team_name)
+
+
+def _roster_rows_for_team(team_name: str) -> dict[tuple[str, int], tuple]:
+    """Project the squad fixture's players for ``team_name`` onto row tuples.
+
+    ``team_name`` is a live provider team name (e.g. ESPN ``displayName``);
+    matched against the fixture via :func:`canonical_team_name` so alias
+    spellings (``Türkiye``/``Turkey``) still resolve. Returns an empty dict
+    when the team has no fixture entry (warns once) or has no valid players."""
+    squad = _squads_by_canonical_name().get(canonical_team_name(team_name))
+    if squad is None:
+        _warn_roster_unmatched_once(team_name)
+        return {}
+    team = canonical_display_name(squad["name"])
+    fifa_code = _to_text(squad.get("fifa_code"))
+    group_name = _to_text(squad.get("group"))
+    rows: dict[tuple[str, int], tuple] = {}
+    for player in squad.get("players") or []:
+        if not isinstance(player, dict):
+            continue
+        number = _to_int(player.get("number"))
+        name = _to_text(player.get("name"))
+        if number is None or not name:
+            continue
+        rows[(team, number)] = (
+            team,
+            fifa_code,
+            group_name,
+            number,
+            _to_text(player.get("pos")),
+            name,
+            fold(name),
+            _to_text(player.get("date_of_birth")),
+        )
+    return rows
+
+
+def _persist_roster_for_team(conn: sqlite3.Connection, team_name: str | None) -> None:
+    """Idempotently persist ``team_name``'s squad rows (static data, insert-once).
+
+    Unlike stats/lineups/venue, roster rows never change poll-to-poll — an
+    ``INSERT OR IGNORE`` on the ``(team, number)`` PRIMARY KEY is sufficient
+    and cheaper than a diff-and-replace."""
+    if not team_name:
+        return
+    rows = _roster_rows_for_team(team_name)
+    if not rows:
+        return
+    placeholders = ", ".join("?" for _ in _ROSTER_COLUMNS.split(","))
+    conn.executemany(
+        f"INSERT OR IGNORE INTO football_roster ({_ROSTER_COLUMNS}) VALUES ({placeholders})",  # noqa: S608
+        list(rows.values()),
+    )
+
+
 def _replace_if_changed(
     conn: sqlite3.Connection,
     table: str,
@@ -365,11 +510,13 @@ def persist_football_side_tables(
     when it actually changed."""
     payload = dict(match.payload or {})
     stored_payload = reader.get_stored_payload(conn, seeded_match_id)
-    for key in ("stats", "lineups"):
+    for key in ("stats", "lineups", "stadium", "city"):
         if key in stored_payload:
             payload[key] = stored_payload[key]
     stats = payload.get("stats")
     lineups = payload.get("lineups")
+    stadium = payload.get("stadium")
+    city = payload.get("city")
 
     with conn:
         if isinstance(stats, list):
@@ -390,6 +537,17 @@ def persist_football_side_tables(
                 seeded_match_id,
                 _lineup_rows(writer.source, seeded_match_id, lineups),
             )
+        if stadium is not None or city is not None:
+            _replace_if_changed(
+                conn,
+                "football_venue",
+                _VENUE_COLUMNS,
+                writer.source,
+                seeded_match_id,
+                _venue_rows(writer.source, seeded_match_id, stadium, city),
+            )
+        _persist_roster_for_team(conn, match.home_team)
+        _persist_roster_for_team(conn, match.away_team)
 
 
 def pack() -> SportPack:
