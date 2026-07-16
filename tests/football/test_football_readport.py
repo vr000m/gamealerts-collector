@@ -400,6 +400,39 @@ class TestLegacyRowCanonicalization:
         assert adapter.lineup_team_announced(self.MATCH_ID, "Turkey") is True
 
 
+class TestRosterAliasCanonicalization:
+    """Regression: football_roster.team is ALWAYS written through
+    canonical_display_name (pack.py's _persist_roster_for_team writes the
+    squad fixture's canonical name, never a raw provider spelling), but
+    _roster_rows previously passed a caller's ``participant`` argument
+    straight into an exact-match query with no canonicalization. A caller
+    supplying a raw provider alias (e.g. "Türkiye" instead of the stored
+    "Turkey") would silently get no rows back from roster_for_team/
+    roster_contains — this pins that the read path canonicalizes the query
+    argument the same way the write path canonicalized what it stored."""
+
+    def _seed_roster_row(self, db):
+        with db:
+            db.execute(
+                "INSERT INTO football_roster "
+                "(team, fifa_code, group_name, number, position, player_name, "
+                "name_folded, date_of_birth) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                ("Turkey", "TUR", "A", 10, "MF", "Roster Player", "roster player", None),
+            )
+        db.commit()
+
+    def test_roster_for_team_matches_raw_provider_alias(self, db):
+        self._seed_roster_row(db)
+        adapter = FootballReadPort(db)
+        result = adapter.roster_for_team("Türkiye")
+        assert [r["player"] for r in result] == ["Roster Player"]
+
+    def test_roster_contains_matches_raw_provider_alias(self, db):
+        self._seed_roster_row(db)
+        adapter = FootballReadPort(db)
+        assert adapter.roster_contains("Türkiye", "Roster Player") is True
+
+
 class TestLegacyGoalScorerFallback:
     """Regression: existing databases can contain goal/own_goal event rows
     written before the scorer-field rename, using payload.player instead of

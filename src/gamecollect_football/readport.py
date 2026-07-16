@@ -23,7 +23,7 @@ from typing import Any
 from gamecollect.db import reader
 from gamecollect.fold import fold
 from gamecollect_football.operations import resolve_source
-from gamecollect_football.reconcile import canonical_team_name
+from gamecollect_football.reconcile import canonical_display_name, canonical_team_name
 
 __all__ = ["FootballReadPort"]
 
@@ -177,8 +177,17 @@ class FootballReadPort:
         return {"stadium": row.get("stadium"), "city": row.get("city")}
 
     def _roster_rows(self, participant: str) -> list[dict[str, Any]]:
+        # football_roster.team is always written through canonical_display_name
+        # (pack.py's _persist_roster_for_team), so a raw provider alias (e.g.
+        # "Türkiye") passed in here must be canonicalized the same way before
+        # the exact-match query. Round 1 fixed this exact bug class for
+        # _lineup_rows but missed this sibling method, silently dropping rows
+        # for a caller using an alias name.
         return reader.get_team_side_table_rows(
-            self._conn, "football_roster", participant, order_by="number"
+            self._conn,
+            "football_roster",
+            canonical_display_name(participant),
+            order_by="number",
         )
 
     def roster_for_team(self, participant: str) -> list[dict[str, Any]]:
