@@ -989,7 +989,11 @@ class ESPNAdapter(MatchDataProvider):
         # gameInfo.venue is the summary's venue block (same shape as the
         # scoreboard's competition.venue) — present whenever ESPN has fixture
         # metadata for the match, independent of live/header state.
-        stadium, city = _extract_venue(data.get("gameInfo", {}).get("venue"))
+        # data.get("gameInfo", {}) returns the default only when the key is
+        # ABSENT; when the key is present with an explicit JSON null, .get
+        # returns None, and `None.get("venue")` would raise AttributeError.
+        # `or {}` normalizes both the absent-key and explicit-null cases.
+        stadium, city = _extract_venue((data.get("gameInfo") or {}).get("venue"))
 
         # Try to get status from header competitions
         header = data.get("header", {})
