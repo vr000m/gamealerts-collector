@@ -189,17 +189,33 @@ def get_latest_event_of_type(
     call. ``types`` is expected to be a small, caller-controlled set of
     literal type strings (not user input), so it is passed as bound
     parameters (safe) rather than interpolated.
+
+    Issues one bounded per-type subquery (each an ``idx_events_match_type_seq
+    (match_id, type, seq)`` index SEEK on ``match_id = ? AND type = ?``,
+    touching only that type's own rows) unioned together, rather than a
+    single ``type IN (...)`` predicate: SQLite's planner cannot satisfy
+    ``ORDER BY seq DESC`` across an IN-list from that composite index (the
+    per-type row groups are not globally seq-ordered without a merge step),
+    so a single-query ``IN (...)`` plan falls back to the OLD
+    ``idx_events_match_seq (match_id, seq)`` full per-match scan this index
+    was added to avoid — confirmed via ``EXPLAIN QUERY PLAN`` against a
+    populated, ``ANALYZE``'d table. The per-type subquery form lets each seek
+    use the composite index directly; the outer query then picks the overall
+    max-``seq`` row among the (at most ``len(types)``) candidates.
     """
     types = tuple(types)
     if not types:
         return None
-    placeholders = ",".join("?" for _ in types)
-    rows = _query(
-        conn,
-        f"SELECT * FROM events WHERE match_id = ? AND type IN ({placeholders}) "
-        "ORDER BY seq DESC LIMIT 1",
-        (match_id, *types),
+    subquery = (
+        "SELECT * FROM (SELECT * FROM events WHERE match_id = ? AND type = ? "
+        "ORDER BY seq DESC LIMIT 1)"
     )
+    params: list[Any] = []
+    for t in types:
+        params.extend((match_id, t))
+    union = " UNION ALL ".join([subquery] * len(types))
+    sql = f"SELECT * FROM ({union}) ORDER BY seq DESC LIMIT 1"
+    rows = _query(conn, sql, params)
     return rows[0] if rows else None
 
 

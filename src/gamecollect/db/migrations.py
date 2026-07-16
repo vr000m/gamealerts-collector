@@ -37,15 +37,29 @@ from pathlib import Path
 # (tests/test_migrations.py asserts fresh-vs-migrated schema parity).
 # Bump MAJOR only for breaking changes (not in-place upgradable).
 SCHEMA_MAJOR = 1
-SCHEMA_MINOR = 0
+SCHEMA_MINOR = 1
 
 _SCHEMA_PATH = Path(__file__).parent / "schema.sql"
 
 Migration = Callable[[sqlite3.Connection], None]
 
+
+def _add_events_match_type_seq_index(conn: sqlite3.Connection) -> None:
+    """v1.1: covering index for get_latest_event_of_type's phase-marker query.
+
+    Additive + idempotent (``CREATE INDEX IF NOT EXISTS``) — the same DDL is
+    folded into schema.sql's ``events`` table block so fresh and migrated
+    databases converge (see test_migrations.py's fresh-vs-migrated parity
+    test)."""
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_events_match_type_seq ON events (match_id, type, seq)"
+    )
+
+
 # Ordered additive migrations, keyed by the (major, minor) they produce.
-# Empty at v1.0 — the first minor bump adds its entry here.
-MIGRATIONS: dict[tuple[int, int], Migration] = {}
+MIGRATIONS: dict[tuple[int, int], Migration] = {
+    (1, 1): _add_events_match_type_seq_index,
+}
 
 
 class SchemaVersionError(RuntimeError):

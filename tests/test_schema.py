@@ -296,3 +296,52 @@ def test_folded_lookup_uses_index_without_source_or_kind(tmp_path):
         assert "idx_entities_folded" in plan, f"name-only lookup not indexed: {plan}"
     finally:
         conn.close()
+
+
+def test_latest_event_of_type_query_uses_covering_index(tmp_path):
+    """idx_events_match_type_seq (schema v1.1) must serve
+    get_latest_event_of_type's actual query shape — a per-type subquery
+    (``WHERE match_id = ? AND type = ? ORDER BY seq DESC LIMIT 1``) unioned
+    across the caller's types, NOT a single ``type IN (...)`` predicate.
+
+    A single ``IN (...)`` form was tried first but confirmed (via this same
+    EXPLAIN QUERY PLAN check, against a populated + ANALYZE'd table) to make
+    SQLite's planner fall back to the OLD (match_id, seq) index and scan
+    every event row for the match — it cannot satisfy ORDER BY seq DESC
+    across an IN-list from the composite index without an extra merge step.
+    Each per-type subquery, by contrast, seeks the composite index directly
+    on an equality (match_id, type) prefix."""
+    from gamecollect.db import reader
+    from gamecollect.db.connection import connect
+
+    conn = connect(tmp_path / "idx_events.db")
+    try:
+        types = ("kickoff", "half_time", "full_time")
+        subquery = (
+            "SELECT * FROM (SELECT * FROM events WHERE match_id = ? AND type = ? "
+            "ORDER BY seq DESC LIMIT 1)"
+        )
+        union = " UNION ALL ".join([subquery] * len(types))
+        sql = f"SELECT * FROM ({union}) ORDER BY seq DESC LIMIT 1"
+        params = []
+        for t in types:
+            params.extend(("m1", t))
+        plan = " ".join(row[3] for row in conn.execute("EXPLAIN QUERY PLAN " + sql, params))
+        assert plan.count("idx_events_match_type_seq") == len(types), (
+            f"expected one per-type index seek: {plan}"
+        )
+        assert "idx_events_match_seq" not in plan, f"fell back to the old scan-only index: {plan}"
+
+        # Also pin that reader.get_latest_event_of_type itself issues this
+        # exact query shape, not some other equivalent-looking form.
+        statements: list[str] = []
+        conn.set_trace_callback(statements.append)
+        try:
+            reader.get_latest_event_of_type(conn, "m1", types)
+        finally:
+            conn.set_trace_callback(None)
+        assert any("UNION ALL" in s for s in statements), (
+            f"get_latest_event_of_type did not issue the per-type UNION ALL query: {statements}"
+        )
+    finally:
+        conn.close()

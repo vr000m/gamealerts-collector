@@ -79,6 +79,13 @@ CREATE TABLE IF NOT EXISTS events (
 
 CREATE INDEX IF NOT EXISTS idx_events_match_seq ON events (match_id, seq);
 
+-- Covers get_latest_event_of_type's "last phase-marker event for a match"
+-- query (WHERE match_id = ? AND type IN (...) ORDER BY seq DESC LIMIT 1) —
+-- without it, only (match_id, seq) is indexed, so SQLite still walks every
+-- event row for the match (in seq-DESC order) checking `type` until it finds
+-- a rare marker (kickoff/half_time/full_time). Schema v1.1 (see migrations.py).
+CREATE INDEX IF NOT EXISTS idx_events_match_type_seq ON events (match_id, type, seq);
+
 -- ---------------------------------------------------------------------------
 -- Entities  (kind-discriminated: team | player | driver | ...)
 -- Replaces gamealerts' football `rosters`/team tables. `name_folded` is
