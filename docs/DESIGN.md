@@ -14,7 +14,13 @@ gamealerts is being restructured into planes; this project is the **data plane**
   (own LLM, tools, in-memory context; two-phase commentary: instant template
   line, then LLM enrichment from full context). Workers poll this project's
   client library (`get_events_since(match_id, seq)` every ~2–3 s) and make
-  on-demand lookups (squad, standings, historical stats).
+  on-demand lookups (squad, standings, historical stats). Cross-process, the
+  worker also consumes this project through the shared-file integration: a
+  generic, sport-agnostic `MatchReadPort` Protocol (`gamecollect.readport`)
+  over one collector-owned SQLite file both processes open, plus a
+  `vocabulary` op exposing the pack manifest as the worker's sport-vocabulary
+  source — see [docs/integration/gameworker-contract.md](integration/gameworker-contract.md)
+  for the full contract.
 - **Voice plane (gamealerts)**: a main pipecat agent owning mic/PTT/STT/TTS,
   question routing, speech arbitration (priority queue), and worker lifecycle.
   It never touches game data.

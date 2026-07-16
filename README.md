@@ -122,6 +122,13 @@ collector core library     owns the schema (versioned), writer discipline,
 Deliberately **no LLM and no prose** in this project: the collector is a pure data
 plane. Commentary, alerts, and voice live in consuming applications.
 
+Consuming apps that share a machine (the gamealerts GameWorker, in
+particular) can also open the collector's SQLite file directly: a generic
+`MatchReadPort` read Protocol, a `data_dir`/admission-lock convention for
+opening the same file, and a `vocabulary` op exposing pack taxonomy for
+data-driven rendering. See
+[docs/integration/gameworker-contract.md](docs/integration/gameworker-contract.md).
+
 ## Why a CLI (and library) rather than an MCP server
 
 - A CLI is hot-evolvable: new subcommands are visible on the next invocation —
