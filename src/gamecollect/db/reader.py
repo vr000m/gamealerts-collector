@@ -22,6 +22,7 @@ typed views belong to the client library layered on top (interfaces plan).
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import urllib.parse
 from pathlib import Path
@@ -235,6 +236,23 @@ def find_entities_by_name(
 # sport-agnostic; only the calling pack module knows its own table names.
 # ---------------------------------------------------------------------------
 
+_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _assert_identifier_shaped(table: str) -> None:
+    """Cheap defense-in-depth for the ``table`` params below.
+
+    These are exported, generic core helpers that f-string-interpolate a
+    caller-supplied table name into SQL (``# noqa: S608``). Every current
+    caller passes a hardcoded literal, so this is unreachable today, but the
+    functions are public API inviting future misuse. This is NOT a full
+    allowlist against ``sqlite_master`` (that would add a query per call) --
+    just a shape check that rejects anything that couldn't possibly be a bare
+    SQL identifier (e.g. containing ``;``, whitespace, or quotes).
+    """
+    if not _IDENTIFIER_RE.match(table):
+        raise ValueError(f"table must be a bare SQL identifier, got {table!r}")
+
 
 def get_side_table_row(
     conn: sqlite3.Connection, table: str, source: str, match_id: str
@@ -244,6 +262,7 @@ def get_side_table_row(
     For per-match, single-row side tables (e.g. a venue table). Returns None
     for an unrecorded match rather than raising.
     """
+    _assert_identifier_shaped(table)
     rows = _query(
         conn,
         f"SELECT * FROM {table} WHERE source = ? AND match_id = ?",  # noqa: S608
@@ -265,6 +284,7 @@ def get_side_table_rows(
     For per-match, multi-row side tables (e.g. a lineup table). Empty list
     for an unrecorded match rather than raising.
     """
+    _assert_identifier_shaped(table)
     sql = f"SELECT * FROM {table} WHERE source = ? AND match_id = ?"  # noqa: S608
     if order_by:
         sql += f" ORDER BY {order_by}"
@@ -279,6 +299,7 @@ def get_team_side_table_rows(
     For team-level (not per-match) side tables (e.g. a static squad roster).
     Empty list when the team has no recorded rows.
     """
+    _assert_identifier_shaped(table)
     sql = f"SELECT * FROM {table} WHERE team = ?"  # noqa: S608
     if order_by:
         sql += f" ORDER BY {order_by}"

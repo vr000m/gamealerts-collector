@@ -242,3 +242,29 @@ class TestGetRecentCommentaryToleranceBoundary:
 
         with pytest.raises(sqlite3.OperationalError):
             reader.get_recent_commentary(conn, MATCH_ID)
+
+
+class TestSideTableHelpersRejectNonIdentifierTable:
+    """get_side_table_row/get_side_table_rows/get_team_side_table_rows
+    f-string-interpolate a caller-supplied ``table`` name into SQL (currently
+    unreachable -- every caller passes a hardcoded literal -- but they are
+    exported, generic core API). Defense-in-depth: reject anything that isn't
+    shaped like a bare SQL identifier before it reaches the query."""
+
+    @pytest.mark.parametrize("garbage_table", ["foo; DROP TABLE matches", "foo bar", ""])
+    def test_get_side_table_row_rejects_garbage_table(self, collector_db, garbage_table):
+        _path, conn = collector_db
+        with pytest.raises(ValueError):
+            reader.get_side_table_row(conn, garbage_table, SOURCE, MATCH_ID)
+
+    @pytest.mark.parametrize("garbage_table", ["foo; DROP TABLE matches", "foo bar", ""])
+    def test_get_side_table_rows_rejects_garbage_table(self, collector_db, garbage_table):
+        _path, conn = collector_db
+        with pytest.raises(ValueError):
+            reader.get_side_table_rows(conn, garbage_table, SOURCE, MATCH_ID)
+
+    @pytest.mark.parametrize("garbage_table", ["foo; DROP TABLE matches", "foo bar", ""])
+    def test_get_team_side_table_rows_rejects_garbage_table(self, collector_db, garbage_table):
+        _path, conn = collector_db
+        with pytest.raises(ValueError):
+            reader.get_team_side_table_rows(conn, garbage_table, "Australia")
