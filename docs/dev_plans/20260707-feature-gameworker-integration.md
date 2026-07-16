@@ -210,7 +210,11 @@ _(EXCLUSIVE on the admission lock is reserved for a destructive reset; SHARED wr
 
 ## Progress
 
-- (not started)
+- [x] Phase 1: Shared-store access model — data_dir resolver + admission lock (`10ac069`)
+- [x] Phase 2: Durable rich data for the read surface — venue + roster (`bb42bf7`)
+- [x] Phase 3: Generic read Protocol + collector-backed adapter (`6cdc00d`)
+- [x] Phase 4: Pack-manifest vocabulary operation (`5a43eeb`)
+- [x] Phase 5: Integration validation, docs, cross-repo contract (`5af0fcd`)
 
 ## Findings
 
@@ -231,8 +235,23 @@ _(EXCLUSIVE on the admission lock is reserved for a destructive reset; SHARED wr
 
 ## Issues & Solutions
 
-- (none yet)
+- **Cross-directory test imports broke outside full-suite collection order.** Two subagent-authored test files (`tests/test_readport_contract.py` in Phase 3, `tests/test_vocabulary_op.py` in Phase 4) imported helpers from sibling test files/directories without proper path setup (`tests.test_cli` treated as a package that doesn't exist; `tests/football/_football_helpers` imported cross-directory without a `sys.path` addition). Both passed when run as part of the full suite (collection-order side effects) but failed standalone. Fixed with the repo's existing same-directory-import convention (`from test_cli import ...`) and an explicit `sys.path.insert` for the one genuinely cross-directory case, then verified both standalone and combined.
+- **Adding the `vocabulary` op broke 5 pre-existing tests hardcoding the exact 4-core-op set.** A legitimate blast-radius hit from Phase 4, not a workaround target — fixed by updating each assertion (4 in `tests/test_cli.py`, 1 renamed+updated in `tests/test_client.py`) to include `vocabulary`.
+- **Phase 5's integration test caught a real event-payload seeding bug.** The Phase 5 test-writer's fixture-seeding helper stamped every event's participant name under the generic `player` payload key, but the real write path (`gamecollect.engine._event_to_row`/`_participant_key`) stamps goal-family events (`goal`/`own_goal`) under `scorer` instead — a distinction `FootballReadPort` relies on when reading events back. Earlier phases' simplified test helpers (Phase 3's `seeded_db` fixture) never asserted a specific scorer name, so the gap was invisible until Phase 5's end-to-end "who scored" assertion. Fixed by seeding through the real `_event_to_row` instead of a hand-rolled re-derivation.
+- A `phase4-tests` subagent run hit a mid-response API connection error but had already written complete, correct files before crashing; verified and used them directly rather than respawning.
 
 ## Final Results
 
-- (pending)
+All 5 phases implemented, tested, and committed on `feature/gameworker-integration` (off `main`, base `8dcd647`):
+
+| Phase | Commit | Summary |
+|---|---|---|
+| 1 | `10ac069` | `gamecollect.db.paths`/`locking`: `data_dir` resolution + SHARED/EXCLUSIVE admission lock mirroring gamealerts' convention |
+| 2 | `bb42bf7` | `football_venue`/`football_roster` side tables; `worldcup.squads.json` loader wired per-poll |
+| 3 | `6cdc00d` | `gamecollect.readport.MatchReadPort` (generic Protocol) + `gamecollect_football.readport.FootballReadPort` (concrete adapter) |
+| 4 | `5a43eeb` | `vocabulary` core op: pack taxonomy/prompt_fragments/display_metadata/compaction_boundaries, `pack`-param-selected |
+| 5 | `5af0fcd` | `docs/integration/gameworker-contract.md`; DESIGN.md/README updated; end-to-end shared-file integration test |
+
+Full suite: 623 passed, 3 skipped (one is a discovery-test artifact confirmed working manually — Phase 2's roster loader is a private per-poll hook, not a separately-callable public function). Both `ruff check` and `ruff format --check` clean throughout.
+
+The gamealerts-side work (7 Integration Seams in `docs/integration/gameworker-contract.md` §5) is out of scope for this repo and tracked as a companion dev plan in the gamealerts repo.
