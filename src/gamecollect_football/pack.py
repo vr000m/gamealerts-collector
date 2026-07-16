@@ -26,6 +26,7 @@ from gamecollect.provider import NormalizedMatch
 from gamecollect_football.espn import ESPNAdapter
 from gamecollect_football.operations import FOOTBALL_OPERATIONS
 from gamecollect_football.reconcile import (
+    FOOTBALL_SIDE_TABLE_DDL,
     canonical_display_name,
     canonical_team_name,
     seed_or_reconcile_match,
@@ -36,78 +37,14 @@ __all__ = ["FOOTBALL_SIDE_TABLE_DDL", "pack", "persist_football_side_tables"]
 
 log = logging.getLogger(__name__)
 
-# Pack-owned side tables (typed homes for the football-specific shapes the
-# adapter carries in NormalizedMatch.payload: boxscore stats and lineups).
-# Additive + idempotent (CREATE TABLE IF NOT EXISTS); soft refs mirror the
-# core posture — no FOREIGN KEY constraints in v1. `name_folded` on lineups
-# preserves the fold-based player lookup gamealerts depends on (stamped with
-# gamecollect.fold.fold by whoever writes the row).
-FOOTBALL_SIDE_TABLE_DDL: tuple[str, ...] = (
-    """
-    CREATE TABLE IF NOT EXISTS football_stats (
-        source          TEXT NOT NULL,
-        match_id        TEXT NOT NULL,   -- soft ref -> matches.match_id
-        team            TEXT NOT NULL,   -- team display name (boxscore key)
-        possession      REAL,
-        shots           INTEGER,
-        shots_on_target INTEGER,
-        corners         INTEGER,
-        fouls           INTEGER,
-        yellow_cards    INTEGER,
-        red_cards       INTEGER,
-        offsides        INTEGER,
-        PRIMARY KEY (source, match_id, team)
-    );
-    """,
-    """
-    CREATE TABLE IF NOT EXISTS football_lineups (
-        source          TEXT NOT NULL,
-        match_id        TEXT NOT NULL,   -- soft ref -> matches.match_id
-        team            TEXT NOT NULL,   -- team display name
-        athlete_id      TEXT NOT NULL,   -- ESPN athlete id
-        display_name    TEXT NOT NULL,
-        name_folded     TEXT,            -- fold(display_name), for folded lookups
-        jersey          TEXT,
-        position        TEXT,
-        starter         INTEGER NOT NULL DEFAULT 0,
-        subbed_in       INTEGER NOT NULL DEFAULT 0,
-        subbed_out      INTEGER NOT NULL DEFAULT 0,
-        formation_place INTEGER,
-        home_away       TEXT,
-        formation       TEXT,
-        PRIMARY KEY (source, match_id, team, athlete_id)
-    );
-    CREATE INDEX IF NOT EXISTS idx_football_lineups_folded
-        ON football_lineups (source, name_folded);
-    """,
-    """
-    CREATE TABLE IF NOT EXISTS football_venue (
-        source          TEXT NOT NULL,
-        match_id        TEXT NOT NULL,   -- soft ref -> matches.match_id
-        stadium         TEXT,
-        city            TEXT,
-        PRIMARY KEY (source, match_id)
-    );
-    """,
-    """
-    CREATE TABLE IF NOT EXISTS football_roster (
-        -- Team-level squad data (static tournament fixture, NOT per-match) —
-        -- deliberately unscoped by `source`/`match_id`: one canonical roster
-        -- per team serves every match/source that team appears in.
-        team            TEXT NOT NULL,   -- canonical display name (see reconcile.py)
-        fifa_code       TEXT,
-        group_name      TEXT,
-        number          INTEGER NOT NULL,
-        position        TEXT,
-        player_name     TEXT NOT NULL,
-        name_folded     TEXT,            -- fold(player_name), for folded lookups
-        date_of_birth   TEXT,
-        PRIMARY KEY (team, number)
-    );
-    CREATE INDEX IF NOT EXISTS idx_football_roster_folded
-        ON football_roster (name_folded);
-    """,
-)
+# FOOTBALL_SIDE_TABLE_DDL (typed homes for the football-specific shapes the
+# adapter carries in NormalizedMatch.payload: boxscore stats and lineups) is
+# defined in reconcile.py, tagged there per-table as match-keyed or
+# team-keyed. That tag is the single source of truth reconcile.py's stub
+# adoption uses to decide which side tables must follow a stub row — see
+# reconcile._FOOTBALL_SIDE_TABLE_SPECS / _MIGRATABLE_SIDE_TABLES. Re-exported
+# here (via __all__ above) since this is the pack's public entry point and
+# existing callers import it from here.
 
 
 def _to_int(value: object) -> int | None:

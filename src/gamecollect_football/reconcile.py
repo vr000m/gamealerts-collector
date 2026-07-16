@@ -38,6 +38,112 @@ from gamecollect.db.writer import PartitionWriter
 from gamecollect.fold import fold
 from gamecollect.provider import NormalizedMatch, merge_payload_preserving_richer
 
+# Pack-owned side tables (typed homes for the football-specific shapes the
+# adapter carries in NormalizedMatch.payload: boxscore stats and lineups).
+# Additive + idempotent (CREATE TABLE IF NOT EXISTS); soft refs mirror the
+# core posture — no FOREIGN KEY constraints in v1. `name_folded` on lineups
+# preserves the fold-based player lookup gamealerts depends on (stamped with
+# gamecollect.fold.fold by whoever writes the row).
+#
+# Each entry is tagged with whether the table is match-keyed (soft ref to
+# matches.match_id, so a per-match row must migrate when a stub is adopted
+# onto a late-appearing canonical schedule row) or team-keyed (one row per
+# team, no per-match row to migrate — e.g. football_roster). This single
+# tagged structure is the source of truth for both the DDL applied to the
+# database (FOOTBALL_SIDE_TABLE_DDL, re-exported from pack.py for the public
+# contract) and the set of tables _adopt_stub_rows must migrate
+# (_MIGRATABLE_SIDE_TABLES, below) — so a newly added match-keyed side table
+# only needs one edit (its tag here) to be picked up by stub adoption,
+# instead of two hand-synced lists that can drift (this exact drift bug fired
+# once already: football_venue was omitted from a hand-maintained migration
+# tuple).
+_FOOTBALL_SIDE_TABLE_SPECS: tuple[tuple[str, bool, str], ...] = (
+    (
+        "football_stats",
+        True,
+        """
+    CREATE TABLE IF NOT EXISTS football_stats (
+        source          TEXT NOT NULL,
+        match_id        TEXT NOT NULL,   -- soft ref -> matches.match_id
+        team            TEXT NOT NULL,   -- team display name (boxscore key)
+        possession      REAL,
+        shots           INTEGER,
+        shots_on_target INTEGER,
+        corners         INTEGER,
+        fouls           INTEGER,
+        yellow_cards    INTEGER,
+        red_cards       INTEGER,
+        offsides        INTEGER,
+        PRIMARY KEY (source, match_id, team)
+    );
+    """,
+    ),
+    (
+        "football_lineups",
+        True,
+        """
+    CREATE TABLE IF NOT EXISTS football_lineups (
+        source          TEXT NOT NULL,
+        match_id        TEXT NOT NULL,   -- soft ref -> matches.match_id
+        team            TEXT NOT NULL,   -- team display name
+        athlete_id      TEXT NOT NULL,   -- ESPN athlete id
+        display_name    TEXT NOT NULL,
+        name_folded     TEXT,            -- fold(display_name), for folded lookups
+        jersey          TEXT,
+        position        TEXT,
+        starter         INTEGER NOT NULL DEFAULT 0,
+        subbed_in       INTEGER NOT NULL DEFAULT 0,
+        subbed_out      INTEGER NOT NULL DEFAULT 0,
+        formation_place INTEGER,
+        home_away       TEXT,
+        formation       TEXT,
+        PRIMARY KEY (source, match_id, team, athlete_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_football_lineups_folded
+        ON football_lineups (source, name_folded);
+    """,
+    ),
+    (
+        "football_venue",
+        True,
+        """
+    CREATE TABLE IF NOT EXISTS football_venue (
+        source          TEXT NOT NULL,
+        match_id        TEXT NOT NULL,   -- soft ref -> matches.match_id
+        stadium         TEXT,
+        city            TEXT,
+        PRIMARY KEY (source, match_id)
+    );
+    """,
+    ),
+    (
+        "football_roster",
+        False,
+        """
+    CREATE TABLE IF NOT EXISTS football_roster (
+        -- Team-level squad data (static tournament fixture, NOT per-match) —
+        -- deliberately unscoped by `source`/`match_id`: one canonical roster
+        -- per team serves every match/source that team appears in.
+        team            TEXT NOT NULL,   -- canonical display name (see reconcile.py)
+        fifa_code       TEXT,
+        group_name      TEXT,
+        number          INTEGER NOT NULL,
+        position        TEXT,
+        player_name     TEXT NOT NULL,
+        name_folded     TEXT,            -- fold(player_name), for folded lookups
+        date_of_birth   TEXT,
+        PRIMARY KEY (team, number)
+    );
+    CREATE INDEX IF NOT EXISTS idx_football_roster_folded
+        ON football_roster (name_folded);
+    """,
+    ),
+)
+
+FOOTBALL_SIDE_TABLE_DDL: tuple[str, ...] = tuple(
+    ddl for _name, _match_keyed, ddl in _FOOTBALL_SIDE_TABLE_SPECS
+)
+
 __all__ = [
     "TEAM_ALIASES",
     "canonical_display_name",
@@ -585,11 +691,16 @@ def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
     return row is not None
 
 
-# Pack-owned side tables keyed by match_id that must follow a stub row when it
-# is adopted onto a late-appearing canonical schedule row. football_roster is
-# deliberately excluded — it is team-keyed (PRIMARY KEY (team, number)), not
-# match-keyed, so it has no per-match row to migrate.
-_MIGRATABLE_SIDE_TABLES = ("football_stats", "football_lineups", "football_venue")
+# Side tables keyed by match_id that must follow a stub row when it is
+# adopted onto a late-appearing canonical schedule row. Derived structurally
+# from _FOOTBALL_SIDE_TABLE_SPECS above (not hand-duplicated) so a newly
+# added match-keyed table is picked up automatically — see the comment on
+# _FOOTBALL_SIDE_TABLE_SPECS. football_roster is excluded because it is
+# team-keyed (PRIMARY KEY (team, number)), not match-keyed, so it has no
+# per-match row to migrate.
+_MIGRATABLE_SIDE_TABLES: tuple[str, ...] = tuple(
+    name for name, match_keyed, _ddl in _FOOTBALL_SIDE_TABLE_SPECS if match_keyed
+)
 
 
 def _adopt_stub_rows(

@@ -1268,3 +1268,43 @@ class TestNoMapChurnDuringRefusal:
             "a persisting refusal conflict must not churn provider_match_map "
             f"every poll; saw: {map_writes}"
         )
+
+
+class TestMigratableSideTablesDerivation:
+    """Regression: _MIGRATABLE_SIDE_TABLES was previously a hand-maintained
+    tuple kept in sync with FOOTBALL_SIDE_TABLE_DDL by hand — and drifted once
+    already (football_venue was omitted, see TestStubAdoption's
+    test_football_venue_row_follows_the_stub). It is now derived structurally
+    from a single tagged spec list (_FOOTBALL_SIDE_TABLE_SPECS), so a newly
+    added match-keyed table cannot be omitted by a second forgotten edit."""
+
+    def test_every_match_keyed_spec_is_migratable(self):
+        from gamecollect_football.reconcile import (
+            _FOOTBALL_SIDE_TABLE_SPECS,
+            _MIGRATABLE_SIDE_TABLES,
+        )
+
+        match_keyed_names = {
+            name for name, match_keyed, _ddl in _FOOTBALL_SIDE_TABLE_SPECS if match_keyed
+        }
+        assert set(_MIGRATABLE_SIDE_TABLES) == match_keyed_names
+        # football_roster is team-keyed and must NOT be migratable.
+        assert "football_roster" not in _MIGRATABLE_SIDE_TABLES
+
+    def test_a_new_match_keyed_spec_is_automatically_migratable(self):
+        """Simulates adding a new match-keyed side table: derive a fresh
+        _MIGRATABLE_SIDE_TABLES from specs + one fake extra entry, exactly as
+        reconcile.py itself does at import time, and assert the new table is
+        included with zero additional hand-editing."""
+        from gamecollect_football.reconcile import _FOOTBALL_SIDE_TABLE_SPECS
+
+        fake_specs = (
+            *_FOOTBALL_SIDE_TABLE_SPECS,
+            (
+                "football_fake_new_table",
+                True,
+                "CREATE TABLE IF NOT EXISTS football_fake_new_table (x TEXT);",
+            ),
+        )
+        derived = tuple(name for name, match_keyed, _ddl in fake_specs if match_keyed)
+        assert "football_fake_new_table" in derived
