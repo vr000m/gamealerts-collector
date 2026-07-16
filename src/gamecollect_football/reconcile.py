@@ -71,12 +71,14 @@ class SideTableSpec(NamedTuple):
     ddl: str
 
 
-# Strips SQL line comments (`-- ...` to end of line) before the match_id
-# check below — a DDL string's PROSE comment can legitimately mention
-# "match_id" (e.g. football_roster's DDL explains it is deliberately
-# unscoped by match_id) without the table declaring any such column; only
-# checking live (non-comment) text avoids a false positive there.
+# Strips SQL line comments (`-- ...` to end of line) and block comments
+# (`/* ... */`, possibly spanning multiple lines) before the match_id check
+# below — a DDL string's PROSE comment can legitimately mention "match_id"
+# (e.g. football_roster's DDL explains it is deliberately unscoped by
+# match_id) without the table declaring any such column; only checking live
+# (non-comment) text avoids a false positive there.
 _SQL_LINE_COMMENT_RE = re.compile(r"--[^\n]*")
+_SQL_BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
 
 # A heuristic (substring, not a SQL parser) check that a bare `match_id`
 # column name appears in the DDL (column declaration or PRIMARY KEY clause)
@@ -98,7 +100,8 @@ def _assert_side_table_specs_structurally_consistent(
     table fails immediately, not only if/when stub adoption happens to
     exercise it."""
     for spec in specs:
-        ddl_without_comments = _SQL_LINE_COMMENT_RE.sub("", spec.ddl)
+        ddl_without_comments = _SQL_BLOCK_COMMENT_RE.sub("", spec.ddl)
+        ddl_without_comments = _SQL_LINE_COMMENT_RE.sub("", ddl_without_comments)
         has_match_id = _MATCH_ID_COLUMN_RE.search(ddl_without_comments) is not None
         if spec.match_keyed and not has_match_id:
             raise AssertionError(

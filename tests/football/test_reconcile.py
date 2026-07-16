@@ -1369,3 +1369,34 @@ class TestSideTableSpecStructuralValidation:
         )
         with pytest.raises(AssertionError, match="match_id"):
             _assert_side_table_specs_structurally_consistent(bad_specs)
+
+    def test_match_id_mention_in_block_comment_is_not_a_false_positive(self):
+        """Round 3 review finding: the comment-stripping only handled `--`
+        line comments before checking for a `match_id` column mention. A
+        `/* ... */` block comment that mentions "match_id" in prose (while
+        the table itself genuinely has no such column) must NOT trip the
+        match_keyed=False branch — this pins that block comments are also
+        stripped before the substring check runs."""
+        from gamecollect_football.reconcile import (
+            SideTableSpec,
+            _assert_side_table_specs_structurally_consistent,
+        )
+
+        specs = (
+            SideTableSpec(
+                "football_fake_team_keyed_table",
+                False,
+                """
+                CREATE TABLE IF NOT EXISTS football_fake_team_keyed_table (
+                    /* mirrors the match_id join used elsewhere, but this
+                       table is deliberately team-keyed, not match-keyed */
+                    team TEXT NOT NULL,
+                    value TEXT,
+                    PRIMARY KEY (team)
+                );
+                """,
+            ),
+        )
+        # Must not raise: the mention of "match_id" is inside a block
+        # comment, not a real column.
+        _assert_side_table_specs_structurally_consistent(specs)
