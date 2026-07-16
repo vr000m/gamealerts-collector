@@ -502,14 +502,25 @@ def persist_football_side_tables(
                 seeded_match_id,
                 _lineup_rows(writer.source, seeded_match_id, lineups),
             )
-        if stadium is not None or city is not None:
+        # Compute the projected rows first and gate on the RESULT being
+        # non-empty (matching the isinstance(stats, list)/isinstance(lineups,
+        # list) guard pattern above), not on the raw stadium/city values.
+        # _venue_rows runs each value through _to_text, which coerces a
+        # malformed/non-scalar value (e.g. a dict) to None -- if the guard
+        # instead checked the raw values, a malformed-but-non-None stadium/
+        # city would pass the guard while _venue_rows yields an EMPTY dict,
+        # and _replace_if_changed(desired={}) against a non-empty `current`
+        # performs an unconditional DELETE, wiping a previously-stored good
+        # venue row over a single bad poll.
+        venue_rows = _venue_rows(writer.source, seeded_match_id, stadium, city)
+        if venue_rows:
             _replace_if_changed(
                 conn,
                 "football_venue",
                 _VENUE_COLUMNS,
                 writer.source,
                 seeded_match_id,
-                _venue_rows(writer.source, seeded_match_id, stadium, city),
+                venue_rows,
             )
         _persist_roster_for_team(conn, match.home_team)
         _persist_roster_for_team(conn, match.away_team)

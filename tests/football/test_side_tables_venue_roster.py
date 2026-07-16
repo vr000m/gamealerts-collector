@@ -152,6 +152,44 @@ class TestVenueSideTable:
         ).fetchall()
         assert rows == [], "an absent stadium/city must not insert a placeholder venue row"
 
+    def test_malformed_stadium_value_does_not_wipe_a_stored_venue_row(self, db):
+        """Regression: the guard before calling _replace_if_changed used to
+        check the RAW stadium/city values (`is not None`), not the projected
+        _venue_rows() result. _venue_rows runs each value through _to_text,
+        which coerces a non-scalar (e.g. a dict) to None. A malformed-but-
+        non-None stadium value used to pass the old raw-value guard while
+        _venue_rows produced an EMPTY dict, and _replace_if_changed(desired={})
+        against a non-empty `current` performs an unconditional DELETE --
+        wiping a previously-good stored venue row over a single bad poll."""
+        table = _find_table_name("venue")
+        if table is None:
+            pytest.skip("no football_*venue* side table wired yet")
+        conn, writer = db
+        # First poll: a good venue payload lands durably.
+        persist_football_side_tables(conn, writer, _match(VENUE_PAYLOAD), MATCH_ID)
+        (count_before,) = conn.execute(
+            f"SELECT COUNT(*) FROM {table} WHERE match_id = ?",  # noqa: S608
+            (MATCH_ID,),
+        ).fetchone()
+        assert count_before == 1
+
+        # Second poll: a malformed, non-None stadium value (a dict, not a
+        # scalar) -- must not wipe the already-stored good row.
+        malformed_payload = {"stadium": {"unexpected": "shape"}, "city": {"also": "bad"}}
+        persist_football_side_tables(conn, writer, _match(malformed_payload), MATCH_ID)
+
+        rows = conn.execute(
+            f"SELECT * FROM {table} WHERE match_id = ?",  # noqa: S608
+            (MATCH_ID,),
+        ).fetchall()
+        assert rows, (
+            f"a malformed stadium/city payload must not wipe the previously-stored "
+            f"venue row in {table}"
+        )
+        row = dict(rows[0])
+        values = {str(v) for v in row.values() if v is not None}
+        assert "NRG Stadium" in values, f"stored venue row was wiped: {row}"
+
 
 class TestRosterSideTable:
     def test_roster_table_exists_in_side_table_ddl(self):
