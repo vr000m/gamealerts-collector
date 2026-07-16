@@ -5,7 +5,7 @@ over it, and the ``tools --json`` manifest is generated from the same operation
 registry these functions register into (:mod:`gamecollect.registry`), so the
 CLI cannot drift from the library by construction.
 
-The four **core** read operations live here and wrap the untyped
+The **core** read operations live here and wrap the untyped
 :mod:`gamecollect.db.reader` rows in frozen dataclasses (``payload`` JSON
 decoded to a Python object). They are sync, read-only, and safe to call while
 collector daemons write (WAL): open the connection with
@@ -16,11 +16,15 @@ match-scoped ops (:func:`get_state`, :func:`get_events_since`) take only
 ``match_id`` — the reader resolves the partition internally. :func:`get_standings`
 is keyed ``(source, group_key, entity_id)`` and has no ``match_id`` to resolve a
 source from, so it takes ``source`` explicitly; :func:`list_matches` accepts an
-optional ``source`` filter.
+optional ``source`` filter. :func:`get_vocabulary` is not a database read at
+all — it returns one installed pack's static manifest (taxonomy, prompt
+fragments, display metadata, compaction boundaries) by name.
 
 Pack-owned side tables (football squads/stats) are read by **pack-contributed**
 operations implemented in ``gamecollect_football`` and registered at pack load —
-this module never imports a pack (dependency direction is pack → core only).
+this module never imports a specific pack package (dependency direction is
+pack → core only); :func:`get_vocabulary` only uses the generic, pack-agnostic
+loader in :mod:`gamecollect.packs.registry`.
 """
 
 from __future__ import annotations
@@ -36,10 +40,13 @@ __all__ = [
     "MatchState",
     "Event",
     "Standing",
+    "TaxonomyEntry",
+    "Vocabulary",
     "list_matches",
     "get_state",
     "get_events_since",
     "get_standings",
+    "get_vocabulary",
 ]
 
 
@@ -194,6 +201,30 @@ class Standing:
         )
 
 
+@dataclass(frozen=True)
+class TaxonomyEntry:
+    """Typed view of one pack ``taxonomy`` entry: display name + default importance."""
+
+    display_name: str
+    importance_default: int
+
+
+@dataclass(frozen=True)
+class Vocabulary:
+    """Typed view of one installed pack's manifest — the worker's sport-vocabulary source.
+
+    Mirrors :class:`~gamecollect.packs.spec.SportPack`'s taxonomy/prompt_fragments/
+    display_metadata/compaction_boundaries fields; this is pack metadata, not a
+    row read from the database.
+    """
+
+    pack: str
+    taxonomy: dict[str, TaxonomyEntry]
+    prompt_fragments: dict[str, str]
+    display_metadata: dict[str, Any]
+    compaction_boundaries: list[str]
+
+
 def list_matches(
     conn: sqlite3.Connection,
     *,
@@ -224,3 +255,33 @@ def get_standings(
 ) -> list[Standing]:
     """Return standings rows for ``source``, optionally scoped to one group."""
     return [Standing.from_row(r) for r in reader.get_standings(conn, source, group_key)]
+
+
+def get_vocabulary(conn: sqlite3.Connection, pack: str) -> Vocabulary:
+    """Return ``pack``'s manifest: taxonomy, prompt fragments, display metadata,
+    compaction boundaries.
+
+    ``conn`` is unused — the vocabulary is static pack metadata, not a database
+    read — but kept in the signature for calling-convention parity with every
+    other operation (``impl(conn, **params)``). Raises
+    :class:`~gamecollect.packs.registry.PackError` if ``pack`` is not an
+    installed entry point or fails validation.
+    """
+    # runtime import: gamecollect.registry imports this module, and
+    # packs.registry imports gamecollect.registry for the Operation type — a
+    # module-level import here would be circular.
+    from gamecollect.packs.registry import load_pack
+
+    del conn
+    loaded = load_pack(pack)
+    taxonomy = {
+        event_type: TaxonomyEntry(decl.display_name, decl.importance_default)
+        for event_type, decl in loaded.taxonomy.items()
+    }
+    return Vocabulary(
+        pack=pack,
+        taxonomy=taxonomy,
+        prompt_fragments=dict(loaded.prompt_fragments),
+        display_metadata=dict(loaded.display_metadata),
+        compaction_boundaries=list(loaded.compaction_boundaries),
+    )

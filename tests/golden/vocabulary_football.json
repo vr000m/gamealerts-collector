@@ -1,0 +1,25 @@
+{
+  "pack": "football-wc2026",
+  "taxonomy": {
+    "goal": {"display_name": "Goal", "importance_default": 1},
+    "own_goal": {"display_name": "Own goal", "importance_default": 1},
+    "penalty": {"display_name": "Penalty", "importance_default": 1},
+    "yellow": {"display_name": "Yellow card", "importance_default": 3},
+    "red": {"display_name": "Red card", "importance_default": 2},
+    "sub": {"display_name": "Substitution", "importance_default": 4},
+    "kickoff": {"display_name": "Kickoff", "importance_default": 3},
+    "half_time": {"display_name": "Half time", "importance_default": 3},
+    "full_time": {"display_name": "Full time", "importance_default": 2}
+  },
+  "prompt_fragments": {
+    "sport_context": "Association football (soccer): two teams of eleven, two 45-minute halves plus stoppage time. Goals are the only score; a match may end in a draw in the group stage.",
+    "event_call": "Call goals immediately with scorer and new score. Mention own goals and converted penalties explicitly. Cards matter: a second yellow means a red and the team plays a player short."
+  },
+  "display_metadata": {
+    "sport_display": "Football",
+    "tournament_display": "FIFA World Cup 2026",
+    "provider": "espn",
+    "tournament_slug": "fifa.world"
+  },
+  "compaction_boundaries": ["kickoff", "half_time", "full_time"]
+}

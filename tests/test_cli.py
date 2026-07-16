@@ -502,7 +502,7 @@ def test_broken_pack_is_skipped_and_core_reads_still_work(tmp_path, capsys, capl
         registry = cli.load_registry(pack_loader=broken_loader, names=["busted-pack"])
 
     # The broken pack contributed nothing; only the sport-agnostic core ops remain.
-    assert set(registry.names) == {"matches", "state", "events", "standings"}
+    assert set(registry.names) == {"matches", "state", "events", "standings", "vocabulary"}
     # It was skipped loudly, naming the offending pack.
     assert any("busted-pack" in rec.getMessage() for rec in caplog.records), (
         "a skipped broken pack must be warned about, not silently dropped"
@@ -529,7 +529,7 @@ def test_pack_with_duplicate_op_name_is_skipped_core_survives(tmp_path, caplog):
     with caplog.at_level(logging.WARNING):
         registry = cli.load_registry(pack_loader=lambda name: _DupOpPack(), names=["dup-pack"])
 
-    assert set(registry.names) == {"matches", "state", "events", "standings"}
+    assert set(registry.names) == {"matches", "state", "events", "standings", "vocabulary"}
     assert any("dup-pack" in rec.getMessage() for rec in caplog.records), (
         "a pack skipped for a duplicate op name must be warned about"
     )
@@ -565,7 +565,7 @@ def test_pack_op_name_collision_with_hand_wired_command_is_skipped(caplog):
         )
 
     assert "collect" not in registry.names
-    assert set(registry.names) == {"matches", "state", "events", "standings"}
+    assert set(registry.names) == {"matches", "state", "events", "standings", "vocabulary"}
     assert any(
         "collect" in rec.getMessage() and "bad-op-pack" in rec.getMessage()
         for rec in caplog.records
@@ -622,7 +622,7 @@ def test_duplicate_pack_entry_point_name_loaded_once(caplog):
         registry = cli.load_registry(pack_loader=counting_loader, names=[PACK_NAME, PACK_NAME])
 
     assert loads == [PACK_NAME], f"a duplicate entry-point name must load once, got {loads}"
-    assert set(registry.names) == {"matches", "state", "events", "standings"}
+    assert set(registry.names) == {"matches", "state", "events", "standings", "vocabulary"}
 
 
 def test_collect_reuses_registry_loaded_pack_without_double_load(tmp_path, monkeypatch):

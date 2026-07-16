@@ -658,19 +658,20 @@ def test_pack_ops_registered_after_load_but_core_client_lacks_them(tmp_path):
     assert callable(_resolve_pack_op("get_player_stats"))
 
 
-def test_core_registry_registers_the_four_core_ops_wired_to_client():
+def test_core_registry_registers_the_core_ops_wired_to_client():
     """The operation registry is the single source of truth CLI/manifest derive
-    from; the four core ops must be registered, each backed by its client fn."""
+    from; the core ops must be registered, each backed by its client fn."""
     from gamecollect import client
     from gamecollect.registry import build_registry
 
     registry = build_registry()
-    assert set(registry.names) == {"matches", "state", "events", "standings"}
+    assert set(registry.names) == {"matches", "state", "events", "standings", "vocabulary"}
     impls = {op.name: op.impl for op in registry.operations}
     assert impls["matches"] is client.list_matches
     assert impls["state"] is client.get_state
     assert impls["events"] is client.get_events_since
     assert impls["standings"] is client.get_standings
+    assert impls["vocabulary"] is client.get_vocabulary
 
 
 def test_registry_merges_pack_contributed_ops_without_core_owning_them():
