@@ -8014,6 +8014,276 @@ def test_backfill_inconclusive_attempt_accrues_merged_richer_data_into_fallback_
     assert state is not None and state["status"] == MatchStatus.FINISHED.value
 
 
+def test_backfill_cooling_deferred_survives_nonterminal_status_flap(tmp_path, caplog):
+    """The ``backfill_cooling_deferred`` gate must defer a match even when it
+    transiently reports a NON-TERMINAL status (SCHEDULED/UNKNOWN) while its
+    backfill cooldown is active — the provider ABC does not guarantee status
+    monotonicity. Before the fix the gate was built from the full
+    ``first_sight`` predicate (which requires ``_is_terminal(status)``), so a
+    SCHEDULED/UNKNOWN flap during cooldown read ``backfill_cooling_deferred
+    == False`` AND ``is_backfill == False``, falling into the ordinary skip
+    branch and durably persisting a bare non-terminal snapshot — permanently
+    foreclosing later re-detection once the match genuinely finished."""
+    from gamecollect.engine import (
+        _BACKFILL_MAX_ATTEMPTS,
+        _COOLDOWN_BASE_POLLS,
+        _MAX_GIVE_UP_EMISSIONS,
+        CollectorEngine,
+        _TransitionTracker,
+    )
+
+    db = tmp_path / "engine.db"
+    identityless_board = nm(
+        "m1",
+        (),
+        status=MatchStatus.FINISHED,
+        home_team=None,
+        away_team=None,
+        kickoff_utc=None,
+        score_home=1,
+        score_away=0,
+    )
+    # A NON-TERMINAL status flap during the cooldown window — the exact shape
+    # this fix must still defer.
+    flapping_board = nm("m1", (), status=MatchStatus.SCHEDULED, score_home=None, score_away=None)
+    real_board = nm("m1", (), status=MatchStatus.FINISHED, score_home=1, score_away=0)
+    fresh_detail = nm(
+        "m1", (ev(0, "goal", minute=5),), status=MatchStatus.FINISHED, score_home=1, score_away=0
+    )
+    reemission_polls = [([identityless_board], {}) for _ in range(_MAX_GIVE_UP_EMISSIONS + 1)]
+    cooling_polls = [([flapping_board], {}) for _ in range(_COOLDOWN_BASE_POLLS - 1)]
+    polls = reemission_polls + cooling_polls + [([real_board], {"m1": fresh_detail})]
+    provider = ScriptedDetailProvider(polls)
+    engine = CollectorEngine(make_pack(provider), str(db), SOURCE, 0.01, provider=provider)
+    engine._restart_scan_done = True
+    engine._backfill["m1"] = _TransitionTracker(
+        fallback=identityless_board,
+        consecutive_failures=_BACKFILL_MAX_ATTEMPTS,
+    )
+    try:
+        with caplog.at_level(logging.DEBUG, logger="gamecollect.engine"):
+            for _ in range(_MAX_GIVE_UP_EMISSIONS + 1):
+                engine.poll_once()
+            assert "m1" not in engine._backfill
+            assert "m1" in engine._cooldowns, "the exhausted give-up must enter a cooldown"
+
+            for _ in range(_COOLDOWN_BASE_POLLS - 1):
+                engine.poll_once()
+                assert reader.get_state(read_db(db), qualified("m1")) is None, (
+                    "no matches row may be seeded during the cooldown window even "
+                    "when the board transiently flaps to a NON-TERMINAL status"
+                )
+            assert provider.detail_calls == [], (
+                "no fetch_match_detail may fire during the cooldown window while flapping"
+            )
+            engine.poll_once()
+    finally:
+        engine.close()
+
+    assert provider.detail_calls == ["m1"], (
+        "once the cooldown lapses and the match genuinely finishes, detection resumes"
+    )
+    assert event_seqs(db, qualified("m1")) == [0], (
+        "post-cooldown detection persists the full event list normally"
+    )
+
+
+def test_backfill_budget_deferred_fresh_candidate_seeds_fallback_survives_vanish(tmp_path):
+    """A fresh first-sight-finished candidate deferred by the per-poll fetch
+    budget must have its tracker's ``fallback`` seeded with the observed
+    scoreboard snapshot at deferral time — mirroring
+    ``_register_backfill_apply_failure``'s accrual. Before the fix, the
+    get-or-create call left ``fallback`` at ``None``; if this match then
+    vanishes off-slate before ever getting a fetch slot and every vanished
+    retry also fails, ``_build_give_up_snapshot`` finds nothing at all to
+    persist (``tracker.fallback`` is ``None``, ``fresh`` is ``None`` on every
+    vanished attempt, no baseline, no stored row) and the give-up silently
+    loses even the score/status that WAS observed at first detection."""
+    from gamecollect.engine import (
+        _BACKFILL_MAX_ATTEMPTS,
+        _BACKFILL_MAX_FETCHES_PER_POLL,
+        CollectorEngine,
+    )
+
+    db = tmp_path / "engine.db"
+    budget_ids = [f"filler{i}" for i in range(1, _BACKFILL_MAX_FETCHES_PER_POLL + 1)]
+    filler_boards = [
+        nm(mid, (), status=MatchStatus.FINISHED, score_home=1, score_away=0) for mid in budget_ids
+    ]
+    filler_details = {
+        mid: nm(
+            mid,
+            (ev(0, "goal", minute=5),),
+            status=MatchStatus.FINISHED,
+            score_home=1,
+            score_away=0,
+        )
+        for mid in budget_ids
+    }
+    # The target: a fresh first-sight-finished candidate on the SAME poll as
+    # the budget-filling matches, distinguishable by its score. The budget is
+    # exhausted by the fillers, so it must be deferred WITHOUT a fetch.
+    target_board = nm("vanisher", (), status=MatchStatus.FINISHED, score_home=9, score_away=0)
+    poll1 = (filler_boards + [target_board], filler_details)
+    # Poll 2..cap: "vanisher" is off-slate; every vanished-hydration retry fails.
+    vanish_polls = [
+        ([], {"vanisher": ProviderUnavailableError(f"summary 503 #{i}")})
+        for i in range(1, _BACKFILL_MAX_ATTEMPTS + 1)
+    ]
+    provider = ScriptedDetailProvider([poll1, *vanish_polls])
+    engine = CollectorEngine(make_pack(provider), str(db), SOURCE, 0.01, provider=provider)
+    engine._restart_scan_done = True
+    try:
+        engine.poll_once()
+        assert "vanisher" not in provider.detail_calls, (
+            "the budget-exhausted fresh candidate must not be fetched this poll"
+        )
+        assert "vanisher" in engine._backfill, "a deferred fresh candidate must still get a tracker"
+        tracker = engine._backfill["vanisher"]
+        assert tracker.consecutive_failures == 0, "a deferral is not a failure"
+        assert tracker.fallback is not None, (
+            "the deferred tracker's fallback must be seeded with this poll's "
+            "observed scoreboard snapshot, not left None"
+        )
+        assert tracker.fallback.score_home == 9 and tracker.fallback.score_away == 0
+
+        for _ in range(_BACKFILL_MAX_ATTEMPTS):
+            engine.poll_once()
+    finally:
+        engine.close()
+
+    assert "vanisher" not in engine._backfill, "the give-up must eventually pop the tracker"
+    state = reader.get_state(read_db(db), qualified("vanisher"))
+    assert state is not None, (
+        "the give-up must persist the originally-observed score, not lose it entirely "
+        "to a None-fallback / None-fresh candidate"
+    )
+    assert state["status"] == MatchStatus.FINISHED.value
+    assert state["score_home"] == 9 and state["score_away"] == 0
+
+
+def test_restart_scans_never_seed_same_provider_id_into_both_tracker_dicts(tmp_path):
+    """A stale pre-reconciliation ``source:id`` stub row and a separate
+    canonical row can coexist for the same underlying match (documented as
+    an accepted shape by ``_stored_match_snapshot``'s docstring). If a stale
+    LIVE stub row and a canonical TERMINAL zero-event row both map to the
+    SAME provider id, ``_seed_restart_trackers`` (scanning LIVE rows) and
+    ``_seed_restart_backfill_trackers`` (scanning TERMINAL zero-event rows)
+    must not each independently seed a tracker for it — the file's own
+    stated ``is_backfill``/``in_transition`` mutual-exclusivity-by-
+    construction invariant would be violated, and both hydration passes
+    would independently fetch_match_detail the same provider id."""
+    from gamecollect.db.connection import connect
+    from gamecollect.engine import CollectorEngine
+
+    db = tmp_path / "engine.db"
+    conn = connect(str(db), side_table_ddl=FAKE_SIDE_TABLE_DDL)
+    try:
+        with conn:
+            # A stale LIVE stub row, resolved via the prefix branch directly
+            # to provider id "m1".
+            conn.execute(
+                "INSERT INTO matches (match_id, source, kickoff_utc, status, minute, "
+                "score_home, score_away, payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    qualified("m1"),
+                    SOURCE,
+                    "2026-06-18T18:00:00Z",
+                    MatchStatus.IN_PLAY.value,
+                    88,
+                    1,
+                    0,
+                    json.dumps({"home_team": "Canada", "away_team": "Qatar"}),
+                ),
+            )
+            # A separate canonical TERMINAL zero-event row, resolved via
+            # provider_match_map to the SAME provider id "m1".
+            _stored_row(
+                conn,
+                "canada-vs-qatar-2026-06-18",
+                status=MatchStatus.FINISHED,
+                score_home=1,
+                updated_at="2026-06-18T20:00:00Z",
+            )
+            conn.execute(
+                "INSERT INTO provider_match_map "
+                "(source, provider, provider_match_id, match_id) VALUES (?, ?, ?, ?)",
+                (SOURCE, "espn", "m1", "canada-vs-qatar-2026-06-18"),
+            )
+    finally:
+        conn.close()
+
+    provider = ScriptedDetailProvider([])
+    pack = make_pack(provider, seed_match=_reconciling_seed)
+    engine = CollectorEngine(pack, str(db), SOURCE, 0.01, provider=provider)
+    try:
+        engine._seed_restart_trackers(set())
+        engine._seed_restart_backfill_trackers(set())
+    finally:
+        engine.close()
+
+    in_transitions = "m1" in engine._transitions
+    in_backfill = "m1" in engine._backfill
+    assert in_transitions != in_backfill, (
+        f"exactly one of the two tracker dicts must be seeded for the shared "
+        f"provider id, never both and never neither: "
+        f"in_transitions={in_transitions}, in_backfill={in_backfill}"
+    )
+    assert in_transitions, (
+        "the LIVE stub scan runs first in poll_once's restart sequence, so it "
+        "claims the provider id before the backfill scan's cross-dict guard sees it"
+    )
+
+
+def test_backfill_give_up_reemission_apply_failure_registers_not_lost(tmp_path, caplog):
+    """A give-up re-emission (``give_up_pending`` already ``True`` from a
+    prior poll) must mark the match in ``self._backfill_apply_pending`` too,
+    not only a fresh fetch success. Before the fix, if this poll's ``_apply``
+    durably ``seed_match``-writes the row (seed-before-child-write) and then
+    a later step raises something ``poll_once`` catches, the failure went
+    unregistered (the match was absent from ``self._backfill_apply_pending``,
+    which is populated only on a fetch success) — silently losing track of a
+    partially-durable write instead of counting it as a backfill attempt."""
+    from gamecollect.engine import CollectorEngine, TaxonomyError, _TransitionTracker
+
+    db = tmp_path / "engine.db"
+
+    def _flaky_seed(conn: sqlite3.Connection, writer, match: NormalizedMatch) -> str | None:
+        # Durably seed the row (mirrors seed-before-child-write), then raise
+        # a writer-rejection error poll_once catches — simulating a later
+        # step failing AFTER the matches row already landed.
+        _seed_match(conn, writer, match)
+        raise TaxonomyError("simulated post-seed rejection")
+
+    board = nm("m1", (), status=MatchStatus.FINISHED, score_home=3, score_away=1)
+    provider = ScriptedDetailProvider([([board], {})])
+    pack = make_pack(provider, seed_match=_flaky_seed)
+    engine = CollectorEngine(pack, str(db), SOURCE, 0.01, provider=provider)
+    engine._restart_scan_done = True
+    # A give-up already pending from a prior poll (re-emission path), at cap
+    # so this poll re-emits without a fetch.
+    engine._backfill["m1"] = _TransitionTracker(
+        fallback=board,
+        consecutive_failures=3,
+        give_up_pending=True,
+        give_up_emissions=1,
+    )
+    try:
+        with caplog.at_level(logging.ERROR, logger="gamecollect.engine"):
+            engine.poll_once()
+    finally:
+        engine.close()
+
+    assert "m1" in engine._backfill, (
+        "the re-emission's downstream apply failure must register against the "
+        "tracker (keeping it alive for a retry), not be silently lost"
+    )
+    tracker = engine._backfill["m1"]
+    assert tracker.consecutive_failures >= 1, (
+        "the failure must be counted via _register_backfill_apply_failure"
+    )
+
+
 def test_client_goal_family_matches_engine():
     """gamecollect.client keeps a second, deliberate copy of the goal-family
     taxonomy literal (to avoid importing the daemon-weight engine module into
