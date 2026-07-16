@@ -382,6 +382,14 @@ class _Cooldown:
     terminal write keeps exponential backoff and the WARN-after-first-epoch
     damping. The ENTRY itself is removed only by a terminal resolution
     (:meth:`_resolve_tracker`) or the expired-and-unseen purge.
+
+    ``is_backfill_origin`` records whether THIS entry was created by
+    :meth:`CollectorEngine._emit_backfill_give_up` (backfill exhaustion) as
+    opposed to :meth:`CollectorEngine._abandon` (ordinary transition
+    abandonment) — the two share ``_cooldowns`` but only a backfill-origin
+    cooldown may gate ``backfill_cooling_deferred``
+    (:meth:`CollectorEngine._fetch_poll_snapshots`); an unrelated
+    transition-abandonment cooldown must not suppress backfill re-detection.
     """
 
     remaining: int
@@ -389,6 +397,7 @@ class _Cooldown:
     expired_unseen: int = 0
     fallback: NormalizedMatch | None = None
     drift_logged: bool = False
+    is_backfill_origin: bool = False
 
 
 @dataclass
@@ -1337,12 +1346,21 @@ class CollectorEngine:
             # requires ``_is_terminal(status)``) would read False in that
             # case, falling through to the same raw-persist skip-branch this
             # defer exists to prevent.
+            # Must check the cooldown entry's ``is_backfill_origin`` flag, not
+            # the boolean-only ``_cooling_down`` — ``self._cooldowns`` is
+            # shared with ordinary transition abandonment (``_abandon``), and
+            # deferring here on an unrelated transition-abandonment cooldown
+            # would silently drop this match's scoreboard snapshot for the
+            # whole (unrelated) cooldown window.
+            backfill_cooldown = self._cooldowns.get(match.match_id)
             backfill_cooling_deferred = (
                 self._backfill_finished_matches
                 and previous is None
                 and not was_live
                 and not has_stored_row
-                and self._cooling_down(match.match_id)
+                and backfill_cooldown is not None
+                and backfill_cooldown.remaining > 0
+                and backfill_cooldown.is_backfill_origin
             )
             if backfill_cooling_deferred:
                 continue
@@ -1930,11 +1948,19 @@ class CollectorEngine:
 
         To keep ``_cooldowns`` bounded when that durable apply never comes — a
         match that ended and dropped off the slate — an expired entry whose match
-        is UNSEEN (absent from ``slate_ids`` and untracked) for a full cap-length
-        window (``_COOLDOWN_MAX_POLLS`` consecutive polls) is purged. Losing its
-        epoch/backoff memory after so long a silence is acceptable: a match that
-        reappears after 256+ quiet polls deserves a fresh epoch. A still-counting
-        entry, or one whose match is seen again, resets the unseen streak.
+        is UNSEEN (absent from ``slate_ids``, ``self._transitions``, AND
+        ``self._backfill``) for a full cap-length window (``_COOLDOWN_MAX_POLLS``
+        consecutive polls) is purged. ``self._backfill`` must be checked here too:
+        a backfill tracker actively being retried off-slate (see
+        :meth:`_hydrate_vanished_backfill_matches`) while a PRIOR give-up cycle's
+        cooldown is still counting down is genuinely still tracked, not unseen —
+        without this the entry's unseen streak would grow anyway and eventually
+        purge its epoch/backoff memory out from under a live tracker, so the
+        NEXT give-up restarts backoff at epoch 1. Losing epoch/backoff memory
+        after so long a silence is acceptable only when nothing is tracking the
+        match at all: a match that reappears after 256+ quiet polls with no
+        tracker deserves a fresh epoch. A still-counting entry, or one whose
+        match is seen or tracked again, resets the unseen streak.
         """
         purge: list[str] = []
         for match_id, cooldown in self._cooldowns.items():
@@ -1942,7 +1968,7 @@ class CollectorEngine:
                 cooldown.remaining -= 1
                 cooldown.expired_unseen = 0
                 continue
-            if match_id in slate_ids or match_id in self._transitions:
+            if match_id in slate_ids or match_id in self._transitions or match_id in self._backfill:
                 cooldown.expired_unseen = 0
                 continue
             cooldown.expired_unseen += 1
@@ -1956,7 +1982,13 @@ class CollectorEngine:
         cooldown = self._cooldowns.get(match_id)
         return cooldown is not None and cooldown.remaining > 0
 
-    def _enter_cooldown(self, match_id: str, fallback: NormalizedMatch | None = None) -> int:
+    def _enter_cooldown(
+        self,
+        match_id: str,
+        fallback: NormalizedMatch | None = None,
+        *,
+        is_backfill_origin: bool = False,
+    ) -> int:
         """Abandon ``match_id`` into a fresh cooldown; return the new epoch.
 
         Each successive abandonment increments the epoch and DOUBLES the poll
@@ -1972,6 +2004,11 @@ class CollectorEngine:
         richest terminal observation survives into the cooldown and seeds the
         re-track after the gate lapses. The fresh entry starts ``drift_logged``
         False, arming one schema-drift ERROR for the new epoch (L3).
+
+        ``is_backfill_origin`` reflects THIS abandonment's own mechanism
+        (``True`` only from :meth:`_emit_backfill_give_up`'s two call sites) —
+        it is not merged with a prior entry's flag, since what matters to
+        ``backfill_cooling_deferred`` is why the match is cooling down NOW.
         """
         previous = self._cooldowns.get(match_id)
         epoch = previous.epoch + 1 if previous is not None else 1
@@ -1983,7 +2020,12 @@ class CollectorEngine:
                 if fallback is not None
                 else previous.fallback
             )
-        self._cooldowns[match_id] = _Cooldown(remaining=remaining, epoch=epoch, fallback=carried)
+        self._cooldowns[match_id] = _Cooldown(
+            remaining=remaining,
+            epoch=epoch,
+            fallback=carried,
+            is_backfill_origin=is_backfill_origin,
+        )
         return epoch
 
     def _on_durable_snapshot(
@@ -2261,7 +2303,7 @@ class CollectorEngine:
                 tracker.consecutive_failures,
             )
             self._backfill.pop(match_id, None)
-            self._enter_cooldown(match_id, fallback=tracker.fallback)
+            self._enter_cooldown(match_id, fallback=tracker.fallback, is_backfill_origin=True)
             return
         tracker.give_up_emissions += 1
         if tracker.give_up_emissions > _MAX_GIVE_UP_EMISSIONS:
@@ -2284,7 +2326,7 @@ class CollectorEngine:
             # ``not self._cooling_down(...)`` gate on ``_first_sight_finished``
             # (see ``_fetch_poll_snapshots``) bounds the hot loop until the
             # cooldown lapses.
-            self._enter_cooldown(match_id, fallback=tracker.fallback)
+            self._enter_cooldown(match_id, fallback=tracker.fallback, is_backfill_origin=True)
             return
         tracker.give_up_pending = True
         # This poll's ``_apply`` may durably ``seed_match`` the row (via

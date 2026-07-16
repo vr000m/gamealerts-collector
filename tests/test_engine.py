@@ -8088,6 +8088,90 @@ def test_backfill_cooling_deferred_survives_nonterminal_status_flap(tmp_path, ca
     )
 
 
+def test_backfill_cooling_deferred_ignores_unrelated_transition_abandonment_cooldown(tmp_path):
+    """``backfill_cooling_deferred`` shares ``self._cooldowns`` with ordinary
+    transition abandonment (``_abandon``), which pops a restart-seeded
+    ``_TransitionTracker`` (one whose ``self._last`` baseline was never
+    populated) into a cooldown that has NOTHING to do with backfill. Before
+    the fix, ``backfill_cooling_deferred`` gated on ``_cooling_down`` alone —
+    any active cooldown, regardless of origin — so a match reappearing on the
+    slate while THIS unrelated cooldown is active had its scoreboard snapshot
+    silently dropped (``continue``, never hydrated). The fix requires the
+    cooldown entry's ``is_backfill_origin`` flag to be True, so a
+    transition-abandonment cooldown must not gate backfill deferral."""
+    from gamecollect.engine import CollectorEngine, _TransitionTracker
+
+    db = tmp_path / "engine.db"
+    # A non-terminal (SCHEDULED) reappearance — the exact shape the
+    # unrelated cooldown must NOT suppress.
+    reappeared = nm("m1", (), status=MatchStatus.SCHEDULED, score_home=None, score_away=None)
+    provider = ScriptedDetailProvider([([reappeared], {})])
+    engine = CollectorEngine(make_pack(provider), str(db), SOURCE, 0.01, provider=provider)
+    engine._restart_scan_done = True
+    # Simulate a restart-seeded tracker (``self._last`` never populated for
+    # this match) that gave up and was abandoned into an ordinary
+    # transition cooldown — unrelated to any backfill give-up.
+    engine._transitions["m1"] = _TransitionTracker()
+    engine._abandon("m1", "test abandonment for %s", "m1")
+    assert "m1" not in engine._transitions, "abandonment must pop the tracker"
+    cooldown = engine._cooldowns.get("m1")
+    assert cooldown is not None and cooldown.remaining > 0, "abandonment must enter a cooldown"
+    assert not cooldown.is_backfill_origin, (
+        "an ordinary transition abandonment must not be flagged as backfill-origin"
+    )
+
+    try:
+        engine.poll_once()
+    finally:
+        engine.close()
+
+    state = reader.get_state(read_db(db), qualified("m1"))
+    assert state is not None, (
+        "a match reappearing while an UNRELATED transition-abandonment cooldown is "
+        "active must still be persisted normally, not silently dropped by "
+        "backfill_cooling_deferred"
+    )
+    assert state["status"] == MatchStatus.SCHEDULED.value
+
+
+def test_age_cooldowns_does_not_purge_unseen_streak_while_backfill_tracker_active(tmp_path):
+    """``_age_cooldowns`` must treat a match tracked in ``self._backfill`` as
+    SEEN, resetting its cooldown's ``expired_unseen`` streak, exactly like
+    ``self._transitions``. Before the fix the check only looked at
+    ``slate_ids`` and ``self._transitions``, so an off-slate backfill tracker
+    being actively retried (see ``_hydrate_vanished_backfill_matches``) while
+    a PRIOR give-up cycle's cooldown was still counting down had its unseen
+    streak incremented anyway — eventually purging the cooldown entry (and
+    its epoch/backoff memory) out from under a live tracker."""
+    from gamecollect.engine import (
+        _COOLDOWN_MAX_POLLS,
+        CollectorEngine,
+        _TransitionTracker,
+    )
+
+    db = tmp_path / "engine.db"
+    provider = ScriptedDetailProvider([])
+    engine = CollectorEngine(make_pack(provider), str(db), SOURCE, 0.01, provider=provider)
+    try:
+        # A lapsed (remaining == 0) cooldown for a match with an ACTIVE
+        # backfill tracker, off-slate.
+        engine._enter_cooldown("m1", is_backfill_origin=True)
+        engine._cooldowns["m1"].remaining = 0
+        engine._backfill["m1"] = _TransitionTracker()
+
+        for _ in range(_COOLDOWN_MAX_POLLS + 5):
+            engine._age_cooldowns(set())
+    finally:
+        engine.close()
+
+    assert "m1" in engine._cooldowns, (
+        "the cooldown must not be purged while self._backfill still tracks the match"
+    )
+    assert engine._cooldowns["m1"].expired_unseen == 0, (
+        "an actively-tracked backfill match must reset the unseen streak every poll"
+    )
+
+
 def test_backfill_budget_deferred_fresh_candidate_seeds_fallback_survives_vanish(tmp_path):
     """A fresh first-sight-finished candidate deferred by the per-poll fetch
     budget must have its tracker's ``fallback`` seeded with the observed
