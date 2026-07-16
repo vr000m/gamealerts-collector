@@ -228,6 +228,36 @@ def test_numeric_athlete_id_and_team_are_coerced_not_dropped(db):
     assert teams == {"42"}
 
 
+def test_lineup_team_is_canonicalized_to_match_roster_and_state_vocabulary(db):
+    """Review finding: football_lineups.team used to store the raw ESPN
+    roster-block name unchanged, while football_roster.team (persisted by
+    the same hook) and payload["home_team"]/["away_team"] (what
+    FootballReadPort's participant-keyed lookups filter against) both run
+    provider names through canonical_display_name. For an alias-mapped team
+    (Türkiye -> Turkey) the two tables disagreed, so lineup_for_match/
+    lineup_team_announced silently returned nothing for a caller using the
+    canonical name it got from latest_state(). This pins that
+    football_lineups.team is canonicalized the same way."""
+    conn, writer = db
+    payload = {
+        "lineups": [
+            {
+                "team": "Türkiye",
+                "players": [{"athlete_id": 1, "display_name": "A. Player"}],
+            }
+        ],
+    }
+    persist_football_side_tables(conn, writer, _match(payload), MATCH_ID)
+    teams = {
+        row[0]
+        for row in conn.execute("SELECT team FROM football_lineups WHERE match_id = ?", (MATCH_ID,))
+    }
+    assert teams == {"Turkey"}, (
+        "football_lineups.team must be canonicalized (Türkiye -> Turkey) so it "
+        "agrees with football_roster.team and payload home_team/away_team"
+    )
+
+
 def test_integral_float_and_string_athlete_id_collapse_to_one_row(db):
     """The same athlete spelled as JSON float ``760421.0`` and string
     ``"760421"`` must collapse to ONE primary-key row (last-wins), not two."""

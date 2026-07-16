@@ -22,6 +22,7 @@ from typing import Any
 
 from gamecollect.db import reader
 from gamecollect.fold import fold
+from gamecollect_football.operations import _resolve_source
 
 __all__ = ["FootballReadPort"]
 
@@ -47,10 +48,6 @@ class FootballReadPort:
 
     def __init__(self, conn: sqlite3.Connection) -> None:
         self._conn = conn
-
-    def _resolve_source(self, match_id: str) -> str | None:
-        state = reader.get_state(self._conn, match_id)
-        return state["source"] if state is not None else None
 
     def latest_state(self, match_id: str) -> dict[str, Any] | None:
         row = reader.get_state(self._conn, match_id)
@@ -110,7 +107,7 @@ class FootballReadPort:
         return [self._project_event(r) for r in rows]
 
     def _lineup_rows(self, match_id: str, participant: str | None = None) -> list[dict[str, Any]]:
-        source = self._resolve_source(match_id)
+        source = _resolve_source(self._conn, match_id)
         if source is None:
             return []
         rows = reader.get_side_table_rows(
@@ -153,7 +150,7 @@ class FootballReadPort:
         return self.lineup_for_match(match_id, participant)
 
     def venue_for_match(self, match_id: str) -> dict[str, Any] | None:
-        source = self._resolve_source(match_id)
+        source = _resolve_source(self._conn, match_id)
         if source is None:
             return None
         row = reader.get_side_table_row(self._conn, "football_venue", source, match_id)

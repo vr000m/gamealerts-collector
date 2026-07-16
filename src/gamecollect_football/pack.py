@@ -291,12 +291,24 @@ def _lineup_rows(
     old ON CONFLICT semantics); non-scalar values coerce to ``None``. The
     ``team``/``athlete_id`` PK components go through :func:`_to_key_text`
     (bool rejected, integral float canonicalized) so ``760421.0`` and
-    ``"760421"`` collapse to one player row instead of duplicating it."""
+    ``"760421"`` collapse to one player row instead of duplicating it.
+    ``team`` is then run through :func:`canonical_display_name` so it agrees
+    with ``football_roster.team`` and ``payload["home_team"]``/``["away_team"]``
+    on alias-mapped teams (``Türkiye`` -> ``Turkey``, etc.) — a mismatch here
+    silently breaks any participant-keyed lookup filtering by team name."""
     rows: dict[tuple[str, str, str, str], tuple] = {}
     for lineup in lineups:
         if not isinstance(lineup, dict):
             continue
         team = _to_key_text(lineup.get("team"))
+        # Canonicalize alias-mapped team names (Türkiye -> Turkey, etc.) so
+        # football_lineups.team agrees with football_roster.team
+        # (_roster_rows_for_team) and payload["home_team"]/["away_team"]
+        # (reconcile.canonical_display_name) — all three must use the same
+        # team-name vocabulary or FootballReadPort's participant-keyed
+        # lookups (lineup_for_match, lineup_team_announced) silently miss.
+        if team:
+            team = canonical_display_name(team)
         if not team:
             _warn_skip_once(
                 source,
@@ -445,11 +457,27 @@ def _persist_roster_for_team(conn: sqlite3.Connection, team_name: str | None) ->
 
     Unlike stats/lineups/venue, roster rows never change poll-to-poll — an
     ``INSERT OR IGNORE`` on the ``(team, number)`` PRIMARY KEY is sufficient
-    and cheaper than a diff-and-replace."""
+    and cheaper than a diff-and-replace. A cheap existence check (rather than
+    an in-memory cache, which would need per-database-file scoping to avoid
+    one connection's cache wrongly suppressing a write to a different,
+    unrelated database opened later in the same process) skips the
+    executemany write entirely once a team's rows are already on disk, so a
+    live match's per-poll calls do real write work only once. The lookup
+    itself (``_roster_rows_for_team``) stays cheap regardless — it is backed
+    by ``@lru_cache``'d fixture data."""
     if not team_name:
         return
     rows = _roster_rows_for_team(team_name)
     if not rows:
+        return
+    # All rows share one canonical team value (the first PK column) — check
+    # existence against that, not a re-derivation, so this can never disagree
+    # with what the insert below actually writes.
+    stored_team = next(iter(rows.values()))[0]
+    already_persisted = conn.execute(
+        "SELECT 1 FROM football_roster WHERE team = ? LIMIT 1", (stored_team,)
+    ).fetchone()
+    if already_persisted is not None:
         return
     placeholders = ", ".join("?" for _ in _ROSTER_COLUMNS.split(","))
     conn.executemany(
