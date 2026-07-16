@@ -172,9 +172,17 @@ _LINEUP_COLUMNS = (
     "formation_place, home_away, formation"
 )
 _VENUE_COLUMNS = "source, match_id, stadium, city"
-_ROSTER_COLUMNS = (
-    "team, fifa_code, group_name, number, position, player_name, name_folded, date_of_birth"
+_ROSTER_COLUMN_NAMES: tuple[str, ...] = (
+    "team",
+    "fifa_code",
+    "group_name",
+    "number",
+    "position",
+    "player_name",
+    "name_folded",
+    "date_of_birth",
 )
+_ROSTER_COLUMNS = ", ".join(_ROSTER_COLUMN_NAMES)
 
 
 def _stats_rows(
@@ -362,17 +370,21 @@ def _warn_roster_unmatched_once(team_name: str) -> None:
     log.warning("football_roster: no squad fixture entry for team %r", team_name)
 
 
-def _roster_rows_for_team(team_name: str) -> dict[tuple[str, int], tuple]:
+def _roster_rows_for_team(team_name: str) -> tuple[str | None, dict[tuple[str, int], tuple]]:
     """Project the squad fixture's players for ``team_name`` onto row tuples.
 
     ``team_name`` is a live provider team name (e.g. ESPN ``displayName``);
     matched against the fixture via :func:`canonical_team_name` so alias
-    spellings (``Türkiye``/``Turkey``) still resolve. Returns an empty dict
-    when the team has no fixture entry (warns once) or has no valid players."""
+    spellings (``Türkiye``/``Turkey``) still resolve. Returns ``(None, {})``
+    when the team has no fixture entry (warns once) or has no valid players;
+    otherwise returns ``(team, rows)`` where ``team`` is the canonical
+    display name stamped on every projected row's first PK column — the
+    caller persisting these rows should use this returned name rather than
+    re-deriving it from the rows dict."""
     squad = _squads_by_canonical_name().get(canonical_team_name(team_name))
     if squad is None:
         _warn_roster_unmatched_once(team_name)
-        return {}
+        return None, {}
     team = canonical_display_name(squad["name"])
     fifa_code = _to_text(squad.get("fifa_code"))
     group_name = _to_text(squad.get("group"))
@@ -394,7 +406,7 @@ def _roster_rows_for_team(team_name: str) -> dict[tuple[str, int], tuple]:
             fold(name),
             _to_text(player.get("date_of_birth")),
         )
-    return rows
+    return team, rows
 
 
 def _persist_roster_for_team(conn: sqlite3.Connection, team_name: str | None) -> None:
@@ -412,19 +424,20 @@ def _persist_roster_for_team(conn: sqlite3.Connection, team_name: str | None) ->
     by ``@lru_cache``'d fixture data."""
     if not team_name:
         return
-    rows = _roster_rows_for_team(team_name)
+    stored_team, rows = _roster_rows_for_team(team_name)
     if not rows:
         return
-    # All rows share one canonical team value (the first PK column) — check
-    # existence against that, not a re-derivation, so this can never disagree
-    # with what the insert below actually writes.
-    stored_team = next(iter(rows.values()))[0]
+    # stored_team is the same canonical name _roster_rows_for_team already
+    # stamped onto every row's first PK column — using its return value
+    # directly (rather than reaching back into the rows dict) means this
+    # existence check can never disagree with what the insert below writes,
+    # and stays correct if the column order in the row tuples ever changes.
     already_persisted = conn.execute(
         "SELECT 1 FROM football_roster WHERE team = ? LIMIT 1", (stored_team,)
     ).fetchone()
     if already_persisted is not None:
         return
-    placeholders = ", ".join("?" for _ in _ROSTER_COLUMNS.split(","))
+    placeholders = ", ".join("?" for _ in _ROSTER_COLUMN_NAMES)
     conn.executemany(
         f"INSERT OR IGNORE INTO football_roster ({_ROSTER_COLUMNS}) VALUES ({placeholders})",  # noqa: S608
         list(rows.values()),
