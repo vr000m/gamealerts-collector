@@ -216,3 +216,29 @@ class TestCollectorWriteCycleLeavesNoPollution:
                 ("wc2026:no-such-match", "Ghost line", "2026-06-14T04:00:00+00:00"),
             )
             conn.commit()
+
+
+class TestGetRecentCommentaryToleranceBoundary:
+    """get_recent_commentary's docstring promises tolerating an ABSENT
+    commentary table (returns [] instead of raising) since gamealerts creates
+    it lazily. It does NOT promise tolerating a column-shape mismatch on a
+    table that DOES exist -- that is a real bug in the consumer's schema and
+    must still raise, so it doesn't silently degrade into a "no commentary"
+    read. This asserts both sides of that documented boundary using a direct
+    sqlite_master existence check (not exception-message string matching,
+    which is fragile across SQLite versions)."""
+
+    def test_absent_table_returns_empty_list(self, collector_db):
+        _path, conn = collector_db
+        # No commentary DDL applied at all.
+        assert reader.get_recent_commentary(conn, MATCH_ID) == []
+
+    def test_existing_table_missing_expected_column_still_raises(self, collector_db):
+        _path, conn = collector_db
+        # A commentary table that exists but lacks the documented
+        # created_at/id columns get_recent_commentary's ORDER BY relies on.
+        conn.executescript("CREATE TABLE commentary (match_id TEXT NOT NULL, text TEXT NOT NULL);")
+        conn.commit()
+
+        with pytest.raises(sqlite3.OperationalError):
+            reader.get_recent_commentary(conn, MATCH_ID)

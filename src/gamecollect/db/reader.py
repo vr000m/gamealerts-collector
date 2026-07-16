@@ -293,16 +293,22 @@ def get_recent_commentary(
     The collector never writes commentary (DESIGN.md §3) — the table is
     created lazily by the consuming app on its own scoped connection, so a
     collector-first boot / pre-match / replay may have no such table yet.
-    Tolerated here: returns ``[]`` instead of letting
-    ``sqlite3.OperationalError`` escape.
+    Tolerated here: returns ``[]`` when the table is absent, instead of
+    letting ``sqlite3.OperationalError`` escape. This checks
+    ``sqlite_master`` directly rather than string-matching the exception
+    message (fragile across SQLite versions) — a genuine column-shape
+    mismatch on a table that DOES exist is a real bug in the consumer's
+    schema and is allowed to raise, since that is not the documented
+    tolerance here.
     """
-    try:
-        return _query(
-            conn,
-            "SELECT * FROM commentary WHERE match_id = ? ORDER BY created_at DESC, id DESC LIMIT ?",
-            (match_id, limit),
-        )
-    except sqlite3.OperationalError as exc:
-        if "no such table" in str(exc):
-            return []
-        raise
+    exists = _query(
+        conn,
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'commentary'",
+    )
+    if not exists:
+        return []
+    return _query(
+        conn,
+        "SELECT * FROM commentary WHERE match_id = ? ORDER BY created_at DESC, id DESC LIMIT ?",
+        (match_id, limit),
+    )
