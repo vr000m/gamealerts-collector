@@ -1,6 +1,6 @@
 # Task: GameWorker integration — generic read Protocol, shared-file write model, pack-manifest vocabulary
 
-**Status**: Not Started
+**Status**: Complete
 **Component**: collector
 **Assigned to**: Claude
 **Priority**: High
@@ -197,14 +197,14 @@ _(EXCLUSIVE on the admission lock is reserved for a destructive reset; SHARED wr
 
 ## Acceptance Criteria
 
-- [ ] The collector creates + stamps the file first; both processes then open it via the shared `data_dir`/env convention; explicit-path `connect()` still works.
-- [ ] Writes are serialized by SQLite WAL + `busy_timeout`; the SHARED admission lock is present and its EXCLUSIVE-fences-SHARED direction is tested; concurrent reads via WAL never block; no corruption in the integration test.
-- [ ] A `MatchReadPort` adapter (in `gamecollect_football`, not core) satisfies the worker's 10-method surface with generically-shaped returns, validated over seeded data + the knockout fixtures; the adapter tolerates an absent `commentary` table.
-- [ ] The generic `readport.py` Protocol carries **no football column names in its type signatures** — asserted by a source/AST/grep test.
-- [ ] `vocabulary` op returns the football pack's taxonomy/prompts/`compaction_boundaries`; exposed in client, CLI, and `tools --json` manifest.
-- [ ] Collector writes zero `commentary` rows and creates no gamealerts pollution tables (tested); commentary is readable through the contract when present.
-- [ ] Cross-repo contract doc committed; DESIGN.md/README/AGENTS updated; the 7 Integration Seams are written up for the gamealerts side.
-- [ ] Full suite + both CI lint gates green.
+- [x] The collector creates + stamps the file first; both processes then open it via the shared `data_dir`/env convention; explicit-path `connect()` still works.
+- [x] Writes are serialized by SQLite WAL + `busy_timeout`; the SHARED admission lock is present and its EXCLUSIVE-fences-SHARED direction is tested; concurrent reads via WAL never block; no corruption in the integration test.
+- [x] A `MatchReadPort` adapter (in `gamecollect_football`, not core) satisfies the worker's 10-method surface with generically-shaped returns, validated over seeded data + the knockout fixtures; the adapter tolerates an absent `commentary` table.
+- [x] The generic `readport.py` Protocol carries **no football column names in its type signatures** — asserted by a source/AST/grep test.
+- [x] `vocabulary` op returns the football pack's taxonomy/prompts/`compaction_boundaries`; exposed in client, CLI, and `tools --json` manifest.
+- [x] Collector writes zero `commentary` rows and creates no gamealerts pollution tables (tested); commentary is readable through the contract when present.
+- [x] Cross-repo contract doc committed; DESIGN.md/README/AGENTS updated; the 7 Integration Seams are written up for the gamealerts side.
+- [x] Full suite + both CI lint gates green.
 
 <!-- reviewed: 2026-07-08 @ 3c367820ad58712a0dade1d21463a001ad8dee7e -->
 
