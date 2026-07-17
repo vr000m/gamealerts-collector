@@ -1,6 +1,6 @@
 # Task: Collector interfaces — engine daemon, client library, gamecollect CLI, ReplayProvider + fixtures
 
-**Status**: Not Started
+**Status**: Shipped — merged in PR #2
 **Component**: collector
 **Assigned to**: Claude
 **Priority**: High
@@ -243,6 +243,6 @@ All four phases conducted 2026-07-03 via /conduct (clean-context implementer/tes
 
 Acceptance criteria: all verified — including live shell smoke (`gamecollect collect` with ReplayProvider via main() injection → `matches`/`events --json` show 6 events / 6–0 / David ×3). Note: `collect` reaches ReplayProvider through the main() injection seam; no shell-level `--fixture` flag was in scope.
 
-Header `**Status**: Not Started` left unedited deliberately — it sits above the review marker (hash window); this section is the completion record.
+Header updated to `**Status**: Shipped — merged in PR #2` post-merge (2026-07-17); it sits above the review marker (hash window), but the change is a status label only and doesn't alter the reviewed content.
 
 Next: /deep-review, /security-review, then merge PR.
