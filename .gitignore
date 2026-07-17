@@ -30,3 +30,6 @@ htmlcov/
 # deep-review local state (skein deep-review skill)
 .deep-review/
 .conduct/
+
+# review-gauntlet local state (skein review-gauntlet skill)
+.gauntlet/
