@@ -250,6 +250,42 @@ Three review-gauntlet rounds ran against the completed 5-phase branch and found 
 - Smaller fixes in the same rounds: a DDL structural-consistency check now runs at import time (catches a `SideTableSpec.match_keyed` mismatch against its own DDL immediately rather than at first migration); ESPN summary parsing now tolerates an explicit `gameInfo: null` (previously assumed the key, if present, was always an object); docs (`README.md`, `AGENTS.md`) and the core-op count were updated for the `vocabulary` CLI op, which had shipped in Phase 4 without a matching doc update.
 - **This same fixer round** additionally validated the `order_by` parameter in the generic side-table read helpers (`get_side_table_rows`/`get_team_side_table_rows`/`get_all_team_side_table_rows` in `src/gamecollect/db/reader.py`) — the `table` parameter had been defended against non-identifier input in an earlier round, but `order_by` was still interpolated unchecked. Both are currently unreachable (every caller passes a literal) but are exported, generic core API, so the same defense-in-depth rationale applies to both parameters.
 
+### Post-handoff contract extension (2026-07-17)
+
+While the gamealerts session built against PR #5 (contract kept open
+deliberately for exactly this), it flagged a real gap: `MatchReadPort`'s 10
+methods all require an already-known `match_id`/`participant` — none let a
+consumer holding only the port list matches or resolve a spoken/typed team
+name to a `match_id`. `gamecollect.client.list_matches` existed but returns
+a typed `MatchState` dataclass with soft entity refs, not this Protocol's
+plain-dict `participants` shape, so it wasn't a substitute for port-only
+consumers.
+
+Closed by adding `MatchReadPort.list_matches(*, source=None, status=None) ->
+list[dict]` (`src/gamecollect/readport.py`, `src/gamecollect_football/readport.py`),
+returning `{"match_id", "source", "status", "kickoff_utc", "participants":
+[...]}` per match — the same `participants` shape as `latest_state`,
+reusing its existing canonical-name projection logic (extracted into a
+shared `_project_participants` helper rather than duplicated). Deliberately
+excludes `phase`/`extra`/`display_clock`/`minute`/`period` — those need a
+targeted per-match query this method shouldn't pay for across a whole
+result set.
+
+Explicitly **not** added: a separate `resolve_team_by_name(name) ->
+match_id` method. `list_matches` plus caller-side fold-matching against
+`participants[].name` (already guaranteed canonical by the write-seam
+canonicalization) covers the resolution need without growing the Protocol
+for a query pattern that legitimately varies by consumer. gamealerts is
+proceeding client-side for `resolve_team_by_name`/`card_counts` derivation
+per its own note back — no ask on those.
+
+Updated: `docs/integration/gameworker-contract.md` §1 (method table +
+discovery/resolution note), `scripts/smoke_gameworker_contract.py` (2 new
+checks), `tests/football/test_football_readport.py` (new `TestListMatches`
+class, 7 tests including a canonicalization regression guard mirroring
+`TestLegacyRowCanonicalization`). Full suite: 678 passed, 1 skipped;
+`ruff check`/`ruff format --check` clean.
+
 ## Final Results
 
 All 5 phases implemented, tested, and committed on `feature/gameworker-integration` (off `main`, base `8dcd647`):

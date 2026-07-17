@@ -21,10 +21,13 @@ the generic signatures.
 
 Consumers inject an adapter and never touch a sport-specific store directly.
 This is a 1:1 replacement for the GameWorker's current 10 football-coupled
-DAO methods:
+DAO methods, plus one new method (`list_matches`, added post-Phase-5 while
+gamealerts built against this contract — see the note below the table) with
+no DAO counterpart:
 
 | Worker method              | Protocol method            |
 |-----------------------------|------------------------------|
+| *(none — see note below)*   | `list_matches`               |
 | `latest_state`              | `latest_state`               |
 | `events_for_match`          | `events_for_match`           |
 | `lineup_for_match`          | `lineup_for_match`           |
@@ -35,6 +38,21 @@ DAO methods:
 | `player_in_lineup`          | `player_in_lineup`           |
 | `lineup_team_announced`     | `lineup_team_announced`      |
 | `recent_commentary`         | `recent_commentary`          |
+
+**Discovery/resolution note:** every method above requires an already-known
+`match_id` or `participant` — none of them let a consumer holding only the
+port list matches or resolve a spoken/typed team name to a `match_id`.
+`gamecollect.client.list_matches` already existed, but returns a typed
+`MatchState` dataclass with soft entity refs (`home_entity`/`away_entity`),
+not this Protocol's plain-dict `participants` shape — not a drop-in
+substitute for a port-only consumer. `MatchReadPort.list_matches` (below)
+is the sanctioned fix: fold-match a resolved team name against
+`participants[].name`, which is always canonical (the write seam
+canonicalizes provider names before persisting — see
+`gamecollect_football.reconcile`). No separate `resolve_team_by_name(name)
+-> match_id` method was added: `list_matches` plus caller-side fold-matching
+covers it without growing the Protocol surface for a query pattern (name
+resolution heuristics) that legitimately varies by consumer.
 
 Return shapes generalize the two-team, single-phase assumptions baked into
 the worker's current DAO:
@@ -49,6 +67,12 @@ the worker's current DAO:
 Every method returns plain dicts/lists (or `bool`/`None`) — the shapes a
 `MatchContext`/Q&A tool consumes directly, never a typed dataclass:
 
+- `list_matches(*, source=None, status=None) -> list[dict]` — per entry:
+  `{"match_id", "source", "status", "kickoff_utc", "participants": [...]}`.
+  Same `participants` shape as `latest_state`, but deliberately lighter — no
+  `phase`/`extra`/`display_clock`/`minute`/`period`, since those need a
+  targeted per-match query this method doesn't pay for across a whole result
+  set. Call `latest_state` for one match's full detail once resolved.
 - `latest_state(match_id) -> dict | None` — `{"match_id", "status", "minute",
   "period", "display_clock", "kickoff_utc", "phase", "participants": [...],
   "extra": {...}}`. `extra` carries adapter/sport-specific additions (e.g.

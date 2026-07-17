@@ -38,6 +38,15 @@ worker's concrete football DAO on every fact-read call site:
 | ``lineup_team_announced`` | :meth:`lineup_team_announced` |
 | ``recent_commentary``     | :meth:`recent_commentary`     |
 
+:meth:`list_matches` has no worker-DAO counterpart above — it closes a gap
+found while gamealerts built against this Protocol: every other method
+requires an already-known ``match_id``/``participant``, so a consumer holding
+only the port (not the full ``gamecollect.client`` module) had no way to
+discover matches or resolve a spoken/typed team name to a ``match_id``.
+``gamecollect.client.list_matches`` already existed but returns a typed
+``MatchState`` dataclass with soft entity refs, not this Protocol's plain-dict
+``participants`` shape — so it is not a drop-in substitute for port consumers.
+
 Every method returns plain dicts/lists (or ``bool``/``None``) — the shapes a
 ``MatchContext``/Q&A tool consumes directly, not typed dataclasses.
 """
@@ -52,6 +61,30 @@ __all__ = ["MatchReadPort"]
 @runtime_checkable
 class MatchReadPort(Protocol):
     """Sport-neutral read surface over one collector-owned match store."""
+
+    def list_matches(
+        self, *, source: str | None = None, status: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Return match summaries, optionally filtered by ``source``/``status``.
+
+        Shape per entry: ``{"match_id", "source", "status", "kickoff_utc",
+        "participants": [{"name", "side", "score"}, ...]}`` — the same
+        ``participants`` shape as :meth:`latest_state`, with canonical
+        display names (the write seam canonicalizes provider names before
+        persisting — see ``gamecollect_football.reconcile`` — so these are
+        already fold-match-ready, not raw provider strings). This is the
+        sanctioned discovery/resolution path: a caller resolving a spoken or
+        typed team name to a ``match_id`` should fold-match against
+        ``participants[].name`` here rather than reaching past the port for
+        ``gamecollect.client.list_matches``.
+
+        Deliberately lighter than :meth:`latest_state`: no ``phase``,
+        ``extra``, ``display_clock``, ``minute``, or ``period`` — those
+        require a targeted per-match query this method does not pay for
+        across a whole result set. Call :meth:`latest_state` for one match's
+        full detail once resolved.
+        """
+        ...
 
     def latest_state(self, match_id: str) -> dict[str, Any] | None:
         """Return the current state snapshot for ``match_id``, or None if unknown.

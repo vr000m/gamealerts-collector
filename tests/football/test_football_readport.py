@@ -549,3 +549,98 @@ class TestCurrentPhaseTargetedLookup:
         self._seed(db)
         row = reader.get_latest_event_of_type(db, self.MATCH_ID, frozenset({"full_time"}))
         assert row is None
+
+
+class TestListMatches:
+    """Discovery/resolution gap raised by gamealerts while building against
+    PR #5: every other MatchReadPort method needs an already-known match_id
+    or participant. list_matches() closes it — a consumer holding only the
+    port can enumerate matches and fold-match a spoken/typed team name
+    against participants[].name to resolve a match_id."""
+
+    def _seed_two_matches(self, db):
+        writer = PartitionWriter(db, SOURCE)
+        writer.upsert_match(
+            {
+                "match_id": "760421",
+                "source": SOURCE,
+                "status": "IN_PLAY",
+                "kickoff_utc": "2026-06-14T04:00:00+00:00",
+                "score_home": 1,
+                "score_away": 0,
+                "display_clock": "27'",
+                "payload": {"home_team": "Turkey", "away_team": "Australia"},
+            }
+        )
+        writer.upsert_match(
+            {
+                "match_id": "760422",
+                "source": SOURCE,
+                "status": "SCHEDULED",
+                "kickoff_utc": "2026-06-15T04:00:00+00:00",
+                "score_home": None,
+                "score_away": None,
+                "display_clock": None,
+                "payload": {"home_team": "Spain", "away_team": "Portugal"},
+            }
+        )
+
+    def test_returns_a_summary_per_seeded_match(self, db):
+        self._seed_two_matches(db)
+        adapter = FootballReadPort(db)
+        results = adapter.list_matches()
+        assert {r["match_id"] for r in results} == {"760421", "760422"}
+
+    def test_summary_shape_has_participants_with_side_and_score(self, db):
+        self._seed_two_matches(db)
+        adapter = FootballReadPort(db)
+        results = adapter.list_matches()
+        by_id = {r["match_id"]: r for r in results}
+        turkey_match = by_id["760421"]
+        assert turkey_match["status"] == "IN_PLAY"
+        assert turkey_match["kickoff_utc"] == "2026-06-14T04:00:00+00:00"
+        assert turkey_match["participants"] == [
+            {"name": "Turkey", "side": "home", "score": 1},
+            {"name": "Australia", "side": "away", "score": 0},
+        ]
+
+    def test_status_filter_scopes_results(self, db):
+        self._seed_two_matches(db)
+        adapter = FootballReadPort(db)
+        results = adapter.list_matches(status="SCHEDULED")
+        assert {r["match_id"] for r in results} == {"760422"}
+
+    def test_source_filter_excludes_other_sources(self, db):
+        self._seed_two_matches(db)
+        adapter = FootballReadPort(db)
+        assert adapter.list_matches(source="not-a-real-source") == []
+
+    def test_no_matches_returns_empty_list(self, db):
+        adapter = FootballReadPort(db)
+        assert adapter.list_matches() == []
+
+    def test_participant_names_are_canonical_not_raw_provider_strings(self, db):
+        """Regression guard mirroring TestLegacyRowCanonicalization above:
+        list_matches reads payload["home_team"]/["away_team"], which the
+        write seam always canonicalizes (gamecollect_football.reconcile) —
+        confirm a canonical name comes back, not a raw provider alias."""
+        writer = PartitionWriter(db, SOURCE)
+        writer.upsert_match(
+            {
+                "match_id": "760423",
+                "source": SOURCE,
+                "status": "IN_PLAY",
+                "kickoff_utc": "2026-06-16T04:00:00+00:00",
+                "score_home": 0,
+                "score_away": 0,
+                "display_clock": "5'",
+                # Written pre-canonicalized, exactly as the real write seam
+                # would stamp it (canonical_display_name("Türkiye") == "Turkey").
+                "payload": {"home_team": "Turkey", "away_team": "Cape Verde"},
+            }
+        )
+        adapter = FootballReadPort(db)
+        results = adapter.list_matches()
+        names = {p["name"] for r in results for p in r["participants"]}
+        assert "Turkey" in names
+        assert "Türkiye" not in names

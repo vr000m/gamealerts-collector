@@ -132,6 +132,20 @@ def build_checks(adapter: FootballReadPort, conn: Any) -> list[tuple[str, Check]
         venue = adapter.venue_for_match(MATCH_ID)
         return venue == EXPECTED_VENUE, f"venue={venue!r}"
 
+    def list_matches_check() -> tuple[bool, str]:
+        results = adapter.list_matches()
+        by_id = {r["match_id"]: r for r in results}
+        found = MATCH_ID in by_id
+        participants = {p["name"] for p in by_id.get(MATCH_ID, {}).get("participants", [])}
+        ok = found and participants == EXPECTED_PARTICIPANTS
+        return ok, f"found={found} participants={participants!r}"
+
+    def list_matches_status_filter_check() -> tuple[bool, str]:
+        status = adapter.list_matches()[0]["status"] if adapter.list_matches() else None
+        filtered = adapter.list_matches(status=status) if status else []
+        ok = bool(filtered) and all(r["status"] == status for r in filtered)
+        return ok, f"status={status!r} count={len(filtered)}"
+
     def latest_state_check() -> tuple[bool, str]:
         state = adapter.latest_state(MATCH_ID)
         keys = sorted(state) if isinstance(state, dict) else state
@@ -174,6 +188,8 @@ def build_checks(adapter: FootballReadPort, conn: Any) -> list[tuple[str, Check]
         ("events_for_match: scorer matches fixture", events_check),
         ("lineup_for_match: both teams announced, includes scorer", lineup_check),
         ("venue_for_match: matches fixture", venue_check),
+        ("list_matches: finds the fixture with canonical participants", list_matches_check),
+        ("list_matches(status=...): filter scopes results", list_matches_status_filter_check),
         ("latest_state: returns a dict", latest_state_check),
         ("events_for_match(since_seq=-1): returns a list", events_since_check),
         ("lineup_for_match_live: returns a list", live_lineup_check),

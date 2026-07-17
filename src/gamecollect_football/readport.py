@@ -50,11 +50,25 @@ class FootballReadPort:
     def __init__(self, conn: sqlite3.Connection) -> None:
         self._conn = conn
 
-    def latest_state(self, match_id: str) -> dict[str, Any] | None:
-        row = reader.get_state(self._conn, match_id)
-        if row is None:
-            return None
+    def list_matches(
+        self, *, source: str | None = None, status: str | None = None
+    ) -> list[dict[str, Any]]:
+        rows = reader.list_matches(self._conn, source=source, status=status)
+        return [self._project_summary(r) for r in rows]
+
+    def _project_summary(self, row: dict[str, Any]) -> dict[str, Any]:
         payload = reader.decode_payload(row.get("payload"))
+        return {
+            "match_id": row["match_id"],
+            "source": row.get("source"),
+            "status": row.get("status"),
+            "kickoff_utc": row.get("kickoff_utc"),
+            "participants": self._project_participants(row, payload),
+        }
+
+    def _project_participants(
+        self, row: dict[str, Any], payload: dict[str, Any]
+    ) -> list[dict[str, Any]]:
         participants: list[dict[str, Any]] = []
         home_name = payload.get("home_team")
         away_name = payload.get("away_team")
@@ -62,6 +76,13 @@ class FootballReadPort:
             participants.append({"name": home_name, "side": "home", "score": row.get("score_home")})
         if away_name:
             participants.append({"name": away_name, "side": "away", "score": row.get("score_away")})
+        return participants
+
+    def latest_state(self, match_id: str) -> dict[str, Any] | None:
+        row = reader.get_state(self._conn, match_id)
+        if row is None:
+            return None
+        payload = reader.decode_payload(row.get("payload"))
         return {
             "match_id": row["match_id"],
             "status": row.get("status"),
@@ -70,7 +91,7 @@ class FootballReadPort:
             "display_clock": row.get("display_clock"),
             "kickoff_utc": row.get("kickoff_utc"),
             "phase": self._current_phase(match_id, row.get("status")),
-            "participants": participants,
+            "participants": self._project_participants(row, payload),
             "extra": {
                 "result_type": payload.get("result_type"),
                 "stadium": payload.get("stadium"),
