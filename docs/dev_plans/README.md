@@ -6,6 +6,7 @@ Index of dev plans for gamealerts-collector. The plan file is the source of trut
 
 | Plan | Comp | Status | Branch | Notes |
 |------|------|--------|--------|-------|
+| [20260718-feature-historical-backfill](20260718-feature-historical-backfill.md) | collector | Not Started | feature/gameworker-integration | One-shot `backfill` CLI for prior-day matches via `fetch_schedule`; closes the Follow-up Work gap left by `20260711-feature-finished-match-backfill`. Lands on PR #5. |
 
 ## Completed Tasks
 
