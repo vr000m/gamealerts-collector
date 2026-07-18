@@ -54,7 +54,7 @@ from gamecollect.db.writer import (
     TaxonomyError,
     UnseededMatchError,
 )
-from gamecollect.diffing import MatchDiff, diff_matches
+from gamecollect.diffing import MatchDiff, diff_match, diff_matches
 from gamecollect.fallback_merge import (
     accrue_fallback as _accrue_fallback,
 )
@@ -890,6 +890,109 @@ class CollectorEngine:
                 # would keep re-firing (fetching detail again) every poll
                 # forever.
                 self._register_backfill_apply_failure(diff.match)
+
+    @property
+    def source(self) -> str:
+        """The partition this engine writes under (read-only)."""
+        return self._source
+
+    def _resolve_stored_match_id(self, provider_match_id: str) -> str | None:
+        """Resolve the stored ``matches.match_id`` for a provider-native id.
+
+        ``matches.match_id`` is not always the bare provider id: packs using
+        a custom ``seed_match`` hook (e.g. the football pack's
+        ``seed_or_reconcile_match``) write a source-qualified stub
+        (``f"{source}:{provider_id}"``) or a canonical id reached through
+        ``provider_match_map``. Mirrors :meth:`_stored_rows_for_provider`'s
+        three id forms and authority order (canonical > qualified stub > bare
+        id for custom-seed packs; bare id > qualified stub for
+        ``default_seed_match`` packs, which never populate the map) but
+        returns the WINNING id string itself, scoped to this engine's own
+        ``self._source`` — never another source's row — so
+        :meth:`stored_source`/:meth:`has_events` can query ``events`` under
+        the id the write actually landed on instead of the bare provider id,
+        which a qualified/reconciled pack never stores under.
+        """
+        qualified = f"{self._source}:{provider_match_id}"
+        if self._pack.seed_match is default_seed_match:
+            rows = self._conn.execute(
+                "SELECT match_id, CASE WHEN match_id = ? THEN 0 ELSE 1 END AS rank "
+                "FROM matches WHERE source = ? AND match_id IN (?, ?) "
+                "ORDER BY rank ASC, match_id ASC LIMIT 1",
+                (provider_match_id, self._source, provider_match_id, qualified),
+            ).fetchall()
+            return rows[0][0] if rows else None
+        rows = self._conn.execute(
+            "SELECT match_id, MIN(rank) AS rank FROM ("
+            "SELECT match_id, CASE WHEN match_id = ? THEN 2 ELSE 1 END AS rank "
+            "FROM matches WHERE source = ? AND match_id IN (?, ?) "
+            "UNION ALL "
+            "SELECT m.match_id, 0 AS rank "
+            "FROM provider_match_map pm "
+            "JOIN matches m ON m.source = pm.source AND m.match_id = pm.match_id "
+            "WHERE pm.source = ? AND pm.provider_match_id = ?"
+            ") candidates GROUP BY match_id ORDER BY rank ASC, match_id ASC LIMIT 1",
+            (
+                provider_match_id,
+                self._source,
+                provider_match_id,
+                qualified,
+                self._source,
+                provider_match_id,
+            ),
+        ).fetchall()
+        return rows[0][0] if rows else None
+
+    def stored_source(self, match_id: str) -> str | None:
+        """Return the ``source`` stored for ``match_id``, or ``None`` if unknown.
+
+        Resolves ``match_id`` (a provider-native id) to its actual stored
+        ``matches.match_id`` row via :meth:`_resolve_stored_match_id` — which
+        is scoped to this engine's own ``self._source`` — then wraps
+        ``reader.get_state`` against this engine's own connection, so callers
+        outside the engine (``backfill.py``) never reach into ``self._conn``
+        directly. A row stored under a DIFFERENT source is therefore reported
+        as ``None`` (not that other source's name): callers must not skip on
+        a ``None`` result, only on an exact match to their own ``source``.
+        """
+        resolved_id = self._resolve_stored_match_id(match_id)
+        if resolved_id is None:
+            return None
+        row = reader.get_state(self._conn, resolved_id)
+        return row["source"] if row is not None else None
+
+    def has_events(self, match_id: str) -> bool:
+        """Return whether at least one event row is stored for ``match_id``.
+
+        Resolves ``match_id`` the same way as :meth:`stored_source`, then
+        wraps ``reader.get_events_since`` against this engine's own
+        connection (events are keyed by the resolved/seeded id, not
+        necessarily the bare provider id).
+        """
+        resolved_id = self._resolve_stored_match_id(match_id)
+        if resolved_id is None:
+            return False
+        return bool(reader.get_events_since(self._conn, resolved_id))
+
+    def apply_one_off_match(
+        self, scoreboard: NormalizedMatch, detail: NormalizedMatch
+    ) -> NormalizedMatch | None:
+        """Apply one enumerated match through the exact live write path.
+
+        Used by the one-shot historical ``backfill`` command (never the poll
+        loop): merges the enumerating scoreboard snapshot with the fetched
+        detail snapshot exactly as the live/same-day path does
+        (:func:`_merge_detail`), builds a from-scratch diff via
+        ``diff_match(merged, last=None)`` (FRESH-write semantics — not a
+        running diff against any stored/in-memory baseline), and writes it
+        through :meth:`_apply`. Reads/writes nothing beyond that: no
+        poll-loop-only in-memory container (``self._last``,
+        ``self._transitions``, ``self._backfill``,
+        ``self._backfill_apply_pending``, cooldowns) is touched.
+        """
+        merged = _merge_detail(scoreboard, detail)
+        diff = diff_match(merged, None)
+        return self._apply(diff)
 
     def _apply(self, diff: MatchDiff) -> NormalizedMatch | None:
         """Seed the match through the pack hook, then append its new events.
