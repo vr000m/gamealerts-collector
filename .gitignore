@@ -33,3 +33,6 @@ htmlcov/
 
 # review-gauntlet local state (skein review-gauntlet skill)
 .gauntlet/
+
+# review-plan local state (skein review-plan skill)
+.review-plan/
