@@ -48,6 +48,21 @@ contract PR #5 introduces is what makes backfilled data actually reachable by
 gamealerts. PR #5 is being held open deliberately for integration gaps like
 this one.
 
+**Known downstream effect — gamealerts side, not fixed here (addendum from
+the gamealerts session, 2026-07-18):** once the full tournament is
+backfilled, most teams will have multiple finished matches in the DB.
+gamealerts' team-name resolver (`resolve_team_by_name`) treats "one team
+name matching more than one candidate match" as Layer-2 ambiguity and
+returns `None`, so a single-team query like "who scored in the Argentina
+game" gets refused with "I don't have data for that match" once Argentina
+has 2+ finished matches — this is the resolver working correctly
+(safe-by-design), not backfilled data being wrong. Two-team queries
+("Argentina vs Brazil") are unaffected and resolve fine. When testing this
+plan's acceptance criteria against real backfilled data, a refused
+single-team query for a team with multiple finished matches is an expected
+gamealerts-side outcome, not a collector bug to chase. Any UX fix for this
+is a later gamealerts product decision, out of scope here.
+
 ## Requirements
 
 - **No forked write path — including the scoreboard/detail merge step.**
@@ -226,6 +241,26 @@ this one.
   never listed (extremely unlikely for a modern tournament, but not
   provably impossible) would silently not appear. State this explicitly in
   `docs/integration/gameworker-contract.md`, not left implicit.
+- **A backfill-only run (no live daemon ever started) must still stamp the
+  shared file so gamealerts' read-only gate accepts it — verified, not
+  assumed** (addendum from the gamealerts session, 2026-07-18: gamealerts
+  opens the shared file read-only and gates on the collector's schema stamp
+  via `wait_for_collector_file_stamped`, raising `CollectorNotReadyError`
+  when absent; a DB that only ever went through `backfill` — the live poll
+  loop never ran — must still pass that gate). **Confirmed already
+  structurally satisfied**: `CollectorEngine.__init__`
+  (`src/gamecollect/engine.py:674`) calls `connect(self._db_path,
+  side_table_ddl=pack.side_table_ddl)` unconditionally at **construction**
+  time, not lazily on first `poll_once`/`run()` — and `connect()` stamps
+  `schema_meta` + creates `matches` as part of schema application
+  regardless of what happens afterward (§2 of
+  `docs/integration/gameworker-contract.md`, "Startup ordering"). Phase 3's
+  `_run_backfill` already constructs the engine (`engine_factory(pack,
+  args.db, args.source, ...)`) before calling `run_backfill`, so the stamp
+  lands even on a zero-match backfill run. This requirement is therefore
+  "confirm it holds, with a test" rather than "build it" — but it must be
+  an explicit, tested contract, not an implicit side effect a future
+  refactor could silently break (e.g. by making engine construction lazy).
 
 ## Review Focus
 
@@ -501,6 +536,16 @@ this one.
 - Run `scripts/smoke_gameworker_contract.py` manually (not part of pytest)
   and confirm it is still 14/14 unaffected by these changes (it seeds its
   own fixture independently of backfill).
+- **Backfill-only readiness-stamp test (new, per the gamealerts addendum,
+  2026-07-18):** run `backfill` against a brand-new temp DB path — no
+  `CollectorEngine.run()`/`poll_once()` ever called on it, only
+  `run_backfill`'s one-shot path — then open a **fresh, separate**
+  connection (mirroring `TestStartupOrdering` in
+  `tests/test_integration_shared_file.py`) and assert
+  `get_schema_version(conn) is not None` and `matches` exists — i.e. the
+  file is readable and stamped exactly as gamealerts'
+  `wait_for_collector_file_stamped` gate requires, even though the live
+  daemon never ran against this file.
 
 ### Phase 5: Docs
 
@@ -703,6 +748,9 @@ sequenceDiagram
 - [ ] Manual Phase 1 live probes: single-day, hyphenated-range, and
       high-match-count-day `fetch_schedule` queries; raw status string
       recorded for the older probe match
+- [ ] Backfill-only readiness-stamp test: a DB touched only by `backfill`
+      (never `run()`/`poll_once()`) is readable via a fresh connection with
+      `schema_meta` stamped (Phase 4, gamealerts addendum)
 
 ### Test Results
 - [ ] All existing tests pass
@@ -749,6 +797,12 @@ sequenceDiagram
 - `apply_one_off_match` merges the scoreboard and detail snapshots via
   `_merge_detail` before applying — proven by the Phase 4 merge-path test,
   not just asserted in prose (per the Critical finding).
+- A DB touched only by `backfill` (the live poll loop never started) is
+  stamped and readable by a fresh connection with no
+  `SchemaVersionError`/unstamped-`schema_meta` condition — the collector-side
+  equivalent of gamealerts' `wait_for_collector_file_stamped` gate passing
+  against a backfill-only file (Phase 4 test, gamealerts addendum
+  2026-07-18).
 - Enumeration unit tests (Phase 2) and a replay-fixture ingest test (Phase 4)
   both pass.
 - `docs/integration/gameworker-contract.md` documents the backfill
@@ -758,7 +812,7 @@ sequenceDiagram
 - Lands as commits on `feature/gameworker-integration` (PR #5) — no new
   branch/PR.
 
-<!-- reviewed: 2026-07-18 @ 9b86d4a75cbfeca58136f8baa4b5c06450cccda4 -->
+<!-- reviewed: 2026-07-18 @ 10c85a6063e52f9625b0c9bf513c71a5299e284c -->
 
 <!-- /review-plan writes the marker line above. Everything below is the workspace: edits here do NOT invalidate the marker. -->
 
@@ -773,6 +827,25 @@ sequenceDiagram
 ## Findings
 
 - (append Phase 1's live-probe output here verbatim once run)
+
+### Addendum from the gamealerts session (2026-07-18)
+
+- **Source-tag dedup reinforced with external confirmation**: gamealerts
+  confirmed from its own side (`main.py:1068`, `readport_shapes.py:346`)
+  that it reads `list_matches()` **unfiltered by source**, so no
+  gamealerts-side source-filtering is needed — the plan's existing
+  "internal writer dedup only, no cross-source filter" design (Requirements,
+  Architecture Decisions) is exactly the right scope; this is corroborating
+  evidence for an already-made decision, not a new requirement.
+- **Positive signal, no action needed**: gamealerts verified Tier-3 live
+  wiring end-to-end this session against `feature/gameworker-integration`
+  @ `7ebf35b` (editable-installed): the contract smoke script (14/14), a
+  9/9 gamealerts-side read-path check, and the live shared-DB adapter +
+  admission lock all resolved cleanly with no fallback path exercised. The
+  `MatchReadPort`/`list_matches` contract (PR #5) holds against a real
+  gamealerts integration — this plan's historical backfill is confirmed as
+  the one remaining gap between "wired" and "actually answers about past
+  games."
 
 ## Issues & Solutions
 
