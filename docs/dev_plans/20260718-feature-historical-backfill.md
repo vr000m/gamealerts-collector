@@ -1011,7 +1011,7 @@ sequenceDiagram
 
 ## Progress
 
-- [ ] Phase 1: Live-network gate — endpoint verification beyond same-day matches
+- [x] Phase 1: Live-network gate — endpoint verification beyond same-day matches
 - [ ] Phase 2: `CollectorEngine.apply_one_off_match` + backfill enumeration module
 - [ ] Phase 3: CLI wiring — `backfill` subcommand
 - [ ] Phase 4: Idempotency, dedup, and end-to-end fixture tests
@@ -1019,7 +1019,47 @@ sequenceDiagram
 
 ## Findings
 
-- (append Phase 1's live-probe output here verbatim once run)
+### Phase 1 live-network gate (run 2026-07-19, conductor-run — see Progress)
+
+- **Target match chosen**: `760421` (Australia vs Türkiye, group stage,
+  2026-06-14) — materially older than the sibling plan's `760511`/`760512`
+  (2026-07-10) probe, from an early part of the tournament window.
+- **`fetch_schedule(dates="20260614")` live result**: returned 5 matches
+  (`760421`, `760422`, `760423`, `760424`, `760425`), all `MatchStatus.FINISHED`.
+  `760421` present as expected.
+- **Raw ESPN `status.type` for `760421`** (verbatim, not just the mapped
+  enum): `{'id': '28', 'name': 'STATUS_FULL_TIME', 'state': 'post',
+  'completed': True, 'description': 'Full Time', 'detail': 'FT',
+  'shortDetail': 'FT'}`.
+- **`fetch_match_detail("760421")` live result**: `status=MatchStatus.FINISHED`,
+  `home_team=Australia`, `away_team=Türkiye`, 15 normalized events. Goal-family
+  event fully populated: `seq=1, minute=27, event_type='goal',
+  team='Australia', player='Nestory Irankunda',
+  assist='Paul Okon-Engstler'`, plus a detail string. Confirms
+  `assert_espn_summary_shape`'s expectations hold for a match well outside
+  the sibling plan's same-adjacent-day probe window.
+- **New range-query probe** (`/review-plan` 2026-07-18 addition):
+  `fetch_schedule(dates="20260613-20260614")` returned 8 matches — exactly
+  the union of `dates="20260613"` (3 matches: `760418`, `760419`, `760420`)
+  and `dates="20260614"` (5 matches: `760421`–`760425`), verified by separate
+  single-day calls. **The hyphenated range form works and returns the
+  correct union** — contrary to the plan's conservative fallback assumption.
+  This does NOT change the plan's decision to default to day-by-day-only
+  chunking (Requirements/Technical Specifications already made that call
+  independent of this probe's outcome); recorded as a positive signal only,
+  not an action item.
+- **New high-match-count-day probe** (`/review-plan` 2026-07-18 addition):
+  single-day counts scaled naturally across dates checked —
+  `20260611`→2, `20260613`→3, `20260615`→4, `20260618`→4, `20260620`→3,
+  and `20260624`/`20260625`/`20260626`/`20260627`→6 each. No round-number
+  plateau (e.g. a suspicious flat 10/25/50 across different dates) that
+  would indicate silent pagination or a response cap; counts vary with
+  actual matchday density as expected for the tournament's group-stage
+  schedule.
+- **STOP condition check**: none of the single-day `fetch_schedule` /
+  `fetch_match_detail` probes failed, errored, or returned a shape
+  inconsistent with `assert_espn_summary_shape`. **Gate passed — proceeding
+  to Phase 2.**
 
 ### Addendum from the gamealerts session (2026-07-18)
 
