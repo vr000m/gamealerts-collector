@@ -49,19 +49,28 @@ gamealerts. PR #5 is being held open deliberately for integration gaps like
 this one.
 
 **Known downstream effect — gamealerts side, not fixed here (addendum from
-the gamealerts session, 2026-07-18):** once the full tournament is
-backfilled, most teams will have multiple finished matches in the DB.
+the gamealerts session, 2026-07-18; flagged as an unverifiable sibling-repo
+claim by `/review-plan` 2026-07-19, assumptions lens, Important):** the
+gamealerts session reports that once the full tournament is backfilled,
+most teams will have multiple finished matches in the DB, and that
 gamealerts' team-name resolver (`resolve_team_by_name`) treats "one team
 name matching more than one candidate match" as Layer-2 ambiguity and
 returns `None`, so a single-team query like "who scored in the Argentina
-game" gets refused with "I don't have data for that match" once Argentina
-has 2+ finished matches — this is the resolver working correctly
-(safe-by-design), not backfilled data being wrong. Two-team queries
-("Argentina vs Brazil") are unaffected and resolve fine. When testing this
-plan's acceptance criteria against real backfilled data, a refused
-single-team query for a team with multiple finished matches is an expected
-gamealerts-side outcome, not a collector bug to chase. Any UX fix for this
-is a later gamealerts product decision, out of scope here.
+game" would be refused once Argentina has 2+ finished matches — reportedly
+the resolver working correctly (safe-by-design), not backfilled data being
+wrong, with two-team queries ("Argentina vs Brazil") unaffected. **This is
+an assumption about sibling-repo behavior, not something this repo can
+verify**: `rg resolve_team_by_name` in this repo hits only docs, never
+code, and `docs/integration/gameworker-contract.md` §1 explicitly records
+that no such port method was added — the resolver lives entirely in
+gamealerts. Accordingly: **collector-side acceptance tests must
+independently confirm the backfilled match's `participants`/canonical
+names are correct via `list_matches`/`events_for_match` directly** (this
+plan's own mechanism, not gamealerts'). Only after that collector-side data
+is confirmed correct should a refused single-team query be treated as
+gamealerts' resolver behaving as reported, rather than assumed without
+checking; any UX fix for the refusal itself is a later gamealerts product
+decision, out of scope here.
 
 ## Requirements
 
@@ -119,6 +128,17 @@ is a later gamealerts product decision, out of scope here.
     match id, which source it's actually owned by, and that `--source` must
     match) rather than letting the raw traceback surface. This is a CLI-level
     requirement, not just a documentation one.
+  - **Review-plan correction (`/review-plan` 2026-07-19, architecture lens,
+    Important):** `run_backfill`'s `source` parameter must not be able to
+    diverge from the engine it's driving — `CollectorEngine` already owns
+    `self._source`, and every write goes through `engine._writer` under
+    that value. `CollectorEngine` gains a read-only `source` property;
+    `run_backfill` reads `engine.source` for its skip-check comparisons
+    instead of trusting a separately-passed kwarg to stay in sync (the
+    `source` kwarg is kept for call-site clarity, but `run_backfill`
+    asserts `source == engine.source` at entry and raises immediately on
+    mismatch) — a caller passing a different value must fail loudly, not
+    silently read one partition while writing to another.
 - **Idempotent and resumable using existing writer behavior, not new
   dedup logic.** `PartitionWriter.append_events` is already idempotent via
   `INSERT OR IGNORE` keyed on `(source, match_id, seq)` with a full-row
@@ -154,6 +174,24 @@ is a later gamealerts product decision, out of scope here.
      for this `match_id` under the target source **AND** it has at least one
      stored event," not bare row existence — a same-source, event-less row
      must still trigger a `fetch_match_detail` + `apply_one_off_match` retry.
+  - **Review-plan correction (`/review-plan` 2026-07-19, architecture lens,
+    Important):** the skip check's read handle was unspecified —
+    `reader.get_state`/`reader.get_events_since` both require a
+    `sqlite3.Connection`, and `run_backfill`'s only handle is `engine`,
+    whose connection is private (`engine._conn`). `CollectorEngine` gains
+    two thin read accessors, `stored_source(match_id) -> str | None` and
+    `has_events(match_id) -> bool`, so `backfill.py` never reaches into
+    `engine._conn` — this is the seam recorded in the Integration Seams
+    table below.
+  - **Review-plan correction (`/review-plan` 2026-07-19, spec-and-testing
+    lens, Important):** the skip predicate ("same-source row AND ≥1 stored
+    event") treats any row with at least one event as fully hydrated. A row
+    with *some but not all* events (e.g. ESPN's detail endpoint
+    under-reported events on first fetch) satisfies this and is skipped
+    forever — an accepted coverage limitation, not a bug: `backfill` never
+    re-hydrates a partially-stored match, only a zero-event one. State this
+    explicitly in `docs/integration/gameworker-contract.md` (Phase 5)
+    alongside the other coverage-ceiling caveats.
 - **Date-range chunking: day-by-day only, not a week-sized batch.**
   **Review-plan correction (`/review-plan` 2026-07-18, assumptions lens,
   Important):** the hyphenated `YYYYMMDD-YYYYMMDD` range form was never
@@ -184,9 +222,16 @@ is a later gamealerts product decision, out of scope here.
     `_default_http_get`'s `_MAX_RESPONSE_BYTES` 16MB cap
     (`src/gamecollect_football/espn.py:528,553-556`) raises
     `ProviderUnavailableError` on overflow rather than truncating silently
-    — so a truncation would surface as a hard failure for that chunk
-    (collected into `BackfillReport.failed`, not a silent under-count), but
-    this must be verified against a real busy day, not assumed benign.
+    — so a truncation surfaces as a hard failure for that chunk, but this
+    must be verified against a real busy day, not assumed benign.
+    **Corrected (`/review-plan` 2026-07-19, spec-and-testing lens,
+    Important):** a chunk-level `fetch_schedule` failure happens before any
+    match id exists, so it cannot be recorded in `BackfillReport.failed`
+    (which is match-id-keyed) — the original wording claiming otherwise was
+    wrong. `run_backfill` catches a `fetch_schedule` failure per chunk,
+    records it in a new `BackfillReport.failed_chunks: list[tuple[str,
+    Exception]]` field, and continues to the next chunk rather than
+    aborting the whole date range on one bad chunk.
   - **ESPN rate-limit/burst behavior is unverified**
     (`/review-plan` 2026-07-18, assumptions lens, Important): the live
     daemon issues roughly one `fetch_match_detail` per poll interval;
@@ -244,11 +289,14 @@ is a later gamealerts product decision, out of scope here.
 - **A backfill-only run (no live daemon ever started) must still stamp the
   shared file so gamealerts' read-only gate accepts it — verified, not
   assumed** (addendum from the gamealerts session, 2026-07-18: gamealerts
-  opens the shared file read-only and gates on the collector's schema stamp
-  via `wait_for_collector_file_stamped`, raising `CollectorNotReadyError`
-  when absent; a DB that only ever went through `backfill` — the live poll
-  loop never ran — must still pass that gate). **Confirmed already
-  structurally satisfied**: `CollectorEngine.__init__`
+  reportedly opens the shared file read-only and gates on the collector's
+  schema stamp via `wait_for_collector_file_stamped`, raising
+  `CollectorNotReadyError` when absent — **these two symbol names are
+  gamealerts-side, per the 2026-07-18 session, and not independently
+  verifiable from this repo** (`/review-plan` 2026-07-19, assumptions lens,
+  Minor); a DB that only ever went through `backfill` — the live poll loop
+  never ran — must still pass that gate). **Confirmed already structurally
+  satisfied**: `CollectorEngine.__init__`
   (`src/gamecollect/engine.py:674`) calls `connect(self._db_path,
   side_table_ddl=pack.side_table_ddl)` unconditionally at **construction**
   time, not lazily on first `poll_once`/`run()` — and `connect()` stamps
@@ -261,6 +309,18 @@ is a later gamealerts product decision, out of scope here.
   "confirm it holds, with a test" rather than "build it" — but it must be
   an explicit, tested contract, not an implicit side effect a future
   refactor could silently break (e.g. by making engine construction lazy).
+  **Review-plan correction (`/review-plan` 2026-07-19, sequencing +
+  spec-and-testing lenses, Important, merged):** the verifying test must
+  actually exercise the guarantee as stated — through `_run_backfill`
+  (Phase 3), which is where engine construction precedes `run_backfill`,
+  not by constructing the engine directly in the test — and must pin a
+  **zero-match** enumeration (so the stamp is provably coming from
+  construction, not from a write) and open the verification connection
+  **read-only**, so a future refactor making construction lazy or
+  conditional would actually fail this test. `get_schema_version` is this
+  repo's collector-side proxy for gamealerts' reported gate; the true
+  cross-repo equivalence was verified live on the gamealerts side (see
+  Findings, Tier-3 signal), not by this collector-side test.
 
 ## Review Focus
 
@@ -354,6 +414,14 @@ is a later gamealerts product decision, out of scope here.
   scoreboard snapshot and the fetched detail snapshot, merges them exactly
   as the live path does, rather than applying a raw detail snapshot). No
   other engine state read/written.
+- **Added (`/review-plan` 2026-07-19, architecture lens, Important):**
+  `CollectorEngine` gains a read-only `source` property (returns
+  `self._source`) and two thin read accessors, `stored_source(match_id: str)
+  -> str | None` and `has_events(match_id: str) -> bool`, wrapping
+  `reader.get_state`/`reader.get_events_since` against the engine's own
+  connection — so `backfill.py` never reaches into `engine._conn` and
+  `run_backfill`'s skip check always reads the same source the engine
+  writes under.
 - New `src/gamecollect/backfill.py`:
   - `chunk_date_range(start: date, end: date, *, overlap_days: int = 1) ->
     Iterator[str]` — pure function yielding **single-day** `YYYYMMDD` chunk
@@ -370,24 +438,36 @@ is a later gamealerts product decision, out of scope here.
     `fetch_schedule`.
   - `run_backfill(engine: CollectorEngine, provider, date_chunks:
     Iterable[str], *, source: str, request_delay: float = 0.5) ->
-    BackfillReport` — for each enumerated scoreboard match: skip only when
-    a stored row exists for that `match_id` under `source` **and** that row
-    has at least one stored event (**corrected skip predicate** — see the
-    Requirements correction above; both the source check and the
-    events-non-empty check are required, reusing `reader.get_state` plus
-    `reader.get_events_since` rather than a bare existence check); a
-    same-source stored row that exists but has zero events is NOT skipped.
-    Otherwise sleeps `request_delay` seconds (rate-limit mitigation, see
-    Requirements), calls `provider.fetch_match_detail(match_id)`, then
+    BackfillReport` — asserts `source == engine.source` at entry
+    (**added per `/review-plan` 2026-07-19, architecture lens, Important**
+    — `run_backfill` must not trust a separately-passed `source` to stay in
+    sync with the engine it's driving; a mismatch raises immediately rather
+    than silently reading one partition while writing another). For each
+    date chunk, wraps `provider.fetch_schedule(dates=chunk)` in a
+    try/except: a chunk-level failure is recorded in a new
+    `BackfillReport.failed_chunks: list[tuple[str, Exception]]` field and
+    enumeration continues to the next chunk (**added per `/review-plan`
+    2026-07-19, spec-and-testing lens, Important** — a `fetch_schedule`
+    failure happens before any match id exists, so it cannot be recorded in
+    the match-id-keyed `failed` field). For each enumerated scoreboard
+    match: skip only when `engine.stored_source(match_id) == source` **and**
+    `engine.has_events(match_id)` is true (**corrected skip predicate** —
+    see the Requirements correction above; both the source check and the
+    events-non-empty check are required, via the engine's read accessors
+    rather than a bare existence check); a same-source stored row that
+    exists but has zero events is NOT skipped. Otherwise sleeps
+    `request_delay` seconds (rate-limit mitigation, see Requirements),
+    calls `provider.fetch_match_detail(match_id)`, then
     `engine.apply_one_off_match(scoreboard, detail)`. `BackfillReport` is a
     small frozen dataclass: counts of `enumerated`, `already_stored_skipped`,
     `applied`, `failed` (with failed match ids + exceptions collected, not
-    raised mid-loop — one bad match must not abort the whole window), plus
-    an explicit count for the `apply_one_off_match` `None`-return case
-    (**corrected — added per Minor finding below**): a `None` return counts
-    as `failed` (the match was NOT durably written with events — same
-    treatment as any other apply failure, so a subsequent re-run retries it
-    rather than silently treating it as done).
+    raised mid-loop — one bad match must not abort the whole window),
+    `failed_chunks` (added above), plus an explicit count for the
+    `apply_one_off_match` `None`-return case (**corrected — added per Minor
+    finding below**): a `None` return counts as `failed` (the match was NOT
+    durably written with events — same treatment as any other apply
+    failure, so a subsequent re-run retries it rather than silently
+    treating it as done).
     **`CrossPartitionError` is the one exception `run_backfill` does NOT
     swallow into `failed`** (added to resolve a design gap surfaced by the
     Phase 3 CLI-error-handling correction below): a `CrossPartitionError`
@@ -414,7 +494,20 @@ is a later gamealerts product decision, out of scope here.
   Testing Gap finding):** after `apply_one_off_match`, assert
   `engine._transitions == {}`, `engine._backfill == {}`, and
   `engine._backfill_apply_pending == set()` — the one-shot path must leave
-  every poll-loop-only in-memory container untouched.
+  every poll-loop-only in-memory container untouched. **New test
+  (`/review-plan` 2026-07-19, spec-and-testing lens, Minor):** spy/patch
+  `diff_match` inside `apply_one_off_match` and assert it is called with
+  `last=None` specifically (FRESH-write semantics, not a running diff
+  against stored state) — the existing isolation and merge-path tests
+  prove adjacent properties but neither pins this directly. **New test
+  (`/review-plan` 2026-07-19, spec-and-testing lens, Important):**
+  `run_backfill` against a fake provider whose `fetch_schedule` raises on
+  one chunk, asserting the exception is recorded in
+  `BackfillReport.failed_chunks` and enumeration continues to the next
+  chunk rather than aborting the run. **New test (`/review-plan`
+  2026-07-19, architecture lens, Important):** `run_backfill` called with a
+  `source` that does not match `engine.source` raises immediately, before
+  any enumeration or fetch happens.
 
 ### Phase 3: CLI wiring — `backfill` subcommand
 
@@ -434,12 +527,18 @@ is a later gamealerts product decision, out of scope here.
   pack_loader=load_pack, loaded_packs=None) -> int` — mirrors `_run_collect`'s
   structure (`cli.py:315-349`) exactly: resolve pack via `loaded_packs`/
   `pack_loader`, resolve `provider` via the injection seam or
-  `pack.provider_factory()`, construct the engine, call
+  `pack.provider_factory()`. **Corrected ordering (`/review-plan`
+  2026-07-19, architecture lens, Minor):** check the provider's
+  historical-enumeration capability (`hasattr(provider, "fetch_schedule")`
+  **and** `hasattr(provider, "fetch_match_detail")`) and return the clear
+  CLI error immediately if either is missing — **before** constructing the
+  engine, so an unsupported-provider `backfill` invocation never
+  creates/stamps a DB file it's about to fail out of. Only after that
+  check passes: construct the engine, call
   `backfill.run_backfill(engine, provider, backfill.chunk_date_range(...),
   source=args.source)`, print a summary (`BackfillReport` counts),
-  `engine.close()` in a `finally`, return 0 on success / non-zero if
-  `enumerate_finished_matches` raised the "provider doesn't support
-  historical enumeration" error. **Corrected (`/review-plan` 2026-07-18,
+  `engine.close()` in a `finally`, return 0 on success / non-zero on the
+  capability-check failure. **Corrected (`/review-plan` 2026-07-18,
   spec-and-testing lens, Important):** also catches `CrossPartitionError`
   around the `run_backfill` call and returns non-zero with an actionable
   message (offending match id, the source that actually owns it, and that
@@ -456,13 +555,22 @@ is a later gamealerts product decision, out of scope here.
   op in `_read_subparser_names`.
 - `main()` dispatches `command == "backfill"` to `_run_backfill`, following
   the existing `command == "collect"` branch shape (`cli.py:392-399`).
+  **Clarified (`/review-plan` 2026-07-19, sequencing lens, Minor):** the
+  subparser, the `HAND_WIRED_COMMANDS` append, and this `main()` dispatch
+  branch are all part of one atomic edit to `cli.py` — land all three in
+  the same commit; the subparser or the tuple update alone leaves
+  `backfill` either untested or dispatching nowhere.
 - Tests: argparse wiring (required flags, help text mentions the
   cross-source constraint), `_run_backfill` with an injected fake provider
   + fake engine double verifying the report is printed and `engine.close()`
   is always called, the clear-error path when an injected provider lacks
-  `fetch_schedule`, **and a test that a `CrossPartitionError` raised from
-  `run_backfill` is caught and produces a non-zero exit with an actionable
-  message, not a raw traceback**.
+  `fetch_schedule`, **a clear-error test when an injected provider has
+  `fetch_schedule` but lacks `fetch_match_detail`** (`/review-plan`
+  2026-07-19, spec-and-testing lens, Minor — the capability check now
+  covers both methods per the reordering above, but only the
+  `fetch_schedule`-absent case had a test), **and a test that a
+  `CrossPartitionError` raised from `run_backfill` is caught and produces a
+  non-zero exit with an actionable message, not a raw traceback**.
 
 ### Phase 4: Idempotency, dedup, and end-to-end fixture tests
 
@@ -537,15 +645,25 @@ is a later gamealerts product decision, out of scope here.
   and confirm it is still 14/14 unaffected by these changes (it seeds its
   own fixture independently of backfill).
 - **Backfill-only readiness-stamp test (new, per the gamealerts addendum,
-  2026-07-18):** run `backfill` against a brand-new temp DB path — no
-  `CollectorEngine.run()`/`poll_once()` ever called on it, only
-  `run_backfill`'s one-shot path — then open a **fresh, separate**
-  connection (mirroring `TestStartupOrdering` in
-  `tests/test_integration_shared_file.py`) and assert
-  `get_schema_version(conn) is not None` and `matches` exists — i.e. the
-  file is readable and stamped exactly as gamealerts'
-  `wait_for_collector_file_stamped` gate requires, even though the live
-  daemon never ran against this file.
+  2026-07-18; corrected per `/review-plan` 2026-07-19, sequencing +
+  spec-and-testing lenses, Important):** drive this through `_run_backfill`
+  (Phase 3's CLI handler, not a directly-constructed engine) against a
+  brand-new temp DB path, with the injected fake provider enumerating
+  **zero** terminal matches for the requested range — `CollectorEngine
+  .run()`/`poll_once()` are never called, and neither is any match apply.
+  Then open a **fresh, separate, read-only** connection (`sqlite3.connect`
+  with `mode=ro`, mirroring gamealerts' reported read-only open, and
+  `TestStartupOrdering` in `tests/test_integration_shared_file.py`) and
+  assert `get_schema_version(conn) is not None` and `matches` exists. This
+  proves the stamp comes from engine **construction**, not from a write —
+  a zero-match run has no writes to hide behind — and a future refactor
+  making construction lazy would fail this test. Note: `get_schema_version`
+  is this repo's collector-side proxy for gamealerts' reported
+  `wait_for_collector_file_stamped` gate — those two symbol names are
+  gamealerts-side per the 2026-07-18 session and not independently
+  verifiable from this repo; the true cross-repo equivalence was verified
+  live on the gamealerts side (see Findings, Tier-3 signal), not by this
+  test.
 
 ### Phase 5: Docs
 
@@ -564,10 +682,14 @@ is a later gamealerts product decision, out of scope here.
   (`/review-plan` 2026-07-18):** also document the day-by-day-only chunking
   decision (no verified week-sized-batch range query), the unverified
   pagination/rate-limit posture (a busy day or throttled run degrades to
-  per-match `BackfillReport.failed` entries recoverable by re-running, not a
+  per-match `BackfillReport.failed` entries or per-chunk
+  `BackfillReport.failed_chunks` entries recoverable by re-running, not a
   hard failure), and that a same-source stored row with zero events (a
   prior live-daemon give-up) is treated as not-yet-backfilled and retried,
-  not skipped.
+  not skipped. **Added (`/review-plan` 2026-07-19):** also document that a
+  same-source row with **some but not all** events is treated as complete
+  and is NOT retried — an accepted coverage limitation, distinct from the
+  zero-event case above (spec-and-testing lens, Important).
 - `README.md`: add the `backfill` command to the CLI usage section
   alongside `collect`, if such a section exists (confirm during
   implementation; Explore did not check this file).
@@ -578,7 +700,9 @@ is a later gamealerts product decision, out of scope here.
 - `src/gamecollect/engine.py` — add `CollectorEngine.apply_one_off_match(
   scoreboard, detail)` (thin wrapper over the existing `_merge_detail`/
   `_apply`/`diff_match` machinery — corrected to a two-arg form per the
-  Critical review-plan finding).
+  Critical review-plan finding); add a read-only `source` property and the
+  `stored_source(match_id)`/`has_events(match_id)` read accessors
+  (`/review-plan` 2026-07-19, architecture lens).
 - `src/gamecollect/cli.py` — new `backfill` subparser + `_run_backfill`
   (including the `CrossPartitionError` catch), dispatched from `main()`;
   **`"backfill"` appended to `HAND_WIRED_COMMANDS`** in the same commit
@@ -627,6 +751,17 @@ is a later gamealerts product decision, out of scope here.
   ABC method.** Matches the sibling plan's explicit decision to leave the
   ABC unwidened (Follow-up Work); revisit only if a second provider needs
   historical enumeration.
+- **`run_backfill` reads source/read-state through the engine, never
+  through a raw connection or an independent kwarg it trusts blindly**
+  (`/review-plan` 2026-07-19, architecture lens, Important). Rejected
+  alternative: `backfill.py` opening its own `reader.connect(...)` handle
+  and comparing against a bare `source: str` parameter — rejected because
+  it couples `backfill.py` to `reader`/connection internals and creates a
+  divergence risk (`source` param vs. `engine._source`) with no structural
+  guard. `CollectorEngine` instead exposes a read-only `source` property
+  and two accessors (`stored_source`, `has_events`); `run_backfill` asserts
+  `source == engine.source` at entry so a mismatch fails loudly rather than
+  silently reading one partition while writing another.
 
 ### Dependencies
 - None — no new third-party dependencies (`pyproject.toml` has zero runtime
@@ -640,12 +775,18 @@ is a later gamealerts product decision, out of scope here.
 | `CollectorEngine.apply_one_off_match` | Phase 2 | Phase 2's `run_backfill`, Phase 4 tests | Takes `(scoreboard, detail)`, merges via `_merge_detail` before applying; must produce identical stored state to the live/same-day path; must not touch poll-loop-only in-memory state |
 | `backfill.run_backfill` | Phase 2 | Phase 3's `_run_backfill` CLI handler | Must never raise mid-loop on a single match's ordinary fetch/apply failure — collects into `BackfillReport.failed` instead. **Exception: `CrossPartitionError` propagates uncaught** (a run-wide `--source` misconfiguration, not a per-match issue) — `_run_backfill` is the sole catcher |
 | `--source` CLI flag | Phase 3 | Operator (documented contract) | Must equal the live daemon's `--source` value; a mismatch raises `CrossPartitionError` from `run_backfill`, caught by `_run_backfill` and surfaced as a clear non-zero exit with an actionable message (Requirements) |
+| `CollectorEngine.stored_source`/`has_events` | Phase 2 | Phase 2's `run_backfill` skip check | Read accessors wrapping `reader.get_state`/`get_events_since` against the engine's own connection; `backfill.py` must not reach into `engine._conn` directly (**added `/review-plan` 2026-07-19, architecture lens, Important**) |
 
 **Phase dependency note** (`/review-plan` 2026-07-18, sequencing lens,
 Minor): Phase 4's tests drive `run_backfill`/`apply_one_off_match`/
 `poll_once` directly — all defined in Phase 2 — and import no CLI code from
 Phase 3. The real dependency graph is `2 → 3` and `2 → 4` in parallel, not
 `2 → 3 → 4`; Phase 4 can proceed even if Phase 3 is still in flight.
+**Added (`/review-plan` 2026-07-19, sequencing lens, Minor):** if Phase 4's
+tests surface a Phase 2 defect while Phase 3 is concurrently building CLI
+wiring on top of Phase 2, land the fix on Phase 2's surface first and have
+Phase 3 rebase onto it — a parallel conductor must not let the two phases
+fork divergent versions of `backfill.py`.
 
 ## Architecture & Call Flow
 
@@ -662,7 +803,8 @@ graph LR
     CLI["backfill CLI (_run_backfill)"] -->|"date range, --source"| BF[backfill.run_backfill]
     BF -->|"fetch_schedule(dates=chunk)"| ESPN["ESPNAdapter (HTTP)"]
     ESPN -->|"scoreboard NormalizedMatch list"| BF
-    BF -->|"skip check: get_state + get_events_since"| DB[(gamecollect.db)]
+    BF -->|"skip check: engine.stored_source/has_events"| ENG["CollectorEngine.apply_one_off_match"]
+    ENG -->|"reader.get_state/get_events_since"| DB[(gamecollect.db)]
     BF -->|"fetch_match_detail(match_id)"| ESPN
     ESPN -->|"detail NormalizedMatch"| BF
     BF -->|"scoreboard, detail"| ENG["CollectorEngine.apply_one_off_match"]
@@ -686,9 +828,10 @@ sequenceDiagram
         BF->>ESPN: fetch_schedule(dates=chunk)
         ESPN-->>BF: scoreboard matches (terminal-filtered)
         loop each terminal match
-            BF->>DB: get_state + get_events_since(match_id)
+            BF->>Eng: stored_source(match_id) / has_events(match_id)
+            Eng->>DB: get_state + get_events_since(match_id)
             alt same-source row with events
-                DB-->>BF: skip (already_stored_skipped += 1)
+                Eng-->>BF: skip (already_stored_skipped += 1)
             else new or event-less same-source or wrong-source
                 BF->>ESPN: fetch_match_detail(match_id)
                 ESPN-->>BF: detail snapshot
@@ -749,8 +892,22 @@ sequenceDiagram
       high-match-count-day `fetch_schedule` queries; raw status string
       recorded for the older probe match
 - [ ] Backfill-only readiness-stamp test: a DB touched only by `backfill`
-      (never `run()`/`poll_once()`) is readable via a fresh connection with
-      `schema_meta` stamped (Phase 4, gamealerts addendum)
+      via `_run_backfill` (never `run()`/`poll_once()`), enumerating zero
+      matches, is readable via a fresh **read-only** connection with
+      `schema_meta` stamped (Phase 4, gamealerts addendum; corrected
+      `/review-plan` 2026-07-19)
+- [ ] `run_backfill` rejects a `source` argument that doesn't match
+      `engine.source`, before any enumeration or fetch (Phase 2,
+      `/review-plan` 2026-07-19, architecture lens)
+- [ ] Chunk-level `fetch_schedule` failure is recorded in
+      `BackfillReport.failed_chunks` and enumeration continues to the next
+      chunk (Phase 2, `/review-plan` 2026-07-19, spec-and-testing lens)
+- [ ] `apply_one_off_match`'s diff is built with `diff_match(merged,
+      last=None)` specifically, not a running diff (Phase 2, `/review-plan`
+      2026-07-19, spec-and-testing lens)
+- [ ] Provider missing only `fetch_match_detail` (has `fetch_schedule`) —
+      clear CLI error, not a mid-loop `AttributeError` (Phase 3,
+      `/review-plan` 2026-07-19, spec-and-testing lens)
 
 ### Test Results
 - [ ] All existing tests pass
@@ -771,6 +928,13 @@ sequenceDiagram
       `CrossPartitionError`, not a silent skip or a raw traceback
 - [ ] `apply_one_off_match` returning `None` — counted as `failed`, not
       silently dropped
+- [ ] A partially-hydrated same-source row (≥1 but not all events) — an
+      accepted, documented coverage limitation: NOT retried (`/review-plan`
+      2026-07-19, spec-and-testing lens)
+- [ ] `fetch_schedule` failure on one date chunk — recorded in
+      `failed_chunks`, remaining chunks still processed
+- [ ] Provider with `fetch_schedule` but missing `fetch_match_detail` —
+      clear error before any enumeration proceeds
 
 ## Acceptance Criteria
 
@@ -797,22 +961,33 @@ sequenceDiagram
 - `apply_one_off_match` merges the scoreboard and detail snapshots via
   `_merge_detail` before applying — proven by the Phase 4 merge-path test,
   not just asserted in prose (per the Critical finding).
-- A DB touched only by `backfill` (the live poll loop never started) is
-  stamped and readable by a fresh connection with no
-  `SchemaVersionError`/unstamped-`schema_meta` condition — the collector-side
-  equivalent of gamealerts' `wait_for_collector_file_stamped` gate passing
-  against a backfill-only file (Phase 4 test, gamealerts addendum
-  2026-07-18).
+- A DB touched only by `backfill` through `_run_backfill`, with zero
+  matches enumerated (the live poll loop never started, and no match was
+  applied), is stamped and readable by a fresh **read-only** connection
+  with no `SchemaVersionError`/unstamped-`schema_meta` condition — the
+  collector-side proxy for gamealerts' reported
+  `wait_for_collector_file_stamped` gate passing against a backfill-only
+  file (Phase 4 test, gamealerts addendum 2026-07-18; corrected
+  `/review-plan` 2026-07-19 to require the CLI path + zero-match
+  enumeration + read-only verification).
+- `run_backfill` rejects a `source` that doesn't match `engine.source`
+  before any enumeration or fetch happens (Phase 2 test, `/review-plan`
+  2026-07-19, architecture lens).
+- A chunk-level `fetch_schedule` failure is recorded in
+  `BackfillReport.failed_chunks` and does not abort enumeration of the
+  remaining chunks (Phase 2 test, `/review-plan` 2026-07-19,
+  spec-and-testing lens).
 - Enumeration unit tests (Phase 2) and a replay-fixture ingest test (Phase 4)
   both pass.
 - `docs/integration/gameworker-contract.md` documents the backfill
-  capability, the coverage ceiling (including the event-less-row and
-  pagination/rate-limit caveats), and the cross-source requirement.
+  capability, the coverage ceiling (including the event-less-row,
+  partially-hydrated-row, and pagination/rate-limit caveats), and the
+  cross-source requirement.
 - Full test suite green; `ruff check`/`ruff format --check` clean.
 - Lands as commits on `feature/gameworker-integration` (PR #5) — no new
   branch/PR.
 
-<!-- reviewed: 2026-07-18 @ 10c85a6063e52f9625b0c9bf513c71a5299e284c -->
+<!-- reviewed: 2026-07-19 @ fceca65e575ee6f93eea44d4f7b91bf0f3d1b3b0 -->
 
 <!-- /review-plan writes the marker line above. Everything below is the workspace: edits here do NOT invalidate the marker. -->
 
