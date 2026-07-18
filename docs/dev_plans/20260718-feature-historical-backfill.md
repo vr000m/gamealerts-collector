@@ -631,16 +631,21 @@ decision, out of scope here.
   `backfill` over a window covering that match id; assert it is NOT skipped
   — `fetch_match_detail` is called and the match is hydrated with events on
   this run.
-- **Backfill-then-live no-duplicate test**: backfill a match under source
-  `wc2026-live` (or whatever fixture source is used), then feed the *same*
-  match id through the normal `CollectorEngine.poll_once`/`_apply` path
-  under the same source (simulating the daemon later seeing it "live" —
-  even though by definition a backfilled match is already terminal, the
-  test should simulate the daemon's own same-day finished-match backfill
-  detecting no stored row is FALSE and skipping re-fetch, or if the daemon's
-  restart sees it fresh, confirm `_apply`'s upsert is a clean update, not a
-  duplicate row) — assert exactly one `matches` row for that match id
-  afterward.
+- **Backfill/live concurrent-overlap no-duplicate test (reframed per
+  external review, 2026-07-19 — the original "backfill-then-live" framing
+  was self-admittedly contrived, since a backfilled match is by definition
+  already terminal and the live daemon has no reason to re-see it):** the
+  realistic overlap case is `backfill` and the live daemon writing to
+  **overlapping dates** under the same source concurrently — e.g. a
+  same-day match the daemon's own same-day finished-match backfill
+  (`_first_sight_finished`) is also eligible to pick up. Simulate this by
+  applying the *same* match id's scoreboard+detail pair once via
+  `engine.apply_one_off_match` (the backfill path) and once via
+  `CollectorEngine.poll_once`/`_apply` (the live path) under the same
+  source, in either order — assert exactly one `matches` row for that
+  match id afterward, and that this is a direct consequence of the
+  idempotent `upsert_match`/`append_events` behavior already required
+  above, not new dedup logic.
 - Run `scripts/smoke_gameworker_contract.py` manually (not part of pytest)
   and confirm it is still 14/14 unaffected by these changes (it seeds its
   own fixture independently of backfill).
@@ -689,7 +694,20 @@ decision, out of scope here.
   not skipped. **Added (`/review-plan` 2026-07-19):** also document that a
   same-source row with **some but not all** events is treated as complete
   and is NOT retried — an accepted coverage limitation, distinct from the
-  zero-event case above (spec-and-testing lens, Important).
+  zero-event case above (spec-and-testing lens, Important). **Added
+  (external review, 2026-07-19, minor):** document that `backfill` is
+  safe to run **concurrently** with the live daemon — grounded in the
+  architecture lens's concurrency check (Findings): both are ordinary WAL
+  writers relying on `busy_timeout` (`connection.py:75-77`) for
+  serialization, `live_db_admission_lock` currently excludes no one
+  (unused today, per its own docstring), and the two writers' match sets
+  don't structurally overlap in the common case (backfill only targets
+  matches already rolled off the live scoreboard) — but when they do
+  overlap (e.g. a same-day match both the daemon's same-day backfill and
+  an operator-run `backfill` are eligible to pick up), the write path's
+  existing idempotency (`upsert_match`/`append_events`) makes the overlap
+  a safe no-op re-apply, not a duplicate (see the Phase 4
+  concurrent-overlap test).
 - `README.md`: add the `backfill` command to the CLI usage section
   alongside `collect`, if such a section exists (confirm during
   implementation; Explore did not check this file).
@@ -987,7 +1005,7 @@ sequenceDiagram
 - Lands as commits on `feature/gameworker-integration` (PR #5) — no new
   branch/PR.
 
-<!-- reviewed: 2026-07-19 @ fceca65e575ee6f93eea44d4f7b91bf0f3d1b3b0 -->
+<!-- reviewed: 2026-07-19 @ 35a8d6357b67130ae3d738d7c0ce49b4f07f6c43 -->
 
 <!-- /review-plan writes the marker line above. Everything below is the workspace: edits here do NOT invalidate the marker. -->
 
@@ -1021,6 +1039,35 @@ sequenceDiagram
   gamealerts integration — this plan's historical backfill is confirmed as
   the one remaining gap between "wired" and "actually answers about past
   games."
+
+### `/review-plan` 2026-07-19, architecture lens — concurrency check (checked, sound; not a finding)
+
+- Checked whether `backfill`-while-daemon-live collides with a writer
+  lock. `live_db_admission_lock` (`db/locking.py`) is defined but has zero
+  callers today (its own docstring: "no such user exists yet, so today the
+  lock excludes nothing"), so `backfill` as a second writer matches
+  `collect`'s existing behavior. WAL + `busy_timeout=5000`
+  (`connection.py:75-77`) serializes the two writers, and the match sets
+  don't structurally overlap in the common case (backfill only targets
+  matches already rolled off the live scoreboard). No design change
+  needed — recorded here because Phase 5's docs update (below) cites this
+  check when documenting that `backfill` is safe to run concurrently with
+  the live daemon.
+
+### External review, 2026-07-19 — two Minor doc/test-framing nits
+
+- Added an operator-facing "`backfill` can run alongside the live daemon"
+  note to Phase 5's `gameworker-contract.md` doc update, grounded in the
+  architecture-lens concurrency check directly above.
+- Reframed the Phase 4 "backfill-then-live no-duplicate" test: the
+  original framing was self-admittedly contrived (a backfilled match is
+  by definition already terminal, so the daemon has no reason to re-see
+  it "live"). Retargeted at the realistic case — `backfill` and the live
+  daemon writing an **overlapping date** under the same source
+  concurrently (e.g. a same-day match both the daemon's own same-day
+  backfill and an operator-run `backfill` are eligible to pick up) —
+  which the write path's existing idempotency already covers, not new
+  dedup logic.
 
 ## Issues & Solutions
 
