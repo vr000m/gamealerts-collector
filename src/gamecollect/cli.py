@@ -34,10 +34,13 @@ import json
 import logging
 import sys
 from collections.abc import Callable, Sequence
+from datetime import date
 from typing import Any
 
 from gamecollect import __version__
+from gamecollect import backfill as backfill_mod
 from gamecollect.db import reader
+from gamecollect.db.writer import CrossPartitionError
 from gamecollect.engine import CollectorEngine
 from gamecollect.packs.registry import PackError, PackNotFoundError, load_pack, pack_names
 from gamecollect.registry import Operation, Registry, build_registry
@@ -49,7 +52,7 @@ log = logging.getLogger(__name__)
 # Subcommands the CLI wires by hand rather than deriving from the registry.
 # The single-source-of-truth test subtracts these from the parser's subcommand
 # set to compare the remainder against the registry op names.
-HAND_WIRED_COMMANDS: tuple[str, ...] = ("collect", "tools")
+HAND_WIRED_COMMANDS: tuple[str, ...] = ("collect", "backfill", "tools")
 # Option names a read subcommand's parser already takes: the CLI's own --db
 # and --json (added by _add_read_arguments) plus argparse's automatic --help.
 # A pack param with one of these names would make sub.add_argument raise
@@ -246,6 +249,34 @@ def build_parser(registry: Registry) -> argparse.ArgumentParser:
         ),
     )
 
+    backfill = subs.add_parser(
+        "backfill",
+        help="One-shot ingest of completed matches from prior days.",
+        description=(
+            "Enumerate completed matches over a date range via the provider's "
+            "fetch_schedule(dates=...) and write them through the same apply path "
+            "the live collector uses, then exit."
+        ),
+    )
+    backfill.add_argument("--pack", required=True, help="Installed pack name (entry point).")
+    backfill.add_argument("--db", required=True, help="SQLite database to write into.")
+    backfill.add_argument(
+        "--source",
+        required=True,
+        help=(
+            "Partition to write into. Must equal the live daemon's --source exactly "
+            "for this data to ever be recognized as the same partition as live-seen "
+            "matches — a mismatch is rejected with a non-zero exit, not a silent "
+            "duplicate."
+        ),
+    )
+    backfill.add_argument(
+        "--start-date", required=True, help="First calendar day to cover, YYYY-MM-DD."
+    )
+    backfill.add_argument(
+        "--end-date", required=True, help="Last calendar day to cover, YYYY-MM-DD."
+    )
+
     tools = subs.add_parser(
         "tools",
         help="Emit the operation manifest (runtime capability discovery).",
@@ -361,6 +392,84 @@ def _run_collect(
     return 0
 
 
+def _run_backfill(
+    args: argparse.Namespace,
+    *,
+    provider: Any = None,
+    engine_factory: Callable[..., CollectorEngine] = CollectorEngine,
+    pack_loader: Callable[[str], Any] = load_pack,
+    loaded_packs: dict[str, Any] | None = None,
+) -> int:
+    """Run a one-shot historical backfill for one source, then exit.
+
+    Mirrors :func:`_run_collect`'s structure: reuse a pack already loaded for
+    the registry when available, otherwise ``pack_loader``; resolve
+    ``provider`` via the injection seam or ``pack.provider_factory()``.
+    Unlike ``_run_collect``, the provider's historical-enumeration capability
+    (``fetch_schedule`` *and* ``fetch_match_detail``) is checked *before* the
+    engine is constructed, so an unsupported provider never creates/stamps a
+    DB file it is about to fail out of. ``provider``/``engine_factory``/
+    ``pack_loader`` are the same injection seams ``_run_collect`` uses so
+    tests never hit real ESPN or real time.
+    """
+    pack = (loaded_packs or {}).get(args.pack)
+    if pack is None:
+        try:
+            pack = pack_loader(args.pack)
+        except PackNotFoundError:
+            print(f"error: no pack named {args.pack!r}", file=sys.stderr)
+            return 2
+        except PackError as exc:
+            print(f"error: pack {args.pack!r} failed to load: {exc}", file=sys.stderr)
+            return 2
+
+    resolved_provider = provider if provider is not None else pack.provider_factory()
+    if not hasattr(resolved_provider, "fetch_schedule") or not hasattr(
+        resolved_provider, "fetch_match_detail"
+    ):
+        print(
+            f"error: provider {resolved_provider!r} does not support historical "
+            "backfill (missing fetch_schedule and/or fetch_match_detail)",
+            file=sys.stderr,
+        )
+        return 2
+
+    try:
+        start = date.fromisoformat(args.start_date)
+        end = date.fromisoformat(args.end_date)
+    except ValueError as exc:
+        print(f"error: invalid --start-date/--end-date: {exc}", file=sys.stderr)
+        return 2
+
+    engine = engine_factory(pack, args.db, args.source, provider=resolved_provider)
+    try:
+        try:
+            report = backfill_mod.run_backfill(
+                engine,
+                resolved_provider,
+                backfill_mod.chunk_date_range(start, end),
+                source=args.source,
+            )
+        except CrossPartitionError as exc:
+            print(
+                f"error: backfill aborted — {exc} (the offending match_id is already "
+                f"owned by a different source; --source must equal the live daemon's "
+                "--source for this data to merge with live-seen matches)",
+                file=sys.stderr,
+            )
+            return 1
+    finally:
+        engine.close()
+
+    print(
+        f"backfill complete: enumerated={report.enumerated} "
+        f"already_stored_skipped={report.already_stored_skipped} "
+        f"applied={report.applied} failed={len(report.failed)} "
+        f"failed_chunks={len(report.failed_chunks)}"
+    )
+    return 0
+
+
 def main(
     argv: Sequence[str] | None = None,
     *,
@@ -393,6 +502,14 @@ def main(
             provider=provider,
             engine_factory=engine_factory,
             runner=runner,
+            pack_loader=pack_loader,
+            loaded_packs=loaded_packs,
+        )
+    if command == "backfill":
+        return _run_backfill(
+            args,
+            provider=provider,
+            engine_factory=engine_factory,
             pack_loader=pack_loader,
             loaded_packs=loaded_packs,
         )

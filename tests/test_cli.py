@@ -38,10 +38,13 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from gamecollect import cli
 from gamecollect.db.connection import connect
-from gamecollect.db.writer import PartitionWriter
+from gamecollect.db.writer import CrossPartitionError, PartitionWriter
 from gamecollect.fold import fold
+from gamecollect.provider import MatchStatus, NormalizedMatch
 
 PACK_NAME = "football-wc2026"
 SRC = "wc2026-test"
@@ -961,3 +964,354 @@ def test_collect_broken_pack_exits_nonzero_with_one_line_error(tmp_path, capsys)
     assert error_lines == [
         f"error: pack {PACK_NAME!r} failed to load: provider factory raised: boom"
     ]
+
+
+# --------------------------------------------------------------------------- #
+# backfill — unit-tested via the main(...) injection seams, mirroring collect
+# --------------------------------------------------------------------------- #
+#
+# Phase 3 contract (docs/dev_plans/20260718-feature-historical-backfill.md
+# §Phase 3): ``backfill`` must match ``collect``'s injection-seam pattern
+# exactly (provider/engine_factory/pack_loader overrides via cli.main(...))
+# so these tests never hit real ESPN or real time. ``_run_backfill`` checks
+# the provider's historical-enumeration capability (fetch_schedule AND
+# fetch_match_detail) BEFORE constructing the engine, calls
+# ``backfill.run_backfill(...)``, prints a BackfillReport summary, always
+# closes the engine, and is the sole catcher of CrossPartitionError (a
+# run-wide --source misconfiguration), surfacing a clean non-zero exit
+# rather than a raw traceback.
+
+BACKFILL_MATCH_ID = f"{SRC}:bf-1"
+
+
+def _bf_match(match_id: str = BACKFILL_MATCH_ID) -> NormalizedMatch:
+    return NormalizedMatch(
+        match_id=match_id,
+        status=MatchStatus.FINISHED,
+        minute=90,
+        score_home=1,
+        score_away=0,
+        display_clock="FT",
+        events=[],
+        home_team="Canada",
+        away_team="Qatar",
+        kickoff_utc="2026-01-10T18:00:00Z",
+        payload={},
+    )
+
+
+class _FakeBackfillProvider:
+    """Historical-enumeration-capable double: every ``fetch_schedule`` chunk
+    returns the same scripted match (regardless of the exact day-chunk keys
+    ``_run_backfill`` derives from ``chunk_date_range``, so these tests don't
+    couple to the overlap-padding implementation detail), and
+    ``fetch_match_detail`` returns the scripted detail for a known id."""
+
+    def __init__(self, match: NormalizedMatch | None = None) -> None:
+        if match is None:
+            match = _bf_match()
+        self._match = match
+        self.schedule_calls: list[str] = []
+        self.detail_calls: list[str] = []
+
+    def fetch_schedule(self, *, dates: str) -> list[NormalizedMatch]:
+        self.schedule_calls.append(dates)
+        return [self._match] if self._match is not None else []
+
+    def fetch_match_detail(self, match_id: str) -> NormalizedMatch:
+        self.detail_calls.append(match_id)
+        return self._match if self._match is not None else _bf_match(match_id)
+
+
+class _ScheduleOnlyProvider:
+    """Has ``fetch_schedule`` but lacks ``fetch_match_detail`` entirely."""
+
+    def fetch_schedule(self, *, dates: str) -> list[NormalizedMatch]:
+        return []
+
+
+class _DetailOnlyProvider:
+    """Has ``fetch_match_detail`` but lacks ``fetch_schedule`` entirely — the
+    ordinary live ``collect`` provider shape, which does not support
+    backfill's historical enumeration."""
+
+    def fetch_match_detail(self, match_id: str) -> NormalizedMatch:
+        return _bf_match(match_id)
+
+
+class _FakeBackfillEngine:
+    """A CollectorEngine-shaped double: the exact read/write surface
+    ``backfill.run_backfill`` uses (``.source``, ``.stored_source``,
+    ``.has_events``, ``.apply_one_off_match``), plus ``.close()`` for the
+    CLI's lifecycle contract. Accepts (and ignores) whatever extra
+    positional/keyword args the real ``engine_factory`` call site passes
+    (e.g. a poll interval, ``record_path``) so this test does not couple to
+    that exact call shape."""
+
+    def __init__(
+        self,
+        pack: Any,
+        db: Any,
+        source: Any,
+        *args: Any,
+        provider: Any = None,
+        apply_raises: BaseException | None = None,
+        **kwargs: Any,
+    ) -> None:
+        self.pack = pack
+        self.db = db
+        self._source = source
+        self.provider = provider
+        self._apply_raises = apply_raises
+        self.closed = False
+        self.apply_calls: list[Any] = []
+
+    @property
+    def source(self) -> Any:
+        return self._source
+
+    def stored_source(self, match_id: str) -> str | None:
+        return None
+
+    def has_events(self, match_id: str) -> bool:
+        return False
+
+    def apply_one_off_match(self, scoreboard: NormalizedMatch, detail: NormalizedMatch) -> Any:
+        self.apply_calls.append((scoreboard, detail))
+        if self._apply_raises is not None:
+            raise self._apply_raises
+        return scoreboard
+
+    def close(self) -> None:
+        self.closed = True
+
+
+_BACKFILL_ARGV_BASE = [
+    "backfill",
+    "--pack",
+    PACK_NAME,
+    "--source",
+    SRC,
+    "--start-date",
+    "2026-01-10",
+    "--end-date",
+    "2026-01-10",
+]
+
+
+def test_backfill_command_is_hand_wired():
+    """``backfill`` must be a hand-wired command (not a registry read op) —
+    the sequencing-lens correction requires it land in ``HAND_WIRED_COMMANDS``
+    in the same commit as the subparser, or the pack-name collision guard and
+    ``test_cli_subcommand_names_helper_matches_built_parser`` misclassify it."""
+    assert "backfill" in cli.HAND_WIRED_COMMANDS
+
+
+def test_backfill_subparser_declares_required_flags():
+    """argparse wiring: ``--pack``/``--db``/``--source`` and the date-range
+    flags are all required on the ``backfill`` subcommand."""
+    registry = _registry()
+    parser = cli.build_parser(registry)
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            backfill_parser = action.choices["backfill"]
+            break
+    else:  # pragma: no cover
+        raise AssertionError("parser exposes no subparsers")
+
+    required_dests = {
+        action.dest for action in backfill_parser._actions if getattr(action, "required", False)
+    }
+    assert "pack" in required_dests
+    assert "db" in required_dests
+    assert "source" in required_dests
+    # Plan allows either --start-date/--end-date or a single --dates
+    # START:END flag; assert whichever form is wired is present and required.
+    has_split_dates = {"start_date", "end_date"} <= required_dests
+    has_combined_dates = "dates" in required_dests
+    assert has_split_dates or has_combined_dates, (
+        f"backfill must require a date-range flag (--start-date/--end-date or "
+        f"--dates), got required dests {required_dests!r}"
+    )
+
+
+def test_backfill_help_text_states_cross_source_constraint(capsys):
+    """The ``--source`` help text must state the cross-source constraint from
+    Requirements: a backfill run's ``--source`` must equal the live daemon's,
+    or it will raise ``CrossPartitionError`` (Requirements: "must be
+    documented as 'must equal the live daemon's `--source`'")."""
+    registry = _registry()
+    parser = cli.build_parser(registry)
+    with pytest.raises(SystemExit):
+        parser.parse_args(["backfill", "--help"])
+    out = capsys.readouterr().out.lower()
+    assert "source" in out
+    assert (
+        "live daemon" in out or "same source" in out or "must match" in out or "must equal" in out
+    )
+
+
+def test_backfill_wires_provider_engine_and_closes_engine(tmp_path):
+    """``gamecollect backfill`` loads the pack via ``pack_loader``, resolves
+    the injected provider, checks its historical-enumeration capability,
+    constructs the engine via ``engine_factory``, drives
+    ``backfill.run_backfill`` against it (proven by the fake provider/engine
+    seeing calls), prints a report, and always closes the engine — entirely
+    through the ``main(...)`` seams, no real ESPN or real time."""
+    db = tmp_path / "backfill.db"
+    provider = _FakeBackfillProvider()
+    sentinel_pack = object()
+    loaded: list[str] = []
+    built: list[_FakeBackfillEngine] = []
+
+    def fake_pack_loader(name: str) -> Any:
+        loaded.append(name)
+        return sentinel_pack
+
+    def engine_factory(pack, db_path, source, *args: Any, **kwargs: Any) -> _FakeBackfillEngine:
+        engine = _FakeBackfillEngine(pack, db_path, source, *args, **kwargs)
+        built.append(engine)
+        return engine
+
+    rc = cli.main(
+        [*_BACKFILL_ARGV_BASE, "--db", str(db)],
+        registry=_registry(),
+        provider=provider,
+        engine_factory=engine_factory,
+        pack_loader=fake_pack_loader,
+    )
+
+    assert rc == 0, "a clean backfill run must exit zero"
+    assert loaded == [PACK_NAME], "backfill must load the named pack via pack_loader"
+    assert len(built) == 1, "backfill must construct exactly one engine"
+    engine = built[0]
+    assert engine.provider is provider, "the injected provider must reach run_backfill"
+    assert provider.schedule_calls, "run_backfill must have called fetch_schedule at least once"
+    assert engine.apply_calls, "the enumerated terminal match must have been applied"
+    assert engine.closed, "backfill must close the engine after the run completes"
+
+
+def test_backfill_prints_report_summary(tmp_path, capsys):
+    """``_run_backfill`` prints a summary derived from the ``BackfillReport``
+    counts (not silence) on a successful run."""
+    db = tmp_path / "backfill.db"
+    provider = _FakeBackfillProvider()
+
+    def engine_factory(pack, db_path, source, *args: Any, **kwargs: Any) -> _FakeBackfillEngine:
+        return _FakeBackfillEngine(pack, db_path, source, *args, **kwargs)
+
+    rc = cli.main(
+        [*_BACKFILL_ARGV_BASE, "--db", str(db)],
+        registry=_registry(),
+        provider=provider,
+        engine_factory=engine_factory,
+        pack_loader=lambda name: object(),
+    )
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert out.strip(), "backfill must print a BackfillReport summary, not run silently"
+
+
+def test_backfill_provider_missing_fetch_schedule_returns_clear_error_before_engine(
+    tmp_path, capsys
+):
+    """A provider lacking ``fetch_schedule`` must fail the capability check
+    immediately with a clear, non-traceback error and non-zero exit — and,
+    per the reordered capability check (`/review-plan` 2026-07-19,
+    architecture lens, Minor), the engine must never be constructed, so an
+    unsupported-provider invocation never creates/stamps a DB file it's
+    about to fail out of."""
+    db = tmp_path / "backfill.db"
+    provider = _DetailOnlyProvider()
+    built: list[Any] = []
+
+    def engine_factory(pack, db_path, source, *args: Any, **kwargs: Any) -> _FakeBackfillEngine:
+        engine = _FakeBackfillEngine(pack, db_path, source, *args, **kwargs)
+        built.append(engine)
+        return engine
+
+    rc = cli.main(
+        [*_BACKFILL_ARGV_BASE, "--db", str(db)],
+        registry=_registry(),
+        provider=provider,
+        engine_factory=engine_factory,
+        pack_loader=lambda name: object(),
+    )
+
+    assert rc != 0, "a provider lacking fetch_schedule must exit non-zero"
+    assert not built, "the engine must not be constructed when the capability check fails"
+    assert not db.exists(), "no DB file may be created/stamped when the capability check fails"
+    captured = capsys.readouterr()
+    assert "Traceback" not in captured.err
+    assert captured.err.strip(), "the capability-check failure must print a clear error"
+
+
+def test_backfill_provider_missing_fetch_match_detail_returns_clear_error_before_engine(
+    tmp_path, capsys
+):
+    """A provider with ``fetch_schedule`` but lacking ``fetch_match_detail``
+    must ALSO fail the capability check before the engine is constructed —
+    the reordered check (`/review-plan` 2026-07-19) covers both methods, not
+    just the fetch_schedule-absent case (`/review-plan` 2026-07-19,
+    spec-and-testing lens, Minor: this exact gap had no test before)."""
+    db = tmp_path / "backfill.db"
+    provider = _ScheduleOnlyProvider()
+    built: list[Any] = []
+
+    def engine_factory(pack, db_path, source, *args: Any, **kwargs: Any) -> _FakeBackfillEngine:
+        engine = _FakeBackfillEngine(pack, db_path, source, *args, **kwargs)
+        built.append(engine)
+        return engine
+
+    rc = cli.main(
+        [*_BACKFILL_ARGV_BASE, "--db", str(db)],
+        registry=_registry(),
+        provider=provider,
+        engine_factory=engine_factory,
+        pack_loader=lambda name: object(),
+    )
+
+    assert rc != 0, "a provider lacking fetch_match_detail must exit non-zero"
+    assert not built, "the engine must not be constructed when the capability check fails"
+    assert not db.exists(), "no DB file may be created/stamped when the capability check fails"
+    captured = capsys.readouterr()
+    assert "Traceback" not in captured.err
+    assert captured.err.strip(), "the capability-check failure must print a clear error"
+
+
+def test_backfill_cross_partition_error_caught_with_actionable_message(tmp_path, capsys):
+    """``CrossPartitionError`` raised out of ``run_backfill`` (a run-wide
+    ``--source`` misconfiguration) must be the ONE exception ``_run_backfill``
+    catches specially: non-zero exit, actionable stderr message (naming the
+    offending match id and that ``--source`` must match the live daemon's),
+    never a raw traceback."""
+    db = tmp_path / "backfill.db"
+    provider = _FakeBackfillProvider()
+    cross_partition_error = CrossPartitionError(
+        f"match {BACKFILL_MATCH_ID} is owned by source 'wc2026-live', not {SRC!r}"
+    )
+
+    def engine_factory(pack, db_path, source, *args: Any, **kwargs: Any) -> _FakeBackfillEngine:
+        return _FakeBackfillEngine(
+            pack, db_path, source, *args, apply_raises=cross_partition_error, **kwargs
+        )
+
+    rc = cli.main(
+        [*_BACKFILL_ARGV_BASE, "--db", str(db)],
+        registry=_registry(),
+        provider=provider,
+        engine_factory=engine_factory,
+        pack_loader=lambda name: object(),
+    )
+
+    assert rc != 0, "a CrossPartitionError from run_backfill must exit non-zero"
+    captured = capsys.readouterr()
+    assert "Traceback" not in captured.err, (
+        "CrossPartitionError must be caught by _run_backfill, never surface as a raw traceback"
+    )
+    assert captured.err.strip(), "the CrossPartitionError path must print an actionable message"
+    assert BACKFILL_MATCH_ID in captured.err or SRC in captured.err, (
+        "the actionable message should name the offending match id and/or source, not just "
+        "a generic failure"
+    )
