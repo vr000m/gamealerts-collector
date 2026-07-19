@@ -1,6 +1,6 @@
 # Task: Historical/full-tournament backfill (prior-day matches)
 
-**Status**: Not Started
+**Status**: Complete
 **Component**: collector
 **Assigned to**: Claude
 **Priority**: High
@@ -883,75 +883,84 @@ sequenceDiagram
 ## Testing Notes
 
 ### Test Approach
-- [ ] Unit tests for `chunk_date_range`/`enumerate_finished_matches` (Phase 2)
-- [ ] Unit tests for `run_backfill`'s skip/apply/failure-collection behavior,
+- [x] Unit tests for `chunk_date_range`/`enumerate_finished_matches` (Phase 2)
+- [x] Unit tests for `run_backfill`'s skip/apply/failure-collection behavior,
       including the source-check + events-non-empty skip predicate and the
       `apply_one_off_match` `None`-return → `failed` accounting (Phase 2)
-- [ ] Test that `apply_one_off_match`/`run_backfill` leave
+- [x] Test that `apply_one_off_match`/`run_backfill` leave
       `engine._transitions`/`engine._backfill`/`engine._backfill_apply_pending`
       untouched (Phase 2)
-- [ ] Merge-path test: a scoreboard identity field omitted by the detail
-      snapshot survives via `_merge_detail` (Phase 4)
-- [ ] CLI argparse + injection-seam tests for `backfill`, including the
+- [x] Merge-path test: a scoreboard identity field omitted by the detail
+      snapshot survives via `_merge_detail` (Phase 2 — landed against a real
+      engine alongside the other `apply_one_off_match` tests rather than
+      duplicated in Phase 4; confirmed by Phase 4's advisory reviewer)
+- [x] CLI argparse + injection-seam tests for `backfill`, including the
       `HAND_WIRED_COMMANDS` update and the `CrossPartitionError`
       catch → non-zero-exit-with-message path (Phase 3)
-- [ ] Replay-fixture end-to-end ingest test (Phase 4)
-- [ ] Idempotent re-run test, including a `fetch_match_detail` zero-call-count
+- [x] Replay-fixture end-to-end ingest test (Phase 4)
+- [x] Idempotent re-run test, including a `fetch_match_detail` zero-call-count
       assertion on the second run (Phase 4)
-- [ ] Cross-source rejection test: `CrossPartitionError` raised by
+- [x] Cross-source rejection test: `CrossPartitionError` raised by
       `apply_one_off_match`, propagated (not swallowed) by `run_backfill`,
-      and caught by `_run_backfill` (Phase 4 + Phase 3)
-- [ ] Different-source existing-row test: a stored row under the wrong
+      and caught by `_run_backfill` (Phase 2 direct-apply + propagation
+      tests, Phase 4 two-real-engine integration test, Phase 3 CLI-catch test)
+- [x] Different-source existing-row test: a stored row under the wrong
       source is never silently skipped (Phase 4)
-- [ ] Event-less stored-row test: a same-source row with zero events is
+- [x] Event-less stored-row test: a same-source row with zero events is
       retried, not skipped (Phase 4)
-- [ ] Manual `scripts/smoke_gameworker_contract.py` run, still 14/14 (Phase 4)
-- [ ] Manual Phase 1 live probes: single-day, hyphenated-range, and
+- [x] Manual `scripts/smoke_gameworker_contract.py` run, still 14/14 (Phase 4)
+- [x] Manual Phase 1 live probes: single-day, hyphenated-range, and
       high-match-count-day `fetch_schedule` queries; raw status string
       recorded for the older probe match
-- [ ] Backfill-only readiness-stamp test: a DB touched only by `backfill`
+- [x] Backfill-only readiness-stamp test: a DB touched only by `backfill`
       via `_run_backfill` (never `run()`/`poll_once()`), enumerating zero
       matches, is readable via a fresh **read-only** connection with
       `schema_meta` stamped (Phase 4, gamealerts addendum; corrected
       `/review-plan` 2026-07-19)
-- [ ] `run_backfill` rejects a `source` argument that doesn't match
+- [x] `run_backfill` rejects a `source` argument that doesn't match
       `engine.source`, before any enumeration or fetch (Phase 2,
       `/review-plan` 2026-07-19, architecture lens)
-- [ ] Chunk-level `fetch_schedule` failure is recorded in
+- [x] Chunk-level `fetch_schedule` failure is recorded in
       `BackfillReport.failed_chunks` and enumeration continues to the next
       chunk (Phase 2, `/review-plan` 2026-07-19, spec-and-testing lens)
-- [ ] `apply_one_off_match`'s diff is built with `diff_match(merged,
+- [x] `apply_one_off_match`'s diff is built with `diff_match(merged,
       last=None)` specifically, not a running diff (Phase 2, `/review-plan`
       2026-07-19, spec-and-testing lens)
-- [ ] Provider missing only `fetch_match_detail` (has `fetch_schedule`) —
+- [x] Provider missing only `fetch_match_detail` (has `fetch_schedule`) —
       clear CLI error, not a mid-loop `AttributeError` (Phase 3,
       `/review-plan` 2026-07-19, spec-and-testing lens)
 
 ### Test Results
-- [ ] All existing tests pass
-- [ ] New tests added and passing
-- [ ] Manual verification complete
+- [x] All existing tests pass (715/715, full suite)
+- [x] New tests added and passing (22 in Phase 2 + 10 in Phase 3 + 7 in
+      Phase 4's `tests/test_backfill_integration.py`, all green)
+- [x] Manual verification complete (Phase 1 live ESPN probes;
+      `scripts/smoke_gameworker_contract.py` 14/14)
 
 ### Edge Cases Tested
-- [ ] Empty date range / no matches found for a chunk
-- [ ] `start > end` (empty `chunk_date_range` iterator) and `start == end`
+- [x] Empty date range / no matches found for a chunk
+- [x] `start > end` (empty `chunk_date_range` iterator) and `start == end`
       (single chunk plus overlap padding)
-- [ ] A chunk containing only non-terminal (scheduled/live) matches — none enumerated
-- [ ] `fetch_match_detail` failure for one match mid-window — rest of window still processed
-- [ ] Re-run over a fully-already-stored range — zero new writes, zero
+- [x] A chunk containing only non-terminal (scheduled/live) matches — none enumerated
+- [x] `fetch_match_detail` failure for one match mid-window — rest of window still processed
+- [x] Re-run over a fully-already-stored range — zero new writes, zero
       `fetch_match_detail` calls
-- [ ] Provider without `fetch_schedule` (e.g. `ReplayProvider`) — clear error, not a crash
-- [ ] Same-source stored row with zero events — retried, not skipped
-- [ ] Stored row under a different source — surfaces as a caught
+- [x] Provider without `fetch_schedule` (e.g. `ReplayProvider`) — clear error, not a crash
+- [x] Same-source stored row with zero events — retried, not skipped
+- [x] Stored row under a different source — surfaces as a caught
       `CrossPartitionError`, not a silent skip or a raw traceback
-- [ ] `apply_one_off_match` returning `None` — counted as `failed`, not
+- [x] `apply_one_off_match` returning `None` — counted as `failed`, not
       silently dropped
-- [ ] A partially-hydrated same-source row (≥1 but not all events) — an
-      accepted, documented coverage limitation: NOT retried (`/review-plan`
-      2026-07-19, spec-and-testing lens)
-- [ ] `fetch_schedule` failure on one date chunk — recorded in
+- [x] A partially-hydrated same-source row (≥1 but not all events) — an
+      accepted, documented coverage limitation: NOT retried. Proven only by
+      construction + the generic `has_events()==True → skipped` tests
+      (`has_events` checks non-emptiness, not completeness, so it cannot
+      distinguish partial from complete) — no fixture specifically seeds a
+      *partial* event set to pin this apart from the "fully hydrated"
+      case.
+- [x] `fetch_schedule` failure on one date chunk — recorded in
       `failed_chunks`, remaining chunks still processed
-- [ ] Provider with `fetch_schedule` but missing `fetch_match_detail` —
+- [x] Provider with `fetch_schedule` but missing `fetch_match_detail` —
       clear error before any enumeration proceeds
 
 ## Acceptance Criteria
@@ -1115,8 +1124,59 @@ sequenceDiagram
 
 ### Summary
 
+All 5 phases landed on `feature/gameworker-integration` (PR #5) via
+`/conduct`: a live-network verification gate (commit `8c753b0`), the
+`apply_one_off_match`/backfill-enumeration module (`49eb574`), the `backfill`
+CLI subcommand (`09b5c42`), idempotency/dedup/end-to-end fixture tests
+(`b9c608b`), and docs (`fb7b968`). The `backfill` CLI now enumerates and
+ingests completed prior-day matches via `fetch_schedule`/`fetch_match_detail`
+through the collector's existing write path, closing the gap the sibling
+`20260711-feature-finished-match-backfill` plan explicitly deferred.
+
 ### Outcomes
+
+- Full test suite: 715 passed, 1 skipped; `ruff check` clean throughout.
+- `scripts/smoke_gameworker_contract.py`: 14/14, unaffected.
+- Every phase (2-4) that touched >200 lines or >3 files got an advisory
+  mid-phase Opus reviewer pass; all findings were Minor and non-blocking
+  (documented in the per-phase commit messages and `.conduct/` state).
+- CI-parity gate (auto-enabled by `/conduct --autonomous`) could not run:
+  no `justfile`/`Makefile`/`package.json`/`Cargo.toml` at the repo root to
+  detect a local CI entrypoint. Skipped by explicit user decision — every
+  phase had already run the full suite, lint, and the manual smoke script
+  independently.
 
 ### Learnings
 
+- Phase 1's "no impl files, doc-only verification" shape didn't fit the
+  standard implementer-subagent workflow cleanly: the subagent's "do not
+  modify the plan file" scope rule directly conflicted with the phase's own
+  requirement to append live-probe findings to this plan's `## Findings`
+  section. Resolved by having the conductor (main Claude) run the live
+  probes and record findings directly, rather than spawning a subagent —
+  worth calling out explicitly in a future plan's Phase 1 slot if it
+  declares "(none)" for Impl/Test files.
+- A test-writer subagent claimed to have staged a new test file via
+  `git add` but had not (caught before running tests in Phase 2); the
+  Phase 3 test-writer prompt was given an explicit staging-verification
+  reminder and staged correctly on the first attempt.
+- The Phase 1 live probes found the hyphenated date-range query
+  (`dates=X-Y`) does work and returns the correct union of days, contrary
+  to the plan's conservative assumption — but Phase 2 deliberately kept
+  day-by-day-only chunking as the default anyway (documented in
+  `docs/integration/gameworker-contract.md` §6), since only a 2-day span
+  was verified and there's no evidence the range form scales unbounded.
+
 ### Follow-up Work
+
+- No Phase 4 test exercises the football pack's `seed_or_reconcile_match`
+  id-migration path (stub → canonical id) specifically for the
+  concurrent-overlap dedup scenario — flagged as Minor by the Phase 4
+  reviewer. The generic `default_seed_match` path used is safe by primary-key
+  construction and can't surface that class of bug; a future plan touching
+  the football pack's reconciliation path should add this coverage.
+- `run_backfill`'s source-mismatch `ValueError` path is structurally
+  unreachable via the CLI in production (both the engine and `run_backfill`
+  receive `args.source`) — flagged as Minor by the Phase 3 reviewer. Purely
+  a defensive/test-only path; no action needed unless `_run_backfill` is
+  refactored to accept a separately-supplied source.
