@@ -1015,7 +1015,7 @@ sequenceDiagram
 - [x] Phase 2: `CollectorEngine.apply_one_off_match` + backfill enumeration module
 - [x] Phase 3: CLI wiring — `backfill` subcommand
 - [x] Phase 4: Idempotency, dedup, and end-to-end fixture tests
-- [ ] Phase 5: Docs
+- [x] Phase 5: Docs
 
 ## Findings
 
