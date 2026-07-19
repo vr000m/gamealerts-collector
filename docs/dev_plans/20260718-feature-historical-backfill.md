@@ -1013,7 +1013,7 @@ sequenceDiagram
 
 - [x] Phase 1: Live-network gate — endpoint verification beyond same-day matches
 - [x] Phase 2: `CollectorEngine.apply_one_off_match` + backfill enumeration module
-- [ ] Phase 3: CLI wiring — `backfill` subcommand
+- [x] Phase 3: CLI wiring — `backfill` subcommand
 - [ ] Phase 4: Idempotency, dedup, and end-to-end fixture tests
 - [ ] Phase 5: Docs
 
