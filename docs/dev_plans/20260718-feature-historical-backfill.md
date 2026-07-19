@@ -1014,7 +1014,7 @@ sequenceDiagram
 - [x] Phase 1: Live-network gate — endpoint verification beyond same-day matches
 - [x] Phase 2: `CollectorEngine.apply_one_off_match` + backfill enumeration module
 - [x] Phase 3: CLI wiring — `backfill` subcommand
-- [ ] Phase 4: Idempotency, dedup, and end-to-end fixture tests
+- [x] Phase 4: Idempotency, dedup, and end-to-end fixture tests
 - [ ] Phase 5: Docs
 
 ## Findings
