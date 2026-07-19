@@ -68,14 +68,27 @@ def _copy_pack_with_operations(pack: Any, operations: tuple[Operation, ...]) -> 
 
 
 def _validated_pack_for_cli(name: str, pack: Any, accepted: list[Any]) -> Any:
-    """Drop pack ops that would break argparse or the merged registry."""
-    existing_names = set(build_registry(accepted).names) | set(HAND_WIRED_COMMANDS)
+    """Drop pack ops that would break argparse or the merged registry.
+
+    A collision with a hand-wired command (``collect``/``backfill``/``tools``) is
+    a hard error, not a droppable op: those subcommands are wired by hand and
+    never derived from the registry, so a same-named pack op would be silently
+    shadowed by the hand-wired parser and never dispatched. Raise loudly, matching
+    the core/pack collision convention in :meth:`Registry.register`, rather than
+    warn-and-drop as we do for a collision with a core or already-merged pack op.
+    """
+    hand_wired = set(HAND_WIRED_COMMANDS)
+    existing_names = set(build_registry(accepted).names)
     kept: list[Operation] = []
     for op in getattr(pack, "operations", ()):
+        if op.name in hand_wired:
+            raise ValueError(
+                f"pack {name!r} operation {op.name!r} collides with hand-wired command {op.name!r}"
+            )
         if op.name in existing_names:
             log.warning(
                 "skipping operation %r from pack %r for CLI registry: name collides "
-                "with an existing or hand-wired command",
+                "with an existing command",
                 op.name,
                 name,
             )
@@ -345,6 +358,31 @@ def _default_runner(engine: CollectorEngine) -> None:
     engine.run()
 
 
+def _resolve_pack(
+    args: argparse.Namespace,
+    pack_loader: Callable[[str], Any],
+    loaded_packs: dict[str, Any] | None,
+) -> Any | None:
+    """Resolve ``args.pack`` to a loaded pack, reusing a registry-loaded one.
+
+    Returns the pack already merged during registry construction
+    (``loaded_packs``) when present, else loads it via ``pack_loader``. On a load
+    failure prints the ``collect``/``backfill`` error message to stderr and
+    returns ``None`` so the caller can exit 2; a loaded pack is never ``None``.
+    """
+    pack = (loaded_packs or {}).get(args.pack)
+    if pack is not None:
+        return pack
+    try:
+        return pack_loader(args.pack)
+    except PackNotFoundError:
+        print(f"error: no pack named {args.pack!r}", file=sys.stderr)
+        return None
+    except PackError as exc:
+        print(f"error: pack {args.pack!r} failed to load: {exc}", file=sys.stderr)
+        return None
+
+
 def _run_collect(
     args: argparse.Namespace,
     *,
@@ -367,16 +405,9 @@ def _run_collect(
     seams: the in-phase unit test drives a single poll with a fake provider and a
     one-shot runner instead of the real ESPN provider and blocking loop.
     """
-    pack = (loaded_packs or {}).get(args.pack)
+    pack = _resolve_pack(args, pack_loader, loaded_packs)
     if pack is None:
-        try:
-            pack = pack_loader(args.pack)
-        except PackNotFoundError:
-            print(f"error: no pack named {args.pack!r}", file=sys.stderr)
-            return 2
-        except PackError as exc:
-            print(f"error: pack {args.pack!r} failed to load: {exc}", file=sys.stderr)
-            return 2
+        return 2
     engine = engine_factory(
         pack,
         args.db,
@@ -412,16 +443,9 @@ def _run_backfill(
     ``pack_loader`` are the same injection seams ``_run_collect`` uses so
     tests never hit real ESPN or real time.
     """
-    pack = (loaded_packs or {}).get(args.pack)
+    pack = _resolve_pack(args, pack_loader, loaded_packs)
     if pack is None:
-        try:
-            pack = pack_loader(args.pack)
-        except PackNotFoundError:
-            print(f"error: no pack named {args.pack!r}", file=sys.stderr)
-            return 2
-        except PackError as exc:
-            print(f"error: pack {args.pack!r} failed to load: {exc}", file=sys.stderr)
-            return 2
+        return 2
 
     resolved_provider = provider if provider is not None else pack.provider_factory()
     if not hasattr(resolved_provider, "fetch_schedule") or not hasattr(

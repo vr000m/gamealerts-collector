@@ -558,23 +558,29 @@ def _test_operation(name: str, *param_names: str):
     )
 
 
-def test_pack_op_name_collision_with_hand_wired_command_is_skipped(caplog):
+@pytest.mark.parametrize("hand_wired_name", ["collect", "backfill", "tools"])
+def test_pack_op_name_collision_with_hand_wired_command_raises(hand_wired_name):
+    """A pack op that claims a hand-wired command name (``collect``/``backfill``/
+    ``tools``) is a hard error, not a droppable op: the hand-wired parser would
+    silently shadow it and it would never dispatch. Surface it loudly rather than
+    warn-and-drop."""
+
     class _CollisionPack:
-        operations = (_test_operation("collect"),)
+        operations = (_test_operation(hand_wired_name),)
 
-    with caplog.at_level(logging.WARNING):
-        registry = cli.load_registry(
-            pack_loader=lambda name: _CollisionPack(), names=["bad-op-pack"]
-        )
+    with pytest.raises(ValueError, match=f"hand-wired command {hand_wired_name!r}"):
+        cli._validated_pack_for_cli("bad-op-pack", _CollisionPack(), [])
 
-    assert "collect" not in registry.names
-    assert set(registry.names) == {"matches", "state", "events", "standings", "vocabulary"}
-    assert any(
-        "collect" in rec.getMessage() and "bad-op-pack" in rec.getMessage()
-        for rec in caplog.records
-    )
-    # Most importantly, the bad op never reaches argparse construction.
-    cli.build_parser(registry)
+
+def test_pack_op_name_collision_with_hand_wired_command_propagates_through_load_registry():
+    """The hard error surfaces through ``load_registry`` too — it is raised before
+    the per-pack ``build_registry`` guard, so it is not swallowed as a soft skip."""
+
+    class _CollisionPack:
+        operations = (_test_operation("backfill"),)
+
+    with pytest.raises(ValueError, match="hand-wired command 'backfill'"):
+        cli.load_registry(pack_loader=lambda name: _CollisionPack(), names=["bad-op-pack"])
 
 
 def test_pack_op_reserved_cli_option_collision_is_skipped(caplog):
