@@ -112,6 +112,24 @@ ended before it was ever polled) has its full event list backfilled once,
 same-slate-bounded by construction — pass `--no-finished-backfill` to disable
 (see [docs/DESIGN.md](docs/DESIGN.md) for the retry-cap and scope details).
 
+**Backfill.** `backfill` fills in matches outside that same-slate window —
+prior days, or a whole date range the daemon never ran during. It walks the
+range day by day, asks the provider for each day's finished matches, and
+applies them through the same write path `collect` uses:
+
+```sh
+gamecollect backfill --pack football-wc2026 --db games.db --source wc2026-live \
+    --start-date 2026-06-15 --end-date 2026-06-20
+```
+
+`--source` **must** match the value the live `collect` daemon uses for the
+same tournament — a mismatch is caught and reported as a clear CLI error, not
+a raw traceback. Coverage is capped by what the provider's scoreboard lists
+for the requested dates (no all-match-id endpoint exists), and re-running
+`backfill` over the same range is safe and idempotent. See
+[docs/integration/gameworker-contract.md](docs/integration/gameworker-contract.md)
+§6 for the full coverage-ceiling, cross-source, and retry-semantics contract.
+
 **Replay.** Recorded sessions (and the seed fixtures checked in under
 [fixtures/football/](fixtures/football/)) replay through `ReplayProvider`,
 which implements the same provider ABC the engine polls — paced in real time,

@@ -192,3 +192,71 @@ rows below are implemented in this repo.
 | 5 | Add a `GAMEALERTS_COLLECTOR_DATA_DIR` config value so gamealerts learns the collector's file + `locks/` path at startup | Both processes must open the same file / lock dir |
 | 6 | Add a scoped `clear_commentary(match_id)` (or table-level clear) DAO/maintenance path | `reset_live` won't reach the collector's file, so replay/demo needs an explicit commentary clear |
 | 7 | Open the collector's file only **after** it exists + is stamped (retry/degrade if absent); never create it via gamealerts' full `_apply_schema` — apply only the scoped `commentary` DDL | The collector must create+stamp `schema_meta` and `matches` first (FK + version-gate prerequisites); a gamealerts-first `connect()` would leave the file unstamped and pollute it |
+
+## 6. Historical backfill — `backfill` CLI
+
+`gamecollect backfill --pack <pack> --db <path> --source <source> --start-date
+<YYYY-MM-DD> --end-date <YYYY-MM-DD>` fills in matches that finished before a
+live `collect` daemon was watching, or that fell outside a same-slate
+`--no-finished-backfill`-bounded catch-up (see README, "Collect"). It walks
+the date range day by day, asks the provider for that day's finished
+matches, and applies each one through the same write path
+(`CollectorEngine._apply` / `_merge_detail`) the live daemon uses — there is
+no separate backfill writer or dedup table.
+
+**Coverage ceiling.** `backfill` can only reach what the provider's
+scoreboard endpoint lists for the requested dates — for the `football-wc2026`
+pack this is ESPN's `fifa.world` scoreboard (`fetch_schedule(dates=...)`).
+There is no all-match-id endpoint. A match that ESPN's scoreboard never
+listed for any date in the requested range is **permanently unreachable** by
+this tool, backfill or otherwise. This is a hard ceiling, not a bug to file.
+
+**Cross-source requirement.** `--source` must equal the value the live
+`collect` daemon uses for the same tournament, exactly. `run_backfill` reads
+the engine's own `source` and asserts it matches the `--source` argument at
+entry; if a match id already exists under a **different** source (i.e. an
+operator points `backfill` at the wrong `--source` for an already-live
+tournament), the write path raises `CrossPartitionError` rather than
+silently writing to the wrong logical partition — that error would otherwise
+mean `list_matches`/`events_for_match` never recognize the two rows as the
+same match. `_run_backfill` (the CLI handler) is the sole catcher: it turns
+`CrossPartitionError` into a clear non-zero-exit message naming the
+offending match id and instructing the operator to match `--source` to the
+live daemon, rather than a raw traceback.
+
+**Day-by-day chunking only.** Date ranges are walked one day at a time
+(`chunk_date_range`), even though the underlying provider's hyphenated range
+query (`dates=X-Y`) was confirmed to work for at least a 2-day span during
+Phase 1 probing. Day-by-day was kept as the deliberate default — there is no
+verified behavior for week-or-larger batched range queries, so a future
+change to batch multiple days per request should re-probe first, not assume
+the range form scales unbounded.
+
+**Retry semantics, not hard failure, under load.** Pagination/rate-limit
+behavior against a genuinely busy matchday was not exhaustively probed
+(Phase 1 saw 2-6 matches per day with no observed cap, across a limited
+sample). A busy day or a throttled run does not abort the whole backfill —
+individual match failures land in `BackfillReport.failed` and a whole
+chunk's `fetch_schedule` failure lands in `BackfillReport.failed_chunks`;
+enumeration continues past both, and re-running `backfill` over the same
+range is safe and picks up where it left off (see idempotency below).
+
+**Skip predicate — what counts as "already backfilled".** A match is
+skipped only when it is stored under the **same** source **and** has at
+least one recorded event (`engine.stored_source(match_id) == source and
+engine.has_events(match_id)`):
+- A same-source row with **zero** events (e.g. a live daemon recorded the
+  match but gave up before any event arrived) is treated as **not yet
+  backfilled** and is retried.
+- A same-source row with **some but not all** events is treated as
+  **complete** and is **not** retried — `has_events` only checks
+  non-emptiness, not completeness. This is an accepted coverage
+  limitation of the current skip predicate, not a bug.
+
+**Safe to run concurrently with the live daemon.** `backfill` and `collect`
+are both ordinary WAL writers relying on `busy_timeout` (§2) for
+serialization — `backfill` takes no exclusive lock over the live daemon. In
+the common case their match sets don't overlap (backfill targets matches
+already off the live scoreboard); when they do overlap, the write path's
+existing idempotency (`upsert_match`'s `ON CONFLICT`, `append_events`)
+makes either apply order a safe no-op re-apply, not a duplicate.
