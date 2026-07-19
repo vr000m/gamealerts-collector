@@ -903,49 +903,25 @@ class CollectorEngine:
         a custom ``seed_match`` hook (e.g. the football pack's
         ``seed_or_reconcile_match``) write a source-qualified stub
         (``f"{source}:{provider_id}"``) or a canonical id reached through
-        ``provider_match_map``. Mirrors :meth:`_stored_rows_for_provider`'s
-        three id forms and authority order (canonical > qualified stub > bare
-        id for custom-seed packs; bare id > qualified stub for
-        ``default_seed_match`` packs, which never populate the map) but
-        returns the WINNING id string itself, scoped to this engine's own
-        ``self._source`` — never another source's row — so
+        ``provider_match_map``. Delegates to the shared
+        :meth:`_stored_rows_for_provider` query builder — asking only for the
+        ``match_id`` column — so the three-id-form SQL and authority order
+        (canonical > qualified stub > bare id for custom-seed packs; bare id >
+        qualified stub for ``default_seed_match`` packs, which never populate
+        the map) live in exactly one place and cannot drift. Returns the
+        WINNING id string itself, scoped to this engine's own ``self._source``
+        — never another source's row — so
         :meth:`stored_source`/:meth:`has_events` can query ``events`` under
         the id the write actually landed on instead of the bare provider id,
         which a qualified/reconciled pack never stores under.
 
-        Deliberately omits ``_stored_rows_for_provider``'s ``updated_at DESC``
-        secondary sort key: a single provider id maps to at most one
-        candidate row per rank tier here, so ranks are always distinct and
-        there is never a tie for that key to break.
+        The shared builder's ``updated_at DESC`` secondary sort key is inert
+        here: a single provider id maps to at most one candidate row per rank
+        tier, so ranks are always distinct and there is never a tie for that
+        key to break (see commit e52c227, which documented this invariant when
+        this method still hand-wrote the SQL without that key).
         """
-        qualified = f"{self._source}:{provider_match_id}"
-        if self._pack.seed_match is default_seed_match:
-            rows = self._conn.execute(
-                "SELECT match_id, CASE WHEN match_id = ? THEN 0 ELSE 1 END AS rank "
-                "FROM matches WHERE source = ? AND match_id IN (?, ?) "
-                "ORDER BY rank ASC, match_id ASC LIMIT 1",
-                (provider_match_id, self._source, provider_match_id, qualified),
-            ).fetchall()
-            return rows[0][0] if rows else None
-        rows = self._conn.execute(
-            "SELECT match_id, MIN(rank) AS rank FROM ("
-            "SELECT match_id, CASE WHEN match_id = ? THEN 2 ELSE 1 END AS rank "
-            "FROM matches WHERE source = ? AND match_id IN (?, ?) "
-            "UNION ALL "
-            "SELECT m.match_id, 0 AS rank "
-            "FROM provider_match_map pm "
-            "JOIN matches m ON m.source = pm.source AND m.match_id = pm.match_id "
-            "WHERE pm.source = ? AND pm.provider_match_id = ?"
-            ") candidates GROUP BY match_id ORDER BY rank ASC, match_id ASC LIMIT 1",
-            (
-                provider_match_id,
-                self._source,
-                provider_match_id,
-                qualified,
-                self._source,
-                provider_match_id,
-            ),
-        ).fetchall()
+        rows = self._stored_rows_for_provider(provider_match_id, columns=("match_id", "updated_at"))
         return rows[0][0] if rows else None
 
     def stored_source(self, match_id: str) -> str | None:

@@ -5041,6 +5041,72 @@ def test_stored_rows_for_provider_dedupes_row_reachable_via_two_arms(tmp_path):
     assert len(rows) == 1, "a row reachable via two arms must be deduplicated, not doubled"
 
 
+def test_resolve_stored_match_id_agrees_with_shared_builder_across_id_forms(tmp_path):
+    """Lock against future divergence: ``_resolve_stored_match_id`` must return
+    the SAME winning ``match_id`` as reading ``rows[0][0]`` off the shared
+    ``_stored_rows_for_provider`` builder, for every id form the builder knows —
+    the bare provider id, the source-qualified stub, and a canonical row reached
+    only through ``provider_match_map``. The method delegates to that builder;
+    this asserts the two never drift apart again."""
+    from gamecollect.db.connection import connect
+    from gamecollect.engine import CollectorEngine
+
+    db = tmp_path / "engine.db"
+    conn = connect(str(db), side_table_ddl=FAKE_SIDE_TABLE_DDL)
+    try:
+        with conn:
+            # Bare-id form.
+            _stored_row(
+                conn,
+                "bare1",
+                status=MatchStatus.IN_PLAY,
+                score_home=0,
+                updated_at="2026-06-18T19:00:00Z",
+            )
+            # Source-qualified stub form.
+            _stored_row(
+                conn,
+                qualified("q1"),
+                status=MatchStatus.IN_PLAY,
+                score_home=0,
+                updated_at="2026-06-18T19:00:00Z",
+            )
+            # Canonical row reached only through the map.
+            _stored_row(
+                conn,
+                "canon1",
+                status=MatchStatus.IN_PLAY,
+                score_home=0,
+                updated_at="2026-06-18T19:00:00Z",
+            )
+            conn.execute(
+                "INSERT INTO provider_match_map (source, provider, provider_match_id, match_id) "
+                "VALUES (?, ?, ?, ?)",
+                (SOURCE, "espn", "p1", "canon1"),
+            )
+    finally:
+        conn.close()
+
+    provider = ScriptedDetailProvider([])
+    pack = make_pack(provider, seed_match=_reconciling_seed)
+    engine = CollectorEngine(pack, str(db), SOURCE, 0.01, provider=provider)
+    try:
+        for provider_id, expected in (
+            ("bare1", "bare1"),
+            ("q1", qualified("q1")),
+            ("p1", "canon1"),
+        ):
+            resolved = engine._resolve_stored_match_id(provider_id)
+            rows = engine._stored_rows_for_provider(provider_id, columns=("match_id", "updated_at"))
+            direct = rows[0][0] if rows else None
+            assert resolved == direct == expected, (
+                f"resolve/builder must agree for {provider_id!r}: "
+                f"resolved={resolved!r} builder={direct!r} expected={expected!r}"
+            )
+    finally:
+        engine.close()
+
+
 # --------------------------------------------------------------------------- #
 # Round-7 review finding: _merge_over_base preserve-richer payload semantics
 # --------------------------------------------------------------------------- #
