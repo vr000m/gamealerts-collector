@@ -204,11 +204,13 @@ class FakeEngine:
         stored: dict[str, tuple[str, bool]] | None = None,
         apply_results: dict[str, NormalizedMatch | None] | None = None,
         apply_raises: dict[str, BaseException] | None = None,
+        stored_raises: dict[str, BaseException] | None = None,
     ) -> None:
         self._source = source
         self._stored = stored or {}
         self._apply_results = apply_results or {}
         self._apply_raises = apply_raises or {}
+        self._stored_raises = stored_raises or {}
         self.apply_calls: list[tuple[NormalizedMatch, NormalizedMatch]] = []
 
     @property
@@ -216,6 +218,8 @@ class FakeEngine:
         return self._source
 
     def stored_source(self, match_id: str) -> str | None:
+        if match_id in self._stored_raises:
+            raise self._stored_raises[match_id]
         entry = self._stored.get(match_id)
         return entry[0] if entry else None
 
@@ -387,6 +391,31 @@ def test_run_backfill_detail_fetch_failure_for_one_match_does_not_stop_enumerati
     assert set(report.failed) == {"bad"}
     assert report.applied == 1
     assert provider.detail_calls == ["bad", "good"]
+
+
+def test_run_backfill_skip_check_sqlite_lock_is_recorded_as_failure_and_continues():
+    # backfill runs against the same --db a live ``collect`` daemon may be
+    # polling; a transient ``sqlite3.OperationalError`` from the skip-check
+    # reads must be recorded per-match, not propagated out of run_backfill.
+    provider = FakeScheduleProvider(
+        {
+            "20260601": [
+                nm("locked", status=MatchStatus.FINISHED),
+                nm("good", status=MatchStatus.FINISHED),
+            ]
+        }
+    )
+    engine = FakeEngine(
+        SOURCE,
+        stored_raises={"locked": sqlite3.OperationalError("database is locked")},
+    )
+    report = backfill.run_backfill(engine, provider, ["20260601"], source=SOURCE, request_delay=0.0)
+    assert report.enumerated == 2
+    assert set(report.failed) == {"locked"}
+    assert isinstance(report.failed["locked"], sqlite3.OperationalError)
+    # The locked match never reached detail-fetch; the remaining match still ran.
+    assert provider.detail_calls == ["good"]
+    assert report.applied == 1
 
 
 def test_run_backfill_apply_one_off_match_returning_none_counts_as_failed():

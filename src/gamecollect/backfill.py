@@ -129,11 +129,15 @@ def run_backfill(
     with zero events is retried, not skipped. Otherwise sleeps
     ``request_delay`` seconds (rate-limit mitigation), fetches full detail
     via ``provider.fetch_match_detail(match_id)``, and applies via
-    ``engine.apply_one_off_match(scoreboard, detail)``. An ordinary
-    fetch/apply failure (including an ``apply_one_off_match`` ``None``
-    return, meaning nothing was durably written) is recorded in
-    :attr:`BackfillReport.failed` keyed by match id; one bad match never
-    aborts the run.
+    ``engine.apply_one_off_match(scoreboard, detail)``. The whole per-match
+    body — skip check included — runs inside one try/except, so a transient
+    failure from the skip-check reads (e.g. a ``sqlite3.OperationalError``
+    "database is locked" while a live ``collect`` daemon holds the same
+    ``--db``) is recorded in :attr:`BackfillReport.failed` like any other
+    per-match failure rather than aborting the run. An ordinary fetch/apply
+    failure (including an ``apply_one_off_match`` ``None`` return, meaning
+    nothing was durably written) is recorded the same way, keyed by match
+    id; one bad match never aborts the run.
 
     ``CrossPartitionError`` is the one exception NOT swallowed into
     ``failed``: it signals a run-wide ``--source`` misconfiguration (every
@@ -170,11 +174,10 @@ def run_backfill(
             enumerated += 1
             match_id = match.match_id
 
-            if engine.stored_source(match_id) == source and engine.has_events(match_id):
-                already_stored_skipped += 1
-                continue
-
             try:
+                if engine.stored_source(match_id) == source and engine.has_events(match_id):
+                    already_stored_skipped += 1
+                    continue
                 if request_delay:
                     time.sleep(request_delay)
                 detail = provider.fetch_match_detail(match_id)
