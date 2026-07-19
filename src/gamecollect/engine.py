@@ -912,6 +912,11 @@ class CollectorEngine:
         :meth:`stored_source`/:meth:`has_events` can query ``events`` under
         the id the write actually landed on instead of the bare provider id,
         which a qualified/reconciled pack never stores under.
+
+        Deliberately omits ``_stored_rows_for_provider``'s ``updated_at DESC``
+        secondary sort key: a single provider id maps to at most one
+        candidate row per rank tier here, so ranks are always distinct and
+        there is never a tie for that key to break.
         """
         qualified = f"{self._source}:{provider_match_id}"
         if self._pack.seed_match is default_seed_match:
