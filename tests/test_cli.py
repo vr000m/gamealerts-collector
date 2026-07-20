@@ -972,6 +972,29 @@ def test_collect_broken_pack_exits_nonzero_with_one_line_error(tmp_path, capsys)
     ]
 
 
+def test_vocabulary_unknown_pack_exits_nonzero_with_one_line_error(tmp_path, capsys):
+    """Round 3 review finding: ``vocabulary`` routes through ``_run_read``,
+    whose impl (``client.get_vocabulary``) loads the pack internally and raises
+    ``PackNotFoundError`` for an unknown name. Without a guard the CLI printed a
+    raw traceback, unlike ``collect``/``backfill`` which surface a clean
+    one-line stderr error and exit 2 for the same invalid-pack case. This pins
+    that ``vocabulary`` matches that convention. Uses the real default
+    ``load_pack`` (get_vocabulary imports it directly) so the real not-found
+    path is exercised; a valid seeded DB so ``open_reader`` succeeds and the
+    pack load is what fails."""
+    db = tmp_path / "vocab.db"
+    _seed_golden_db(db)
+
+    rc = cli.main(["vocabulary", "nonexistent", "--db", str(db)], registry=_registry())
+
+    assert rc == 2, "an unknown pack must exit 2 like collect/backfill"
+    captured = capsys.readouterr()
+    assert captured.out == "", "the error must go to stderr, not stdout"
+    assert "Traceback" not in captured.err
+    error_lines = [line for line in captured.err.splitlines() if line]
+    assert error_lines == ["error: no pack named 'nonexistent'"]
+
+
 # --------------------------------------------------------------------------- #
 # backfill — unit-tested via the main(...) injection seams, mirroring collect
 # --------------------------------------------------------------------------- #

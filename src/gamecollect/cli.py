@@ -328,11 +328,26 @@ def _render_text(payload: Any) -> None:
 
 
 def _run_read(op: Operation, args: argparse.Namespace) -> int:
-    """Execute a registry read operation and print its result."""
+    """Execute a registry read operation and print its result.
+
+    A read op whose impl loads a pack internally (``vocabulary`` via
+    ``client.get_vocabulary``) can raise ``PackError``/``PackNotFoundError``
+    for an unknown or malformed pack. Surface that as the same clean one-line
+    stderr error + exit 2 that ``collect``/``backfill`` produce (see
+    :func:`_resolve_pack`) rather than a raw traceback. Only ops carrying a
+    ``pack`` param can raise this, so ``kwargs['pack']`` is always present when
+    it does; ops that never load a pack never enter these handlers.
+    """
     kwargs = {param.name: getattr(args, param.name) for param in op.params}
     conn = reader.open_reader(args.db)
     try:
         result = op.impl(conn, **kwargs)
+    except PackNotFoundError:
+        print(f"error: no pack named {kwargs['pack']!r}", file=sys.stderr)
+        return 2
+    except PackError as exc:
+        print(f"error: pack {kwargs['pack']!r} failed to load: {exc}", file=sys.stderr)
+        return 2
     finally:
         conn.close()
     payload = op.to_json(result)
