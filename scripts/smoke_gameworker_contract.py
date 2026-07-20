@@ -141,7 +141,8 @@ def build_checks(adapter: FootballReadPort, conn: Any) -> list[tuple[str, Check]
         return ok, f"found={found} participants={participants!r}"
 
     def list_matches_status_filter_check() -> tuple[bool, str]:
-        status = adapter.list_matches()[0]["status"] if adapter.list_matches() else None
+        all_matches = adapter.list_matches()
+        status = all_matches[0]["status"] if all_matches else None
         filtered = adapter.list_matches(status=status) if status else []
         ok = bool(filtered) and all(r["status"] == status for r in filtered)
         return ok, f"status={status!r} count={len(filtered)}"
