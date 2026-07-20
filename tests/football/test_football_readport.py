@@ -399,6 +399,36 @@ class TestLegacyRowCanonicalization:
         adapter = FootballReadPort(db)
         assert adapter.lineup_team_announced(self.MATCH_ID, "Turkey") is True
 
+    def test_participants_canonicalize_legacy_raw_team_name(self, db):
+        """A matches row whose payload carries a raw provider alias (e.g.
+        "Türkiye"), written before write-side canonicalization, must surface
+        the canonical DISPLAY name ("Turkey") through both list_matches() and
+        latest_state() participants — mirroring the defensive re-canonicalize
+        the sibling _lineup_rows/_roster_rows already do on read."""
+        writer = PartitionWriter(db, SOURCE)
+        writer.upsert_match(
+            {
+                "match_id": self.MATCH_ID,
+                "source": SOURCE,
+                "status": "IN_PLAY",
+                "kickoff_utc": "2026-06-14T04:00:00+00:00",
+                "score_home": 1,
+                "score_away": 0,
+                "display_clock": "27'",
+                # Legacy/raw provider spellings stored directly, never passed
+                # through canonical_display_name at write time.
+                "payload": {"home_team": "Türkiye", "away_team": "Côte d'Ivoire"},
+            }
+        )
+        db.commit()
+
+        adapter = FootballReadPort(db)
+        summary = next(m for m in adapter.list_matches() if m["match_id"] == self.MATCH_ID)
+        assert [p["name"] for p in summary["participants"]] == ["Turkey", "Ivory Coast"]
+
+        state = adapter.latest_state(self.MATCH_ID)
+        assert [p["name"] for p in state["participants"]] == ["Turkey", "Ivory Coast"]
+
 
 class TestRosterAliasCanonicalization:
     """Regression: football_roster.team is ALWAYS written through

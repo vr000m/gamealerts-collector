@@ -20,10 +20,11 @@ from __future__ import annotations
 import sqlite3
 from typing import Any
 
+from gamecollect.client import _GOAL_FAMILY_EVENT_TYPES, _normalize_legacy_payload
 from gamecollect.db import reader
 from gamecollect.fold import fold
 from gamecollect_football.operations import resolve_source
-from gamecollect_football.reconcile import canonical_team_name
+from gamecollect_football.reconcile import canonical_display_name, canonical_team_name
 
 __all__ = ["FootballReadPort"]
 
@@ -32,11 +33,6 @@ __all__ = ["FootballReadPort"]
 # generic ``phase`` field on events/state. Football-specific VALUES, kept
 # local to this adapter; the core Protocol's ``phase`` field stays untyped.
 _PHASE_MARKER_TYPES = frozenset({"kickoff", "half_time", "full_time"})
-
-# Goal-family event types: payload carries the scorer under "scorer", every
-# other event type carries the actor under "player" (schema.sql events
-# comment).
-_GOAL_FAMILY_TYPES = frozenset({"goal", "own_goal"})
 
 
 class FootballReadPort:
@@ -72,10 +68,29 @@ class FootballReadPort:
         participants: list[dict[str, Any]] = []
         home_name = payload.get("home_team")
         away_name = payload.get("away_team")
+        # Defensively re-canonicalize the DISPLAY name on read, mirroring the
+        # legacy-tolerance already in _lineup_rows/_roster_rows: every current
+        # write path stamps canonical_display_name at the seam, but a row
+        # written before that (or by legacy code) can carry a raw provider
+        # alias (e.g. "Türkiye"). canonical_display_name (alias map, case
+        # preserved) — NOT canonical_team_name (fold to a lowercase comparison
+        # key) — keeps the participant name human-readable ("Turkey").
         if home_name:
-            participants.append({"name": home_name, "side": "home", "score": row.get("score_home")})
+            participants.append(
+                {
+                    "name": canonical_display_name(home_name),
+                    "side": "home",
+                    "score": row.get("score_home"),
+                }
+            )
         if away_name:
-            participants.append({"name": away_name, "side": "away", "score": row.get("score_away")})
+            participants.append(
+                {
+                    "name": canonical_display_name(away_name),
+                    "side": "away",
+                    "score": row.get("score_away"),
+                }
+            )
         return participants
 
     def latest_state(self, match_id: str) -> dict[str, Any] | None:
@@ -115,17 +130,18 @@ class FootballReadPort:
         return str(status).lower() if status else None
 
     def _project_event(self, row: dict[str, Any]) -> dict[str, Any]:
-        payload = reader.decode_payload(row.get("payload"))
         event_type = row["type"]
-        if event_type in _GOAL_FAMILY_TYPES:
-            # Rows written before the goal-event participant-contract rename
-            # (docs/dev_plans/20260710-feature-goal-event-participants.md)
-            # stored the scorer under "player" instead of "scorer". Mirror
-            # gamecollect.client._normalize_legacy_payload's fallback so
-            # historical rows still surface a scorer name here.
-            player = payload.get("scorer") or payload.get("player")
-        else:
-            player = payload.get("player")
+        # Reuse the core client's legacy-payload normalizer (pack -> core import
+        # is allowed) instead of a third hand-rolled goal-family copy: rows
+        # written before the goal-event participant-contract rename
+        # (docs/dev_plans/20260710-feature-goal-event-participants.md) stored
+        # the scorer under "player"; _normalize_legacy_payload rewrites it to
+        # "scorer" exactly as gamecollect.engine._stored_events does. The
+        # goal-family set is imported from the same module, so this adapter
+        # cannot drift from the core taxonomy literal.
+        payload = _normalize_legacy_payload(event_type, reader.decode_payload(row.get("payload")))
+        participant_key = "scorer" if event_type in _GOAL_FAMILY_EVENT_TYPES else "player"
+        player = payload.get(participant_key)
         return {
             "seq": row["seq"],
             "minute": row.get("minute"),
