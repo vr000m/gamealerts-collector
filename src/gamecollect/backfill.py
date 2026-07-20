@@ -125,9 +125,16 @@ def run_backfill(
     :attr:`BackfillReport.failed_chunks` and enumeration continues with the
     next chunk rather than aborting the whole run.
 
-    For each enumerated terminal match: skipped (counted in
-    ``already_stored_skipped``) only when the stored ``source`` equals this
-    run's ``source`` AND events landed — resolved in a single
+    For each enumerated terminal match: a match already applied SUCCESSFULLY
+    earlier in this same run (tracked in-memory) is skipped before any
+    re-fetch — a padded adjacent-day chunk can re-enumerate it, and for an
+    eventless terminal match the DB-backed ``has_events`` check below never
+    fires (apply writes events LAST and can return a non-None baseline with
+    zero event rows), so without this guard a transient failure on the
+    redundant retry would count the match in both ``applied`` and ``failed``.
+    Otherwise skipped (counted in ``already_stored_skipped``) only when the
+    stored ``source`` equals this run's ``source`` AND events landed — resolved
+    in a single
     ``engine.stored_source_and_has_events(match_id)`` call (one stored-id
     resolution instead of two). A same-source stored row with zero events is
     retried, not skipped. ``has_events`` is a RELIABLE "already fully stored"
@@ -163,6 +170,7 @@ def run_backfill(
     enumerated = 0
     already_stored_skipped = 0
     applied = 0
+    applied_ids: set[str] = set()
     failed: dict[str, Exception] = {}
     failed_chunks: list[tuple[str, Exception]] = []
 
@@ -190,6 +198,23 @@ def run_backfill(
             match_id = match.match_id
 
             try:
+                if match_id in applied_ids:
+                    # Already applied successfully earlier in THIS run. A match
+                    # can be re-enumerated under an adjacent day's padded chunk
+                    # (see chunk_date_range's overlap), and the DB-backed
+                    # skip-check below cannot catch this case for an eventless
+                    # terminal match: apply_one_off_match writes events LAST and
+                    # may return a non-None baseline with zero event rows, so
+                    # ``has_events`` stays False even after a fully successful
+                    # apply. Re-fetching and re-applying would be a documented
+                    # safe no-op, but a transient fetch/apply failure on that
+                    # redundant retry would wrongly record the match in
+                    # ``failed`` alongside its earlier ``applied`` count — the
+                    # succeed-then-fail mirror of the fail-then-succeed case the
+                    # ``failed.pop`` below handles. Skip it: nothing new to
+                    # write, and no redundant provider call to fail on.
+                    already_stored_skipped += 1
+                    continue
                 stored_source, has_events = engine.stored_source_and_has_events(match_id)
                 if stored_source == source and has_events:
                     already_stored_skipped += 1
@@ -220,6 +245,7 @@ def run_backfill(
                 # limitation, not a correctness bug: a caller reads it as
                 # "matches examined", not "distinct matches".)
                 failed.pop(match_id, None)
+                applied_ids.add(match_id)
                 applied += 1
 
     return BackfillReport(

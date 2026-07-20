@@ -543,6 +543,82 @@ def test_run_backfill_match_that_fails_then_succeeds_is_not_reported_as_both():
     assert report.failed == {}
 
 
+class _SucceedEventlessEngine:
+    """Engine double whose ``apply_one_off_match`` ALWAYS succeeds (returns
+    non-None) but whose skip-check ALWAYS reports zero stored events.
+
+    Models an eventless terminal match: ``apply_one_off_match`` writes events
+    LAST (``side_tables_first``) and can return a non-None baseline even when
+    there are no event rows to append, so ``has_events`` legitimately stays
+    False even after a fully successful apply. Across a padded re-enumeration
+    the DB-backed skip-check therefore never fires; only the in-run
+    applied-ids guard prevents the redundant retry.
+    """
+
+    def __init__(self, source: str) -> None:
+        self._source = source
+
+    @property
+    def source(self) -> str:
+        return self._source
+
+    def stored_source_and_has_events(self, match_id: str) -> tuple[str | None, bool]:
+        return None, False
+
+    def apply_one_off_match(
+        self, scoreboard: NormalizedMatch, detail: NormalizedMatch
+    ) -> NormalizedMatch | None:
+        return scoreboard
+
+
+class _SucceedThenFetchFailProvider:
+    """``fetch_match_detail`` succeeds on its FIRST call and fails on every
+    later call — a transient blip on the redundant re-fetch of a match that was
+    already applied earlier in the same run."""
+
+    def __init__(self, schedule: dict[str, list[NormalizedMatch]]) -> None:
+        self._schedule = schedule
+        self.schedule_calls: list[str] = []
+        self.detail_calls: list[str] = []
+
+    def fetch_schedule(self, *, dates: str) -> list[NormalizedMatch]:
+        self.schedule_calls.append(dates)
+        return list(self._schedule.get(dates, []))
+
+    def fetch_match_detail(self, match_id: str) -> NormalizedMatch:
+        self.detail_calls.append(match_id)
+        if len(self.detail_calls) >= 2:
+            raise ConnectionError("transient blip on redundant re-fetch")
+        return nm(match_id)
+
+
+def test_run_backfill_match_applied_eventless_then_refetch_fails_is_not_reported_as_both():
+    """Regression (reverse of ``fails_then_succeeds``): a match applied
+    SUCCESSFULLY in one chunk with zero events (so ``has_events`` stays False)
+    and re-enumerated in a later padded chunk — where the redundant re-fetch
+    transiently FAILS — must NOT end up counted in both ``applied`` AND
+    ``failed``. Because the match was already applied this run, the second
+    encounter is skipped before re-fetching, so the transient failure never
+    contaminates the report.
+    """
+    provider = _SucceedThenFetchFailProvider(
+        {
+            "20260601": [nm("m1", status=MatchStatus.FINISHED)],
+            "20260602": [nm("m1", status=MatchStatus.FINISHED)],
+        }
+    )
+    engine = _SucceedEventlessEngine(SOURCE)
+    report = backfill.run_backfill(
+        engine, provider, ["20260601", "20260602"], source=SOURCE, request_delay=0.0
+    )
+    assert report.applied == 1
+    assert "m1" not in report.failed
+    assert report.failed == {}
+    # The redundant second-chunk re-fetch was skipped entirely, so
+    # fetch_match_detail ran exactly once and the transient failure never fired.
+    assert provider.detail_calls == ["m1"]
+
+
 def test_run_backfill_source_mismatch_raises_before_any_enumeration_or_fetch():
     provider = FakeScheduleProvider({"20260601": [nm("m1", status=MatchStatus.FINISHED)]})
     engine = FakeEngine("engine-owned-source")
