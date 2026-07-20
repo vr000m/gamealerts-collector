@@ -135,7 +135,7 @@ class FootballReadPort:
         # is allowed) instead of a third hand-rolled goal-family copy: rows
         # written before the goal-event participant-contract rename
         # (docs/dev_plans/20260710-feature-goal-event-participants.md) stored
-        # the scorer under "player"; _normalize_legacy_payload rewrites it to
+        # the scorer under "player"; normalize_legacy_payload rewrites it to
         # "scorer" exactly as gamecollect.engine._stored_events does. The
         # goal-family set is imported from the same module, so this adapter
         # cannot drift from the core taxonomy literal.

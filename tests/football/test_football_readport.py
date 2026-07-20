@@ -482,7 +482,7 @@ class TestRosterAliasCanonicalization:
 class TestLegacyGoalScorerFallback:
     """Regression: existing databases can contain goal/own_goal event rows
     written before the scorer-field rename, using payload.player instead of
-    payload.scorer (see gamecollect.client._normalize_legacy_payload for the
+    payload.scorer (see gamecollect.client.normalize_legacy_payload for the
     same fallback on the core read path). The adapter must still surface the
     scorer name for these legacy-shaped rows."""
 

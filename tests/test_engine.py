@@ -8772,14 +8772,14 @@ def test_backfill_give_up_reemission_apply_failure_registers_not_lost(tmp_path, 
 def test_client_goal_family_matches_engine():
     """gamecollect.client keeps a second, deliberate copy of the goal-family
     taxonomy literal (to avoid importing the daemon-weight engine module into
-    a lightweight read client — see client._GOAL_FAMILY_EVENT_TYPES'
+    a lightweight read client — see client.GOAL_FAMILY_EVENT_TYPES'
     docstring). If the two ever drift, a legacy-payload row would normalize
     correctly on the internal engine-reconciliation path but not on the
     public get_events_since/events --json path, or vice versa."""
-    from gamecollect.client import _GOAL_FAMILY_EVENT_TYPES as client_set
+    from gamecollect.client import GOAL_FAMILY_EVENT_TYPES as client_set
     from gamecollect.engine import _GOAL_FAMILY_EVENT_TYPES as engine_set
 
     assert client_set == engine_set, (
-        f"gamecollect.client._GOAL_FAMILY_EVENT_TYPES {sorted(client_set)} drifted from "
+        f"gamecollect.client.GOAL_FAMILY_EVENT_TYPES {sorted(client_set)} drifted from "
         f"gamecollect.engine._GOAL_FAMILY_EVENT_TYPES {sorted(engine_set)}"
     )

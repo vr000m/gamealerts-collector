@@ -114,13 +114,6 @@ def normalize_legacy_payload(event_type: str, payload: Any) -> Any:
     return payload
 
 
-# Backward-compatible private aliases: core still references the underscore
-# names internally (below) and the drift guard
-# ``test_client_goal_family_matches_engine`` imports the underscore form.
-_GOAL_FAMILY_EVENT_TYPES = GOAL_FAMILY_EVENT_TYPES
-_normalize_legacy_payload = normalize_legacy_payload
-
-
 @dataclass(frozen=True)
 class MatchState:
     """Typed view of one ``matches`` row (``payload`` JSON-decoded)."""
