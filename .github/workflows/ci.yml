@@ -119,7 +119,12 @@ jobs:
                   "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'football_%'"
               )
           }
-          assert side_tables == {"football_stats", "football_lineups"}, side_tables
+          assert side_tables == {
+              "football_stats",
+              "football_lineups",
+              "football_venue",
+              "football_roster",
+          }, side_tables
           conn.close()
           print(f"football wheel smoke OK: {inserted} events written to {db_path}")
           EOF

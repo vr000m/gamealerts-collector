@@ -29,14 +29,157 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sqlite3
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, NamedTuple
 
 from gamecollect.db import reader
 from gamecollect.db.writer import PartitionWriter
 from gamecollect.fold import fold
 from gamecollect.provider import NormalizedMatch, merge_payload_preserving_richer
+
+# Pack-owned side tables (typed homes for the football-specific shapes the
+# adapter carries in NormalizedMatch.payload: boxscore stats and lineups).
+# Additive + idempotent (CREATE TABLE IF NOT EXISTS); soft refs mirror the
+# core posture — no FOREIGN KEY constraints in v1. `name_folded` on lineups
+# preserves the fold-based player lookup gamealerts depends on (stamped with
+# gamecollect.fold.fold by whoever writes the row).
+#
+# Each entry is tagged with whether the table is match-keyed (soft ref to
+# matches.match_id, so a per-match row must migrate when a stub is adopted
+# onto a late-appearing canonical schedule row) or team-keyed (one row per
+# team, no per-match row to migrate — e.g. football_roster). This single
+# tagged structure is the source of truth for both the DDL applied to the
+# database (FOOTBALL_SIDE_TABLE_DDL, re-exported from pack.py for the public
+# contract) and the set of tables _adopt_stub_rows must migrate
+# (_MIGRATABLE_SIDE_TABLES, below) — so a newly added match-keyed side table
+# only needs one edit (its tag here) to be picked up by stub adoption,
+# instead of two hand-synced lists that can drift (this exact drift bug fired
+# once already: football_venue was omitted from a hand-maintained migration
+# tuple).
+# Strips SQL line comments (`-- ...` to end of line) and block comments
+# (`/* ... */`, possibly spanning multiple lines) before the match_id check
+# in SideTableSpec.match_keyed — a DDL string's PROSE comment can legitimately
+# mention "match_id" (e.g. football_roster's DDL explains it is deliberately
+# unscoped by match_id) without the table declaring any such column; only
+# checking live (non-comment) text avoids a false positive there.
+_SQL_LINE_COMMENT_RE = re.compile(r"--[^\n]*")
+_SQL_BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
+
+# A heuristic (substring, not a SQL parser) check that a bare `match_id`
+# column name appears in the DDL (column declaration or PRIMARY KEY clause).
+_MATCH_ID_COLUMN_RE = re.compile(r"\bmatch_id\b")
+
+
+class SideTableSpec(NamedTuple):
+    """One football pack-owned side table: its name and CREATE TABLE DDL.
+
+    A ``NamedTuple`` (not a bare 2-tuple) so the unpack sites
+    (``FOOTBALL_SIDE_TABLE_DDL`` below, ``_MIGRATABLE_SIDE_TABLES`` in this
+    module) are self-documenting and IDE-checkable against field reordering."""
+
+    name: str
+    ddl: str
+
+    @property
+    def match_keyed(self) -> bool:
+        """Whether the table is match-keyed (soft ref to ``matches.match_id``).
+
+        DERIVED structurally from the DDL — not a hand-set flag — so it can
+        never drift from the DDL sitting beside it (the two-sources-of-truth
+        bug a hand-set boolean + import-time cross-checker previously guarded
+        against; deriving removes both). A match-keyed table's per-match rows
+        must migrate when a stub is adopted onto a late-appearing canonical
+        schedule row (see :func:`_adopt_stub_rows` / ``_MIGRATABLE_SIDE_TABLES``);
+        a team-keyed table (one row per team, e.g. ``football_roster``) has no
+        per-match row to migrate. SQL comments are stripped first so DDL prose
+        mentioning "match_id" does not false-positive."""
+        ddl_without_comments = _SQL_BLOCK_COMMENT_RE.sub("", self.ddl)
+        ddl_without_comments = _SQL_LINE_COMMENT_RE.sub("", ddl_without_comments)
+        return _MATCH_ID_COLUMN_RE.search(ddl_without_comments) is not None
+
+
+_FOOTBALL_SIDE_TABLE_SPECS: tuple[SideTableSpec, ...] = (
+    SideTableSpec(
+        "football_stats",
+        """
+    CREATE TABLE IF NOT EXISTS football_stats (
+        source          TEXT NOT NULL,
+        match_id        TEXT NOT NULL,   -- soft ref -> matches.match_id
+        team            TEXT NOT NULL,   -- team display name (boxscore key)
+        possession      REAL,
+        shots           INTEGER,
+        shots_on_target INTEGER,
+        corners         INTEGER,
+        fouls           INTEGER,
+        yellow_cards    INTEGER,
+        red_cards       INTEGER,
+        offsides        INTEGER,
+        PRIMARY KEY (source, match_id, team)
+    );
+    """,
+    ),
+    SideTableSpec(
+        "football_lineups",
+        """
+    CREATE TABLE IF NOT EXISTS football_lineups (
+        source          TEXT NOT NULL,
+        match_id        TEXT NOT NULL,   -- soft ref -> matches.match_id
+        team            TEXT NOT NULL,   -- team display name
+        athlete_id      TEXT NOT NULL,   -- ESPN athlete id
+        display_name    TEXT NOT NULL,
+        name_folded     TEXT,            -- fold(display_name), for folded lookups
+        jersey          TEXT,
+        position        TEXT,
+        starter         INTEGER NOT NULL DEFAULT 0,
+        subbed_in       INTEGER NOT NULL DEFAULT 0,
+        subbed_out      INTEGER NOT NULL DEFAULT 0,
+        formation_place INTEGER,
+        home_away       TEXT,
+        formation       TEXT,
+        PRIMARY KEY (source, match_id, team, athlete_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_football_lineups_folded
+        ON football_lineups (source, name_folded);
+    """,
+    ),
+    SideTableSpec(
+        "football_venue",
+        """
+    CREATE TABLE IF NOT EXISTS football_venue (
+        source          TEXT NOT NULL,
+        match_id        TEXT NOT NULL,   -- soft ref -> matches.match_id
+        stadium         TEXT,
+        city            TEXT,
+        PRIMARY KEY (source, match_id)
+    );
+    """,
+    ),
+    SideTableSpec(
+        "football_roster",
+        """
+    CREATE TABLE IF NOT EXISTS football_roster (
+        -- Team-level squad data (static tournament fixture, NOT per-match) —
+        -- deliberately unscoped by `source`/`match_id`: one canonical roster
+        -- per team serves every match/source that team appears in.
+        team            TEXT NOT NULL,   -- canonical display name (see reconcile.py)
+        fifa_code       TEXT,
+        group_name      TEXT,
+        number          INTEGER NOT NULL,
+        position        TEXT,
+        player_name     TEXT NOT NULL,
+        name_folded     TEXT,            -- fold(player_name), for folded lookups
+        date_of_birth   TEXT,
+        PRIMARY KEY (team, number)
+    );
+    CREATE INDEX IF NOT EXISTS idx_football_roster_folded
+        ON football_roster (name_folded);
+    """,
+    ),
+)
+
+FOOTBALL_SIDE_TABLE_DDL: tuple[str, ...] = tuple(spec.ddl for spec in _FOOTBALL_SIDE_TABLE_SPECS)
 
 __all__ = [
     "TEAM_ALIASES",
@@ -585,9 +728,16 @@ def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
     return row is not None
 
 
-# Pack-owned side tables keyed by match_id that must follow a stub row when it
-# is adopted onto a late-appearing canonical schedule row.
-_MIGRATABLE_SIDE_TABLES = ("football_stats", "football_lineups")
+# Side tables keyed by match_id that must follow a stub row when it is
+# adopted onto a late-appearing canonical schedule row. Derived structurally
+# from _FOOTBALL_SIDE_TABLE_SPECS above (not hand-duplicated) so a newly
+# added match-keyed table is picked up automatically — see the comment on
+# _FOOTBALL_SIDE_TABLE_SPECS. football_roster is excluded because it is
+# team-keyed (PRIMARY KEY (team, number)), not match-keyed, so it has no
+# per-match row to migrate.
+_MIGRATABLE_SIDE_TABLES: tuple[str, ...] = tuple(
+    spec.name for spec in _FOOTBALL_SIDE_TABLE_SPECS if spec.match_keyed
+)
 
 
 def _adopt_stub_rows(
@@ -667,6 +817,16 @@ def _adopt_stub_rows(
     merged_payload = dict(stub_payload)
     _merge_preserving_richer(merged_payload, reader.get_stored_payload(conn, canonical_id))
     with conn:
+        # Deliberately hardcoded to football_lineups by name rather than
+        # generalized via a "has home/away orientation" tag on
+        # SideTableSpec: today football_lineups is the ONLY side table
+        # carrying a per-row home/away orientation column, so a third tag
+        # dimension on the spec tuple would be speculative scaffolding for a
+        # hypothetical second table, not a real generalization (round 2
+        # review finding #5 — deferred deliberately). If a second
+        # orientation-carrying side table is ever added, generalize this into
+        # a spec-driven loop (mirroring _MIGRATABLE_SIDE_TABLES above) at
+        # that point.
         if reverse_oriented and _table_exists(conn, "football_lineups"):
             conn.execute(
                 "UPDATE football_lineups "

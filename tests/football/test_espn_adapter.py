@@ -274,6 +274,28 @@ def test_null_athlete_in_key_event_does_not_crash():
     assert events[0].player is None and events[0].team is None
 
 
+def test_null_game_info_does_not_crash_summary_parse():
+    """ESPN can send ``"gameInfo": null`` (key present, value explicitly
+    None) rather than omitting the key. ``data.get("gameInfo", {})`` only
+    substitutes the default when the key is ABSENT -- when it's present with
+    a JSON null, .get returns None, and the previous
+    ``data.get("gameInfo", {}).get("venue")`` then raised AttributeError,
+    which fetch_match_detail's except clause converted into a
+    ShapeDriftError -- failing the ENTIRE summary parse over a field
+    (venue) that should simply come back None. The fix normalizes the
+    absent-key and explicit-null cases the same way so the match still
+    parses, just without venue info."""
+    from gamecollect_football.espn import ESPNAdapter
+
+    raw = json.loads(FIXTURE_PATH.read_text())
+    raw["gameInfo"] = None
+
+    adapter = ESPNAdapter(http_get=lambda url, params=None, _d=raw: _d)
+    match = adapter.fetch_match_detail(MATCH_ID)
+    assert match.payload.get("stadium") is None
+    assert match.payload.get("city") is None
+
+
 class TestProviderSeamNonDictResponses:
     """Codex adversarial fix: valid JSON with the wrong top-level type (e.g. a
     bare list) must surface as ShapeDriftError, not a raw TypeError escaping

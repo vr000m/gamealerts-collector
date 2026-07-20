@@ -725,6 +725,56 @@ class TestStubAdoption:
         finally:
             conn.close()
 
+    def test_football_venue_row_follows_the_stub(self, tmp_path):
+        """Adversarial-review finding: football_venue was absent from
+        _MIGRATABLE_SIDE_TABLES, so adoption left a canonical match with no
+        venue (readers see None) while the venue row stayed orphaned on the
+        deleted stub id. Mirrors test_football_side_table_rows_follow_the_stub
+        for the venue table."""
+        from gamecollect_football.pack import FOOTBALL_SIDE_TABLE_DDL
+
+        conn = connect(tmp_path / "adopt_venue.db", side_table_ddl=FOOTBALL_SIDE_TABLE_DDL)
+        try:
+            writer = PartitionWriter(conn, SOURCE_A)
+            assert seed_or_reconcile_match(conn, writer, _match(), PROVIDER) == self.STUB
+            with conn:
+                conn.execute(
+                    "INSERT INTO football_venue (source, match_id, stadium, city) "
+                    "VALUES (?, ?, ?, ?)",
+                    (SOURCE_A, self.STUB, "Estadio Azteca", "Mexico City"),
+                )
+                # A foreign partition's row keyed to the same stub-looking id
+                # must NOT be touched (partition discipline).
+                conn.execute(
+                    "INSERT INTO football_venue (source, match_id, stadium, city) "
+                    "VALUES (?, ?, ?, ?)",
+                    (SOURCE_B, self.STUB, "NRG Stadium", "Houston"),
+                )
+            self._seed_schedule_row(writer)
+            assert seed_or_reconcile_match(conn, writer, _match(), PROVIDER) == self.CANONICAL
+
+            canonical_venue = conn.execute(
+                "SELECT stadium, city FROM football_venue WHERE source = ? AND match_id = ?",
+                (SOURCE_A, self.CANONICAL),
+            ).fetchone()
+            assert tuple(canonical_venue) == ("Estadio Azteca", "Mexico City"), (
+                "the canonical match must be immediately venue-visible after adoption"
+            )
+            (stub_remaining,) = conn.execute(
+                "SELECT COUNT(*) FROM football_venue WHERE source = ? AND match_id = ?",
+                (SOURCE_A, self.STUB),
+            ).fetchone()
+            assert stub_remaining == 0, "no venue row may remain orphaned on the deleted stub"
+            foreign_partition_venue = conn.execute(
+                "SELECT stadium, city FROM football_venue WHERE source = ? AND match_id = ?",
+                (SOURCE_B, self.STUB),
+            ).fetchone()
+            assert tuple(foreign_partition_venue) == ("NRG Stadium", "Houston"), (
+                "a foreign partition's venue row must survive untouched"
+            )
+        finally:
+            conn.close()
+
     def test_stub_with_no_events_still_migrates_and_dedupes_rows(self, db):
         """A stub with no events (state-only strip row) is trivially adopted:
         mappings move, the stub matches row is deleted, one row remains."""
@@ -1218,3 +1268,101 @@ class TestNoMapChurnDuringRefusal:
             "a persisting refusal conflict must not churn provider_match_map "
             f"every poll; saw: {map_writes}"
         )
+
+
+class TestMigratableSideTablesDerivation:
+    """Regression: _MIGRATABLE_SIDE_TABLES was previously a hand-maintained
+    tuple kept in sync with FOOTBALL_SIDE_TABLE_DDL by hand — and drifted once
+    already (football_venue was omitted, see TestStubAdoption's
+    test_football_venue_row_follows_the_stub). It is now derived structurally
+    from a single tagged spec list (_FOOTBALL_SIDE_TABLE_SPECS), so a newly
+    added match-keyed table cannot be omitted by a second forgotten edit."""
+
+    def test_every_match_keyed_spec_is_migratable(self):
+        from gamecollect_football.reconcile import (
+            _FOOTBALL_SIDE_TABLE_SPECS,
+            _MIGRATABLE_SIDE_TABLES,
+        )
+
+        match_keyed_names = {spec.name for spec in _FOOTBALL_SIDE_TABLE_SPECS if spec.match_keyed}
+        assert set(_MIGRATABLE_SIDE_TABLES) == match_keyed_names
+        # football_roster is team-keyed and must NOT be migratable.
+        assert "football_roster" not in _MIGRATABLE_SIDE_TABLES
+
+    def test_a_new_match_keyed_spec_is_automatically_migratable(self):
+        """Simulates adding a new match-keyed side table: derive a fresh
+        _MIGRATABLE_SIDE_TABLES from specs + one fake extra entry, exactly as
+        reconcile.py itself does at import time, and assert the new table is
+        included with zero additional hand-editing. ``match_keyed`` is now
+        DERIVED from the DDL, so the fake table declares a real match_id
+        column instead of a hand-set flag."""
+        from gamecollect_football.reconcile import _FOOTBALL_SIDE_TABLE_SPECS, SideTableSpec
+
+        fake_specs = (
+            *_FOOTBALL_SIDE_TABLE_SPECS,
+            SideTableSpec(
+                "football_fake_new_table",
+                "CREATE TABLE IF NOT EXISTS football_fake_new_table "
+                "(source TEXT, match_id TEXT, x TEXT);",
+            ),
+        )
+        derived = tuple(spec.name for spec in fake_specs if spec.match_keyed)
+        assert "football_fake_new_table" in derived
+
+
+class TestSideTableSpecMatchKeyedDerivation:
+    """``SideTableSpec.match_keyed`` is DERIVED from the DDL (not a hand-set
+    boolean cross-checked at import time), so the tag can never drift from the
+    DDL beside it — the two-sources-of-truth problem the old
+    ``_assert_side_table_specs_structurally_consistent`` guarded is now
+    structurally impossible. These pin the derivation itself."""
+
+    def test_real_specs_derive_expected_match_keyed(self):
+        from gamecollect_football.reconcile import _FOOTBALL_SIDE_TABLE_SPECS
+
+        by_name = {spec.name: spec.match_keyed for spec in _FOOTBALL_SIDE_TABLE_SPECS}
+        assert by_name["football_stats"] is True
+        assert by_name["football_lineups"] is True
+        assert by_name["football_venue"] is True
+        # football_roster is deliberately team-keyed (PRIMARY KEY (team, number)).
+        assert by_name["football_roster"] is False
+
+    def test_match_id_column_derives_match_keyed_true(self):
+        from gamecollect_football.reconcile import SideTableSpec
+
+        spec = SideTableSpec(
+            "football_fake_match_keyed_table",
+            "CREATE TABLE IF NOT EXISTS football_fake_match_keyed_table "
+            "(source TEXT, match_id TEXT);",
+        )
+        assert spec.match_keyed is True
+
+    def test_no_match_id_column_derives_match_keyed_false(self):
+        from gamecollect_football.reconcile import SideTableSpec
+
+        spec = SideTableSpec(
+            "football_fake_new_table",
+            "CREATE TABLE IF NOT EXISTS football_fake_new_table (x TEXT);",
+        )
+        assert spec.match_keyed is False
+
+    def test_match_id_mention_in_block_comment_is_not_a_false_positive(self):
+        """The comment-stripping must cover `/* ... */` block comments: a
+        table that mentions "match_id" only in prose (while genuinely
+        team-keyed) must derive match_keyed=False, not be misclassified as
+        match-keyed."""
+        from gamecollect_football.reconcile import SideTableSpec
+
+        spec = SideTableSpec(
+            "football_fake_team_keyed_table",
+            """
+            CREATE TABLE IF NOT EXISTS football_fake_team_keyed_table (
+                /* mirrors the match_id join used elsewhere, but this
+                   table is deliberately team-keyed, not match-keyed */
+                team TEXT NOT NULL,
+                value TEXT,
+                PRIMARY KEY (team)
+            );
+            """,
+        )
+        assert spec.match_keyed is False

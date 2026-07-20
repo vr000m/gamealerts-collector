@@ -581,6 +581,21 @@ def _parse_minute(display_value: str | None) -> int | None:
         return None
 
 
+def _extract_venue(venue: dict | None) -> tuple[str | None, str | None]:
+    """Extract (stadium, city) from an ESPN venue block.
+
+    ESPN city is "Houston, Texas" / "Kansas City, Missouri"; keep the city
+    name (before the first comma) to match the seeded-schedule city
+    convention. Shared by the scoreboard (``competition.venue``) and summary
+    (``gameInfo.venue``) parsers — same shape, two different source paths.
+    """
+    venue = venue or {}
+    stadium = venue.get("fullName") or None
+    raw_city = (venue.get("address") or {}).get("city")
+    city = raw_city.split(",")[0].strip() if raw_city else None
+    return stadium, city
+
+
 def _parse_formation_place(raw: object) -> int | None:
     """Parse ESPN's ``formationPlace`` (a string like "1") into an int, or None."""
     if raw is None:
@@ -915,12 +930,7 @@ class ESPNAdapter(MatchDataProvider):
         # (it would need the summary/standings endpoint — a heavier follow-up).
         # These land in NormalizedMatch.payload — schedule metadata lives in the
         # matches.payload JSON column, not core columns (plan pin).
-        venue = comp.get("venue") or {}
-        stadium = venue.get("fullName") or None
-        # ESPN city is "Houston, Texas" / "Kansas City, Missouri"; keep the city name
-        # (before the first comma) to match the seeded-schedule city convention.
-        raw_city = (venue.get("address") or {}).get("city")
-        city = raw_city.split(",")[0].strip() if raw_city else None
+        stadium, city = _extract_venue(comp.get("venue"))
         # season.slug is e.g. "group-stage" / "round-of-32" → "Group Stage".
         slug = (ev.get("season") or {}).get("slug")
         round_name = slug.replace("-", " ").title() if slug else None
@@ -975,6 +985,15 @@ class ESPNAdapter(MatchDataProvider):
         # Defaulted here so a headerless / empty-competitions summary normalizes
         # to None rather than reading an unbound loop variable below.
         result_type: str | None = None
+
+        # gameInfo.venue is the summary's venue block (same shape as the
+        # scoreboard's competition.venue) — present whenever ESPN has fixture
+        # metadata for the match, independent of live/header state.
+        # data.get("gameInfo", {}) returns the default only when the key is
+        # ABSENT; when the key is present with an explicit JSON null, .get
+        # returns None, and `None.get("venue")` would raise AttributeError.
+        # `or {}` normalizes both the absent-key and explicit-null cases.
+        stadium, city = _extract_venue((data.get("gameInfo") or {}).get("venue"))
 
         # Try to get status from header competitions
         header = data.get("header", {})
@@ -1078,5 +1097,7 @@ class ESPNAdapter(MatchDataProvider):
                 "score_pen_away": score_pen_away,
                 "pen_winner_side": pen_winner_side,
                 "result_type": result_type,
+                "stadium": stadium,
+                "city": city,
             },
         )

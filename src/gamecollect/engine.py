@@ -40,13 +40,14 @@ import logging
 import random
 import signal
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Hashable
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
-from gamecollect.db import reader
+from gamecollect.db import paths, reader
 from gamecollect.db.connection import connect
+from gamecollect.db.locking import AdvisoryLock, live_db_admission_lock
 from gamecollect.db.writer import (
     CrossPartitionError,
     PartitionWriter,
@@ -54,7 +55,7 @@ from gamecollect.db.writer import (
     TaxonomyError,
     UnseededMatchError,
 )
-from gamecollect.diffing import MatchDiff, diff_matches
+from gamecollect.diffing import MatchDiff, diff_match, diff_matches
 from gamecollect.fallback_merge import (
     accrue_fallback as _accrue_fallback,
 )
@@ -673,6 +674,17 @@ class CollectorEngine:
 
         self._conn = connect(self._db_path, side_table_ddl=pack.side_table_ddl)
         self._writer = PartitionWriter(self._conn, source, taxonomy=pack.taxonomy)
+        # Directory holding the SHARED/EXCLUSIVE admission lock (Phase 1). The
+        # data_dir is the DB file's parent: the shared-file model puts the DB
+        # directly under data_dir (paths.db_path), so paths.lock_dir(parent)
+        # yields the same <data_dir>/locks gamealerts' commentary writer uses.
+        # For an explicit-path connection (the pre-shared-file `path=` form) the
+        # lock still lands in a `locks/` sibling of the DB — no resolvable
+        # data_dir is required, so backward compatibility is preserved. Every
+        # write session (poll_once, apply_one_off_match) holds this SHARED for
+        # its duration so a future destructive EXCLUSIVE reset fences in-flight
+        # writers; SHARED holders coexist and never block one another.
+        self._lock_dir = paths.lock_dir(self._db_path.parent)
 
         # Last-written provider snapshot per provider-native match_id (the diff
         # baseline) and, when recording, the merged fixture accumulator.
@@ -728,6 +740,26 @@ class CollectorEngine:
         # from an ordinary match's ``_apply`` failure (unrelated to backfill
         # retry accounting).
         self._backfill_apply_pending: set[str] = set()
+        # Last-logged drift signature per provider_match_id -> {seq: signature}
+        # — see _log_drift_once. A drifted seq's stored row is never mutated,
+        # so the SAME mismatch would otherwise re-diff and re-log at ERROR
+        # every poll for the rest of the match; this caps each distinct
+        # mismatch to one ERROR, demoting identical repeats to DEBUG while
+        # still re-escalating if the mismatch's content changes. Keyed (like
+        # self._cooldowns/_transitions/_backfill) by provider-native match id
+        # so _resolve_tracker/_resolve_backfill_tracker can evict a resolved
+        # match's entries instead of leaking for the life of the process.
+        self._logged_drift: dict[str, dict[Any, str]] = {}
+        # Provider-native match ids whose drift RE-SURFACED during the current
+        # poll (populated by _log_drift_once, cleared at the top of each
+        # poll_once). Read by the eviction helper _evict_match_tracking so a
+        # terminal-resolution/backfill-resolution apply does NOT wipe the
+        # drift-dedup cache of a match whose drift is STILL recurring this poll
+        # — wiping it would re-escalate the same persistent drift to ERROR next
+        # poll (the spam _log_drift_once exists to damp). A match that stops
+        # drifting is absent from this set on its next resolution poll and its
+        # cache is then evicted, so a finished match's memory does not leak.
+        self._drifted_this_poll: set[str] = set()
         self._backoff_multiplier = 1
         # One-time restart scan latch: on the FIRST successful poll the stored
         # matches table is scanned for rows this source left live at shutdown
@@ -785,6 +817,23 @@ class CollectorEngine:
         self._backoff_multiplier = 1
         return self._jittered_interval()
 
+    def _admission_lock(self) -> AdvisoryLock:
+        """SHARED admission lock over ``self._lock_dir`` for one write session.
+
+        Acquired SHARED (the default) and held for the duration of a single
+        collector write session — a ``poll_once`` batch or a one-shot
+        ``apply_one_off_match`` — mirroring gamealerts' commentary writer, so a
+        future destructive EXCLUSIVE reset (:mod:`gamecollect.db.locking`)
+        fences in-flight writers. SHARED holders coexist and never block one
+        another, so per-write acquisition adds zero contention between concurrent
+        collector/commentary writers while still admitting the reset BETWEEN
+        write sessions; a daemon-lifetime hold would instead starve it forever.
+        No EXCLUSIVE user exists yet, so today the lock fences nothing at
+        runtime — this closes the documented "collector holds it SHARED for its
+        write session" gap ahead of that user landing.
+        """
+        return live_db_admission_lock(self._lock_dir)
+
     def poll_once(self) -> None:
         """Fetch, diff, and write one poll's worth of matches.
 
@@ -806,93 +855,214 @@ class CollectorEngine:
         retroactively-inserted seq) keeps re-diffing and re-logging instead of
         being silently baselined away.
         """
+        # Reset the per-poll drift-recurrence set: only drift observed DURING
+        # this poll gates the eviction helper's drift-cache retention (see
+        # _evict_match_tracking / _log_drift_once).
+        self._drifted_this_poll.clear()
         matches, live_resumptions = self._fetch_poll_snapshots()
         if self._recorder is not None:
             self._recorder.accumulate(matches)
-        for diff in diff_matches(matches, self._last):
-            if not diff.has_changes:
-                # Stored state already durably matches this snapshot. For a
-                # non-live snapshot this is a genuine durable state (the row IS
-                # persisted terminal), so a pending terminal tracker resolves
-                # and its cooldown clears. But a no-change LIVE snapshot
-                # advanced NOTHING (snapshot == baseline, zero writes): it must
-                # NOT clear a cooldown or drop a resumption's tracker, so it is
-                # routed with ``state_advanced=False`` (its live branch is a
-                # no-op) — see _on_durable_snapshot.
-                self._on_durable_snapshot(
-                    diff.match.match_id,
-                    diff.match,
-                    live_resumptions=live_resumptions,
-                    state_advanced=False,
-                )
-                continue
-            try:
-                baseline = self._apply(diff)
-            except SequenceError as exc:
-                # Defensive net: _apply reconciles fingerprint drift itself
-                # against the stored rows, so this only fires for a batch that
-                # failed pre-insert validation in a way the reconciliation also
-                # could not absorb. Leave self._last unchanged so a corrected
-                # list re-syncs.
-                log.error(
-                    "event drift for match %s on source %s: %s (skipping match this poll)",
-                    diff.match.match_id,
-                    self._source,
-                    exc,
-                )
-                # This _apply raised AFTER seed_match may already have
-                # durably written the matches row (seed-before-child-write),
-                # so a match this poll's fetch confirmed as ``is_backfill``
-                # must still count this as a backfill attempt — otherwise a
-                # row now exists with no tracker to keep is_backfill alive,
-                # permanently foreclosing retry. Not reached for a
-                # non-backfill match (absent from
-                # ``self._backfill_apply_pending``).
-                if diff.match.match_id in self._backfill_apply_pending:
+        # Hold the SHARED admission lock for this poll's write session only (not
+        # the network fetch above, which acquires nothing): the diff/apply loop
+        # is where every DB write lands. Per-poll (not daemon-lifetime) so a
+        # future EXCLUSIVE reset can be admitted between polls — see
+        # _admission_lock. Readers never acquire the lock.
+        with self._admission_lock():
+            for diff in diff_matches(matches, self._last):
+                if not diff.has_changes:
+                    # Stored state already durably matches this snapshot. For a
+                    # non-live snapshot this is a genuine durable state (the row IS
+                    # persisted terminal), so a pending terminal tracker resolves
+                    # and its cooldown clears. But a no-change LIVE snapshot
+                    # advanced NOTHING (snapshot == baseline, zero writes): it must
+                    # NOT clear a cooldown or drop a resumption's tracker, so it is
+                    # routed with ``state_advanced=False`` (its live branch is a
+                    # no-op) — see _on_durable_snapshot.
+                    self._on_durable_snapshot(
+                        diff.match.match_id,
+                        diff.match,
+                        live_resumptions=live_resumptions,
+                        state_advanced=False,
+                    )
+                    continue
+                try:
+                    baseline = self._apply(diff)
+                except SequenceError as exc:
+                    # Defensive net: _apply reconciles fingerprint drift itself
+                    # against the stored rows, so this only fires for a batch that
+                    # failed pre-insert validation in a way the reconciliation also
+                    # could not absorb. Leave self._last unchanged so a corrected
+                    # list re-syncs.
+                    log.error(
+                        "event drift for match %s on source %s: %s (skipping match this poll)",
+                        diff.match.match_id,
+                        self._source,
+                        exc,
+                    )
+                    # This _apply raised AFTER seed_match may already have
+                    # durably written the matches row (seed-before-child-write),
+                    # so a match this poll's fetch confirmed as ``is_backfill``
+                    # must still count this as a backfill attempt — otherwise a
+                    # row now exists with no tracker to keep is_backfill alive,
+                    # permanently foreclosing retry. Not reached for a
+                    # non-backfill match (absent from
+                    # ``self._backfill_apply_pending``).
+                    if diff.match.match_id in self._backfill_apply_pending:
+                        self._register_backfill_apply_failure(diff.match)
+                    continue
+                except (TaxonomyError, UnseededMatchError, CrossPartitionError) as exc:
+                    # Undeclared type / unseeded / foreign-partition write: a bad
+                    # match must not crash the daemon. Log loudly and skip; the
+                    # baseline is untouched so a corrected poll re-tries the full
+                    # list. Non-writer exceptions stay fatal (they propagate).
+                    log.error(
+                        "writer rejected match %s on source %s: %s (skipping match this poll)",
+                        diff.match.match_id,
+                        self._source,
+                        exc,
+                    )
+                    # Same rationale as the SequenceError branch above.
+                    if diff.match.match_id in self._backfill_apply_pending:
+                        self._register_backfill_apply_failure(diff.match)
+                    continue
+                if baseline is not None:
+                    self._last[diff.match.match_id] = baseline
+                    # CONSUME point of the transition state machine: a DURABLE apply
+                    # (a real write landed, ``state_advanced=True``) resolves a
+                    # pending terminal tracker (and clears any abandonment cooldown),
+                    # or reconciles a live resumption's fallback against the applied
+                    # state. An apply failure above (baseline None / exception)
+                    # retains the tracker so the captured terminal state is retried
+                    # next poll.
+                    self._on_durable_snapshot(
+                        diff.match.match_id,
+                        baseline,
+                        live_resumptions=live_resumptions,
+                        state_advanced=True,
+                    )
+                elif diff.match.match_id in self._backfill_apply_pending:
+                    # seed_match returned None (missing identity) after a
+                    # successful detail fetch for an is_backfill match — no
+                    # durable write landed, so nothing was foreclosed, but without
+                    # registering a failure here nothing ever counts against
+                    # _BACKFILL_MAX_ATTEMPTS either, and _first_sight_finished
+                    # would keep re-firing (fetching detail again) every poll
+                    # forever.
                     self._register_backfill_apply_failure(diff.match)
-                continue
-            except (TaxonomyError, UnseededMatchError, CrossPartitionError) as exc:
-                # Undeclared type / unseeded / foreign-partition write: a bad
-                # match must not crash the daemon. Log loudly and skip; the
-                # baseline is untouched so a corrected poll re-tries the full
-                # list. Non-writer exceptions stay fatal (they propagate).
-                log.error(
-                    "writer rejected match %s on source %s: %s (skipping match this poll)",
-                    diff.match.match_id,
-                    self._source,
-                    exc,
-                )
-                # Same rationale as the SequenceError branch above.
-                if diff.match.match_id in self._backfill_apply_pending:
-                    self._register_backfill_apply_failure(diff.match)
-                continue
-            if baseline is not None:
-                self._last[diff.match.match_id] = baseline
-                # CONSUME point of the transition state machine: a DURABLE apply
-                # (a real write landed, ``state_advanced=True``) resolves a
-                # pending terminal tracker (and clears any abandonment cooldown),
-                # or reconciles a live resumption's fallback against the applied
-                # state. An apply failure above (baseline None / exception)
-                # retains the tracker so the captured terminal state is retried
-                # next poll.
-                self._on_durable_snapshot(
-                    diff.match.match_id,
-                    baseline,
-                    live_resumptions=live_resumptions,
-                    state_advanced=True,
-                )
-            elif diff.match.match_id in self._backfill_apply_pending:
-                # seed_match returned None (missing identity) after a
-                # successful detail fetch for an is_backfill match — no
-                # durable write landed, so nothing was foreclosed, but without
-                # registering a failure here nothing ever counts against
-                # _BACKFILL_MAX_ATTEMPTS either, and _first_sight_finished
-                # would keep re-firing (fetching detail again) every poll
-                # forever.
-                self._register_backfill_apply_failure(diff.match)
 
-    def _apply(self, diff: MatchDiff) -> NormalizedMatch | None:
-        """Seed the match through the pack hook, then append its new events.
+    @property
+    def source(self) -> str:
+        """The partition this engine writes under (read-only)."""
+        return self._source
+
+    def _resolve_stored_match_id(self, provider_match_id: str) -> str | None:
+        """Resolve the stored ``matches.match_id`` for a provider-native id.
+
+        ``matches.match_id`` is not always the bare provider id: packs using
+        a custom ``seed_match`` hook (e.g. the football pack's
+        ``seed_or_reconcile_match``) write a source-qualified stub
+        (``f"{source}:{provider_id}"``) or a canonical id reached through
+        ``provider_match_map``. Delegates to the shared
+        :meth:`_stored_rows_for_provider` query builder — asking only for the
+        ``match_id`` column — so the three-id-form SQL and authority order
+        (canonical > qualified stub > bare id for custom-seed packs; bare id >
+        qualified stub for ``default_seed_match`` packs, which never populate
+        the map) live in exactly one place and cannot drift. Returns the
+        WINNING id string itself, scoped to this engine's own ``self._source``
+        — never another source's row — so
+        :meth:`stored_source`/:meth:`has_events` can query ``events`` under
+        the id the write actually landed on instead of the bare provider id,
+        which a qualified/reconciled pack never stores under.
+
+        The shared builder's ``updated_at DESC`` secondary sort key is inert
+        here: a single provider id maps to at most one candidate row per rank
+        tier, so ranks are always distinct and there is never a tie for that
+        key to break (see commit e52c227, which documented this invariant when
+        this method still hand-wrote the SQL without that key).
+        """
+        rows = self._stored_rows_for_provider(provider_match_id, columns=("match_id", "updated_at"))
+        return rows[0][0] if rows else None
+
+    def stored_source(self, match_id: str) -> str | None:
+        """Return the ``source`` stored for ``match_id``, or ``None`` if unknown.
+
+        Resolves ``match_id`` (a provider-native id) to its actual stored
+        ``matches.match_id`` row via :meth:`_resolve_stored_match_id` — which
+        is scoped to this engine's own ``self._source`` — then wraps
+        ``reader.get_state`` against this engine's own connection, so callers
+        outside the engine (``backfill.py``) never reach into ``self._conn``
+        directly. A row stored under a DIFFERENT source is therefore reported
+        as ``None`` (not that other source's name): callers must not skip on
+        a ``None`` result, only on an exact match to their own ``source``.
+        """
+        resolved_id = self._resolve_stored_match_id(match_id)
+        if resolved_id is None:
+            return None
+        row = reader.get_state(self._conn, resolved_id)
+        return row["source"] if row is not None else None
+
+    def has_events(self, match_id: str) -> bool:
+        """Return whether at least one event row is stored for ``match_id``.
+
+        Resolves ``match_id`` the same way as :meth:`stored_source`, then
+        wraps ``reader.get_events_since`` against this engine's own
+        connection (events are keyed by the resolved/seeded id, not
+        necessarily the bare provider id).
+        """
+        resolved_id = self._resolve_stored_match_id(match_id)
+        if resolved_id is None:
+            return False
+        return reader.has_any_event(self._conn, resolved_id)
+
+    def stored_source_and_has_events(self, match_id: str) -> tuple[str | None, bool]:
+        """Return ``(stored source, has-events)`` for ``match_id`` in ONE resolve.
+
+        The backfill skip-check needs both the stored ``source`` and whether
+        events landed. Calling :meth:`stored_source` and :meth:`has_events`
+        separately re-runs the multi-arm ``_resolve_stored_match_id`` UNION
+        query twice per enumerated match; this resolves the stored id once and
+        answers both, halving the skip-check's SQL round trips. Same
+        ``self._source`` scoping as the two single-answer methods: a row stored
+        under a DIFFERENT source reports ``(None, ...)`` for the source, so a
+        caller must skip only on an exact match to its own ``source``.
+        """
+        resolved_id = self._resolve_stored_match_id(match_id)
+        if resolved_id is None:
+            return None, False
+        row = reader.get_state(self._conn, resolved_id)
+        source = row["source"] if row is not None else None
+        has_events = reader.has_any_event(self._conn, resolved_id)
+        return source, has_events
+
+    def apply_one_off_match(
+        self, scoreboard: NormalizedMatch, detail: NormalizedMatch
+    ) -> NormalizedMatch | None:
+        """Apply one enumerated match through the exact live write path.
+
+        Used by the one-shot historical ``backfill`` command (never the poll
+        loop): merges the enumerating scoreboard snapshot with the fetched
+        detail snapshot exactly as the live/same-day path does
+        (:func:`_merge_detail`), builds a from-scratch diff via
+        ``diff_match(merged, last=None)`` (FRESH-write semantics — not a
+        running diff against any stored/in-memory baseline), and writes it
+        through :meth:`_apply`. Reads/writes nothing beyond that: no
+        poll-loop-only in-memory container (``self._last``,
+        ``self._transitions``, ``self._backfill``,
+        ``self._backfill_apply_pending``, cooldowns) is touched.
+        """
+        merged = _merge_detail(scoreboard, detail)
+        diff = diff_match(merged, None)
+        # side_tables_first: a one-shot finished match must be applied
+        # all-or-(events-)nothing so the backfill skip-check's has_events()
+        # proxy reliably means "fully stored" — see _apply's docstring.
+        # Hold the SHARED admission lock for this one match's write session,
+        # exactly as the poll loop does (see _admission_lock): backfill is a
+        # live-DB writer too, so a future EXCLUSIVE reset must fence it.
+        with self._admission_lock():
+            return self._apply(diff, side_tables_first=True)
+
+    def _apply(self, diff: MatchDiff, *, side_tables_first: bool = False) -> NormalizedMatch | None:
+        """Seed the match through the pack hook, then persist events + side tables.
 
         Returns the snapshot the caller should advance the diff baseline to:
         the incoming snapshot on a clean write, a snapshot whose event list is
@@ -904,6 +1074,24 @@ class CollectorEngine:
         returned when the pack's ``persist_side_tables`` hook raises: the
         failure is logged (never fatal to the daemon) and the un-advanced
         baseline gives side-table persistence a retry on the next poll.
+
+        ``side_tables_first`` swaps the order of the two child writes:
+
+        * The live poll loop (default, ``False``) writes EVENTS FIRST — they
+          are the primary data and must be streamed the moment they are
+          observed; the side-table persist is best-effort with an independent
+          next-poll retry, so a side-table failure never costs already-observed
+          events.
+        * The one-shot backfill path (``True``, via
+          :meth:`apply_one_off_match`) persists SIDE TABLES FIRST, so a
+          side-table failure leaves NO events stored either. Backfill's
+          skip-check uses ``has_events()`` as its "already fully stored" proxy;
+          writing events last makes that proxy reliable — a match whose side
+          tables were stranded reports ``has_events()`` ``False`` and is
+          retried on a rerun instead of being silently skipped with its
+          stats/lineups/venue permanently lost. A finished match is applied
+          once (no incremental streaming), so the live path's events-first
+          priority does not apply here.
         """
         match = diff.match
         seeded_id = self._pack.seed_match(self._conn, self._writer, match)
@@ -917,6 +1105,29 @@ class CollectorEngine:
                 self._source,
             )
             return None
+
+        if side_tables_first:
+            if not self._persist_side_tables_guarded(match, seeded_id):
+                return None
+            return self._append_new_events(seeded_id, diff)
+
+        baseline = self._append_new_events(seeded_id, diff)
+        if not self._persist_side_tables_guarded(match, seeded_id):
+            return None
+        return baseline
+
+    def _append_new_events(self, seeded_id: str, diff: MatchDiff) -> NormalizedMatch:
+        """Append a diff's new events; return the snapshot to baseline from.
+
+        On a clean append the baseline is the incoming snapshot; on a
+        sequence-drift rejection the batch is reconciled against the stored
+        rows and the baseline is rebuilt from what is ACTUALLY stored so
+        unresolved drift keeps re-diffing (and re-logging) every poll instead
+        of being silently accepted. Writer rejections other than
+        :class:`SequenceError` propagate (caught by ``poll_once``'s per-match
+        isolation).
+        """
+        match = diff.match
         baseline = match
         if diff.new_events:
             rows = [_event_to_row(e) for e in diff.new_events]
@@ -934,28 +1145,32 @@ class CollectorEngine:
                 # re-logs) every poll instead of being silently accepted.
                 stored_events = self._reconcile_sequence_conflict(seeded_id, match.match_id, rows)
                 baseline = replace(match, events=stored_events)
+        return baseline
+
+    def _persist_side_tables_guarded(self, match: NormalizedMatch, seeded_id: str) -> bool:
+        """Run the pack's ``persist_side_tables`` hook; return whether it succeeded.
+
+        A pack hook must never kill the daemon (a malformed payload value
+        binding into sqlite raises InterfaceError, for example). A failure is
+        logged and reported as ``False`` so the caller returns ``None`` and
+        leaves the diff baseline un-advanced: the next poll (or backfill
+        rerun) re-diffs the full match, the idempotent core append is a no-op,
+        and the side-table hook gets a natural retry.
+        """
         try:
             self._pack.persist_side_tables(self._conn, self._writer, match, seeded_id)
         except Exception as exc:
-            # A pack hook must never kill the daemon (a malformed payload
-            # value binding into sqlite raises InterfaceError, for example).
-            # Core writes above already committed in their own transactions,
-            # so failing here would otherwise leave durable core state with
-            # missing/stale side tables and NO retry path. Returning None
-            # keeps the baseline un-advanced: the next poll re-diffs the full
-            # match, the idempotent core appends no-op, and the side-table
-            # hook gets a natural retry.
             log.error(
                 "persist_side_tables failed for match %s (seeded id %s) on source %s: %s "
-                "(baseline not advanced; side tables retried next poll)",
+                "(baseline not advanced; side tables retried next poll/rerun)",
                 match.match_id,
                 seeded_id,
                 self._source,
                 exc,
                 exc_info=True,
             )
-            return None
-        return baseline
+            return False
+        return True
 
     def _reconcile_sequence_conflict(
         self, seeded_id: str, provider_match_id: str, rows: list[dict[str, Any]]
@@ -969,13 +1184,17 @@ class CollectorEngine:
           single-row append: an identical fingerprint is the writer's
           idempotent no-op; a mutated fingerprint (in-place provider
           correction) raises :class:`~gamecollect.db.writer.SequenceError`,
-          logged at ERROR — the stored row is never mutated (append-only).
+          logged via :meth:`_log_drift_once` — the stored row is never
+          mutated (append-only).
         * seq at-or-below the stored head and NOT stored — a retroactive
           insertion (e.g. a VAR-restored event): never written (it would
           violate the writer's monotonic invariant and could interleave two
-          timelines), logged at ERROR. Because the returned baseline excludes
-          it, it re-diffs and re-logs on every poll it persists —
-          loud-but-alive, not silently swallowed.
+          timelines), logged via :meth:`_log_drift_once`. Because the
+          returned baseline excludes it, it re-diffs on every poll it
+          persists — loud-but-alive, not silently swallowed, though
+          :meth:`_log_drift_once` caps an UNCHANGED mismatch to one ERROR
+          (later identical polls log at DEBUG) so a single persistent drift
+          does not spam ERROR for the rest of the match.
         * seq strictly beyond the stored head — appended one row at a time in
           ascending order, so the writer's strictly-increasing invariant holds
           for every insert it performs. Appended seqs join the stored set, so
@@ -1011,23 +1230,40 @@ class CollectorEngine:
                     try:
                         self._writer.append_events(seeded_id, [row])
                     except SequenceError as exc:
-                        log.error(
-                            "event drift for match %s seq %s on source %s: %s "
-                            "(keeping stored row, skipping this event)",
+                        # The incoming row's FULL content, not just the seq
+                        # or the exception's changed-column names — see
+                        # _log_drift_once: a dedup signature narrower than
+                        # the row itself would silently demote a genuinely
+                        # different re-drift (new value on the same column,
+                        # or a different retroactive event) to WARNING.
+                        self._log_drift_once(
                             provider_match_id,
                             seq,
-                            self._source,
-                            exc,
+                            signature=self._drift_signature("conflict", row),
+                            message=(
+                                "event drift for match %s seq %s on source %s: %s "
+                                "(keeping stored row, skipping this event)"
+                            ),
+                            args=(provider_match_id, seq, self._source, exc),
                         )
+                    else:
+                        # The provider's fingerprint reverted to match the
+                        # stored row (an idempotent no-op write): the prior
+                        # drift is resolved, so its cached signature must be
+                        # cleared — otherwise a genuinely NEW recurrence of
+                        # the same wrong value later would be silently
+                        # demoted to WARNING as a stale "repeat".
+                        self._logged_drift.get(provider_match_id, {}).pop(seq, None)
                 else:
-                    log.error(
-                        "event drift for match %s seq %s on source %s: retroactive "
-                        "event insertion below stored head %s; event NOT written "
-                        "(re-logged every poll it persists)",
+                    self._log_drift_once(
                         provider_match_id,
                         seq,
-                        self._source,
-                        head,
+                        signature=self._drift_signature("retroactive", row),
+                        message=(
+                            "event drift for match %s seq %s on source %s: retroactive "
+                            "event insertion below stored head %s; event NOT written"
+                        ),
+                        args=(provider_match_id, seq, self._source, head),
                     )
                 continue
             try:
@@ -1035,12 +1271,14 @@ class CollectorEngine:
             except SequenceError as exc:
                 # Defensive: a malformed seq (non-int, duplicate) the head
                 # check above could not classify.
-                log.error(
-                    "event drift for match %s seq %s on source %s: %s (skipping this event)",
+                self._log_drift_once(
                     provider_match_id,
                     seq,
-                    self._source,
-                    exc,
+                    signature=self._drift_signature("malformed", row),
+                    message=(
+                        "event drift for match %s seq %s on source %s: %s (skipping this event)"
+                    ),
+                    args=(provider_match_id, seq, self._source, exc),
                 )
                 continue
             if isinstance(seq, int):
@@ -1048,6 +1286,72 @@ class CollectorEngine:
                 stored_seqs.add(seq)
                 appended_this_batch.add(seq)
         return self._stored_events(seeded_id)
+
+    @staticmethod
+    def _drift_signature(kind: str, row: dict[str, Any]) -> str:
+        """Build a drift-dedup signature capturing the incoming row's FULL content.
+
+        ``kind`` is the drift class (``"conflict"``/``"retroactive"``/
+        ``"malformed"``); the row's sorted items follow, so a re-drift with
+        genuinely different content (a new wrong value on the same column, a
+        different retroactive event) re-escalates to ERROR rather than being
+        demoted against a coarser signature — see :meth:`_log_drift_once`. The
+        three :meth:`_reconcile_sequence_conflict` call sites share this one
+        builder so the signatures cannot drift apart in shape.
+        """
+        return f"{kind}:{repr(sorted(row.items()))}"
+
+    def _log_drift_once(
+        self,
+        provider_match_id: str,
+        seq: Any,
+        *,
+        signature: str,
+        message: str,
+        args: tuple[Any, ...],
+    ) -> None:
+        """Log a drift ERROR once per distinct (match, seq) mismatch; repeats stay at WARNING.
+
+        The stored row is never mutated, so an unresolved drift re-diffs
+        identically on every subsequent poll for the rest of the match —
+        logging it at ERROR every time drowns real signal (a NEW mismatch
+        elsewhere) in noise. The first occurrence of a given ``signature``
+        for a ``(provider_match_id, seq)`` pair still logs at ERROR;
+        identical repeats are demoted to WARNING (not DEBUG — this project
+        never configures logging, so its effective level is the stdlib
+        default of WARNING; a DEBUG repeat would be emitted nowhere,
+        silently swallowing an ongoing drift the docstring promises stays
+        loud-but-alive). ``signature`` must capture the incoming row's full
+        content (not e.g. a static literal or the exception's changed-column
+        names alone) so a re-drift with genuinely different content — a
+        different retroactive event, or a fresh in-place correction to a new
+        wrong value on the same column — re-escalates to ERROR as new
+        information rather than being silently demoted.
+
+        ``seq`` may be any JSON-decoded value, including an unhashable one
+        (a malformed provider payload can carry a list/dict where an int
+        seq is expected) — it is never used as a dict key directly, only
+        via a hashable derivative, so a malformed seq still logs instead of
+        raising ``TypeError``.
+
+        Keyed by ``provider_match_id`` (not the internal ``seeded_id``) so
+        :meth:`_resolve_tracker` / :meth:`_resolve_backfill_tracker` can evict
+        a resolved match's entries the same way they already do for
+        ``self._cooldowns`` / ``self._transitions`` / ``self._backfill`` —
+        without this, drift memory for finished matches would linger for the
+        life of the process.
+        """
+        # Record that drift re-surfaced for this match THIS poll so the
+        # eviction helper does not wipe the dedup cache out from under a still-
+        # recurring drift on a non-live match (see _evict_match_tracking).
+        self._drifted_this_poll.add(provider_match_id)
+        key = seq if isinstance(seq, Hashable) else repr(seq)
+        match_signatures = self._logged_drift.setdefault(provider_match_id, {})
+        if match_signatures.get(key) == signature:
+            log.warning(message, *args)
+            return
+        match_signatures[key] = signature
+        log.error(message, *args)
 
     def _stored_events(self, seeded_id: str) -> list[NormalizedEvent]:
         """Read the ACTUALLY-STORED event rows back as :class:`NormalizedEvent`s.
@@ -1938,6 +2242,30 @@ class CollectorEngine:
         tracker.consecutive_failures += 1
         return tracker
 
+    def _evict_match_tracking(self, match_id: str, *, force_drift: bool = False) -> None:
+        """Drop a match's cooldown entry and, when safe, its drift-dedup memory.
+
+        The single owner of paired ``self._cooldowns`` + ``self._logged_drift``
+        eviction, used by all three eviction sites (:meth:`_resolve_tracker`,
+        :meth:`_resolve_backfill_tracker`, and the expired-unseen purge in
+        :meth:`_age_cooldowns`) so the two maps are never popped out of step by
+        a hand-written pair that forgets one.
+
+        The cooldown entry is always removed. ``self._logged_drift`` is removed
+        only when the match did NOT drift during the CURRENT poll — a
+        still-recurring drift on a now-non-live match must keep its dedup cache,
+        or the next poll re-escalates the same drift to ERROR (the spam
+        :meth:`_log_drift_once` exists to damp). ``force_drift=True`` bypasses
+        that check for the expired-unseen purge, where the match has been absent
+        for a full cap-length window and is genuinely gone (nothing is drifting
+        it any more, so the memory is pure leak). A drift that has stopped
+        recurring is evicted on the match's next resolution poll (it is absent
+        from ``_drifted_this_poll`` then), so a finished match does not leak.
+        """
+        self._cooldowns.pop(match_id, None)
+        if force_drift or match_id not in self._drifted_this_poll:
+            self._logged_drift.pop(match_id, None)
+
     def _age_cooldowns(self, slate_ids: set[str]) -> None:
         """Decrement every active abandonment cooldown by one poll (floor 0).
 
@@ -1946,11 +2274,12 @@ class CollectorEngine:
         at 0 (normally popped only by a durable apply) so the ``epoch`` of the
         NEXT abandonment keeps growing the interval.
 
-        To keep ``_cooldowns`` bounded when that durable apply never comes — a
-        match that ended and dropped off the slate — an expired entry whose match
-        is UNSEEN (absent from ``slate_ids``, ``self._transitions``, AND
-        ``self._backfill``) for a full cap-length window (``_COOLDOWN_MAX_POLLS``
-        consecutive polls) is purged. ``self._backfill`` must be checked here too:
+        To keep ``_cooldowns`` (and ``self._logged_drift``, purged alongside it)
+        bounded when that durable apply never comes — a match that ended and
+        dropped off the slate — an expired entry whose match is UNSEEN (absent
+        from ``slate_ids``, ``self._transitions``, AND ``self._backfill``) for
+        a full cap-length window (``_COOLDOWN_MAX_POLLS`` consecutive polls) is
+        purged. ``self._backfill`` must be checked here too:
         a backfill tracker actively being retried off-slate (see
         :meth:`_hydrate_vanished_backfill_matches`) while a PRIOR give-up cycle's
         cooldown is still counting down is genuinely still tracked, not unseen —
@@ -1975,7 +2304,9 @@ class CollectorEngine:
             if cooldown.expired_unseen >= _COOLDOWN_MAX_POLLS:
                 purge.append(match_id)
         for match_id in purge:
-            del self._cooldowns[match_id]
+            # Genuinely retired (unseen a full cap window): force-evict the
+            # drift cache too — nothing is drifting the match any more.
+            self._evict_match_tracking(match_id, force_drift=True)
 
     def _cooling_down(self, match_id: str) -> bool:
         """True while ``match_id`` is within an unexpired abandonment cooldown."""
@@ -2521,7 +2852,13 @@ class CollectorEngine:
         on live status — see that method's docstring for why it must not be
         gated behind this (non-live-only) method.
         """
-        self._cooldowns.pop(match_id, None)
+        # Evict the cooldown always; evict the drift-dedup cache only when the
+        # drift is NOT still recurring this poll (see _evict_match_tracking) —
+        # this method runs on EVERY non-live durable snapshot, including every
+        # poll of a FINISHED match whose provider keeps re-sending an
+        # unreconcilable event, and an unconditional drift pop here would
+        # re-ERROR that persistent drift every single poll.
+        self._evict_match_tracking(match_id)
         tracker = self._transitions.pop(match_id, None)
         if tracker is None or not tracker.give_up_pending:
             return
@@ -2551,23 +2888,25 @@ class CollectorEngine:
         never set), a give-up apply landing, AND the case of a merged detail
         resolving LIVE for a backfill-tracked match (e.g. a provider
         correcting a stale terminal/scheduled read) — ``self._backfill`` must
-        never leak any of these ways. Also pops any ``self._cooldowns`` entry
-        left by ``_emit_backfill_give_up``'s exhaustion branch — but ONLY
-        when a ``self._backfill`` entry actually existed here (``tracker is
-        not None``): unlike :meth:`_resolve_tracker` (only reached on the
-        non-live tail, where a cooldown pop is always safe), this method runs
-        for EVERY durable apply on EVERY match, including ones that were
-        never backfill-tracked and may be cooling down for an unrelated
-        transition abandonment — popping unconditionally would clear that
-        cooldown's epoch/backoff memory out from under the transition path's
-        own L1 preserve-epoch invariant (:meth:`_clear_cooling_gate`). Gating
-        on ``tracker is not None`` is sound because a backfill tracker and a
-        transition-abandonment cooldown are mutually exclusive by
-        construction for the same match id.
+        never leak any of these ways. Also pops any ``self._cooldowns`` (and
+        ``self._logged_drift``) entry left by ``_emit_backfill_give_up``'s
+        exhaustion branch — but ONLY when a ``self._backfill`` entry actually
+        existed here (``tracker is not None``): unlike :meth:`_resolve_tracker`
+        (only reached on the non-live tail, where a cooldown pop is always
+        safe), this method runs for EVERY durable apply on EVERY match,
+        including ones that were never backfill-tracked and may be cooling
+        down for an unrelated transition abandonment — popping unconditionally
+        would clear that cooldown's epoch/backoff memory out from under the
+        transition path's own L1 preserve-epoch invariant
+        (:meth:`_clear_cooling_gate`). Gating on ``tracker is not None`` is
+        sound because a backfill tracker and a transition-abandonment cooldown
+        are mutually exclusive by construction for the same match id.
         """
         tracker = self._backfill.pop(match_id, None)
         if tracker is not None:
-            self._cooldowns.pop(match_id, None)
+            # Same eviction discipline as _resolve_tracker: keep the drift
+            # cache if the drift is still recurring this poll.
+            self._evict_match_tracking(match_id)
         if tracker is None or not tracker.give_up_pending:
             return
         log.error(

@@ -9,11 +9,14 @@ altered by a pack.
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import re
 import sqlite3
 from decimal import Decimal
+from functools import lru_cache
+from pathlib import Path
 
 from gamecollect.db import reader
 from gamecollect.db.writer import PartitionWriter
@@ -22,58 +25,26 @@ from gamecollect.packs.spec import SportPack
 from gamecollect.provider import NormalizedMatch
 from gamecollect_football.espn import ESPNAdapter
 from gamecollect_football.operations import FOOTBALL_OPERATIONS
-from gamecollect_football.reconcile import seed_or_reconcile_match
+from gamecollect_football.reconcile import (
+    FOOTBALL_SIDE_TABLE_DDL,
+    canonical_display_name,
+    canonical_team_name,
+    seed_or_reconcile_match,
+)
 from gamecollect_football.taxonomy import TAXONOMY
 
 __all__ = ["FOOTBALL_SIDE_TABLE_DDL", "pack", "persist_football_side_tables"]
 
 log = logging.getLogger(__name__)
 
-# Pack-owned side tables (typed homes for the football-specific shapes the
-# adapter carries in NormalizedMatch.payload: boxscore stats and lineups).
-# Additive + idempotent (CREATE TABLE IF NOT EXISTS); soft refs mirror the
-# core posture — no FOREIGN KEY constraints in v1. `name_folded` on lineups
-# preserves the fold-based player lookup gamealerts depends on (stamped with
-# gamecollect.fold.fold by whoever writes the row).
-FOOTBALL_SIDE_TABLE_DDL: tuple[str, ...] = (
-    """
-    CREATE TABLE IF NOT EXISTS football_stats (
-        source          TEXT NOT NULL,
-        match_id        TEXT NOT NULL,   -- soft ref -> matches.match_id
-        team            TEXT NOT NULL,   -- team display name (boxscore key)
-        possession      REAL,
-        shots           INTEGER,
-        shots_on_target INTEGER,
-        corners         INTEGER,
-        fouls           INTEGER,
-        yellow_cards    INTEGER,
-        red_cards       INTEGER,
-        offsides        INTEGER,
-        PRIMARY KEY (source, match_id, team)
-    );
-    """,
-    """
-    CREATE TABLE IF NOT EXISTS football_lineups (
-        source          TEXT NOT NULL,
-        match_id        TEXT NOT NULL,   -- soft ref -> matches.match_id
-        team            TEXT NOT NULL,   -- team display name
-        athlete_id      TEXT NOT NULL,   -- ESPN athlete id
-        display_name    TEXT NOT NULL,
-        name_folded     TEXT,            -- fold(display_name), for folded lookups
-        jersey          TEXT,
-        position        TEXT,
-        starter         INTEGER NOT NULL DEFAULT 0,
-        subbed_in       INTEGER NOT NULL DEFAULT 0,
-        subbed_out      INTEGER NOT NULL DEFAULT 0,
-        formation_place INTEGER,
-        home_away       TEXT,
-        formation       TEXT,
-        PRIMARY KEY (source, match_id, team, athlete_id)
-    );
-    CREATE INDEX IF NOT EXISTS idx_football_lineups_folded
-        ON football_lineups (source, name_folded);
-    """,
-)
+# FOOTBALL_SIDE_TABLE_DDL (typed homes for the football-specific shapes the
+# adapter carries in NormalizedMatch.payload: boxscore stats and lineups) is
+# defined in reconcile.py, tagged there per-table as match-keyed or
+# team-keyed. That tag is the single source of truth reconcile.py's stub
+# adoption uses to decide which side tables must follow a stub row — see
+# reconcile._FOOTBALL_SIDE_TABLE_SPECS / _MIGRATABLE_SIDE_TABLES. Re-exported
+# here (via __all__ above) since this is the pack's public entry point and
+# existing callers import it from here.
 
 
 def _to_int(value: object) -> int | None:
@@ -200,6 +171,18 @@ _LINEUP_COLUMNS = (
     "jersey, position, starter, subbed_in, subbed_out, "
     "formation_place, home_away, formation"
 )
+_VENUE_COLUMNS = "source, match_id, stadium, city"
+_ROSTER_COLUMN_NAMES: tuple[str, ...] = (
+    "team",
+    "fifa_code",
+    "group_name",
+    "number",
+    "position",
+    "player_name",
+    "name_folded",
+    "date_of_birth",
+)
+_ROSTER_COLUMNS = ", ".join(_ROSTER_COLUMN_NAMES)
 
 
 def _stats_rows(
@@ -211,12 +194,20 @@ def _stats_rows(
     payload collapses last-wins (the old ON CONFLICT semantics). Non-scalar
     values are coerced to ``None`` rather than passed to sqlite; the ``team``
     PK component goes through :func:`_to_key_text` (bool rejected, integral
-    float canonicalized) so numeric spellings cannot mint duplicate keys."""
+    float canonicalized) so numeric spellings cannot mint duplicate keys.
+    ``team`` is then run through :func:`canonical_display_name`, mirroring
+    :func:`_lineup_rows`, so ``football_stats.team`` agrees with
+    ``football_roster.team``/``football_lineups.team`` and
+    ``payload["home_team"]``/``["away_team"]`` on alias-mapped teams — a
+    mismatch here silently breaks ``get_player_stats(team=...)`` for a caller
+    passing the canonical name."""
     rows: dict[tuple[str, str, str], tuple] = {}
     for row in stats:
         if not isinstance(row, dict):
             continue
         team = _to_key_text(row.get("team"))
+        if team:
+            team = canonical_display_name(team)
         if not team:
             _warn_skip_once(
                 source,
@@ -253,12 +244,24 @@ def _lineup_rows(
     old ON CONFLICT semantics); non-scalar values coerce to ``None``. The
     ``team``/``athlete_id`` PK components go through :func:`_to_key_text`
     (bool rejected, integral float canonicalized) so ``760421.0`` and
-    ``"760421"`` collapse to one player row instead of duplicating it."""
+    ``"760421"`` collapse to one player row instead of duplicating it.
+    ``team`` is then run through :func:`canonical_display_name` so it agrees
+    with ``football_roster.team`` and ``payload["home_team"]``/``["away_team"]``
+    on alias-mapped teams (``Türkiye`` -> ``Turkey``, etc.) — a mismatch here
+    silently breaks any participant-keyed lookup filtering by team name."""
     rows: dict[tuple[str, str, str, str], tuple] = {}
     for lineup in lineups:
         if not isinstance(lineup, dict):
             continue
         team = _to_key_text(lineup.get("team"))
+        # Canonicalize alias-mapped team names (Türkiye -> Turkey, etc.) so
+        # football_lineups.team agrees with football_roster.team
+        # (_roster_rows_for_team) and payload["home_team"]/["away_team"]
+        # (reconcile.canonical_display_name) — all three must use the same
+        # team-name vocabulary or FootballReadPort's participant-keyed
+        # lookups (lineup_for_match, lineup_team_announced) silently miss.
+        if team:
+            team = canonical_display_name(team)
         if not team:
             _warn_skip_once(
                 source,
@@ -313,6 +316,134 @@ def _lineup_rows(
     return rows
 
 
+def _venue_rows(
+    source: str, seeded_match_id: str, stadium: object, city: object
+) -> dict[tuple[str, str], tuple]:
+    """Project a payload's ``stadium``/``city`` onto a single football_venue row.
+
+    Returns an empty dict when both are missing — the caller only invokes
+    :func:`_replace_if_changed` when there is something to persist, so a poll
+    that carries no venue data at all leaves any already-stored row alone."""
+    stadium_text = _to_text(stadium)
+    city_text = _to_text(city)
+    if stadium_text is None and city_text is None:
+        return {}
+    return {(source, seeded_match_id): (source, seeded_match_id, stadium_text, city_text)}
+
+
+@lru_cache(maxsize=1)
+def _load_squads_fixture() -> tuple[dict, ...]:
+    """Load the static WC2026 squads fixture (team-level rosters).
+
+    There is no ESPN team-squad fetch — the ESPN ``rosters[]`` block is
+    per-match and already becomes ``football_lineups``. This is the only
+    source for team-level squad data. Cached (the fixture never changes at
+    runtime) and never raises: a missing/malformed fixture must not crash the
+    per-poll side-table hook, mirroring the payload-coercion posture above."""
+    fixture_path = Path(__file__).parent / "fixtures" / "worldcup.squads.json"
+    try:
+        with fixture_path.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        log.warning("football_roster: could not load squads fixture %s", fixture_path)
+        return ()
+    if not isinstance(data, list):
+        return ()
+    return tuple(squad for squad in data if isinstance(squad, dict) and squad.get("name"))
+
+
+@lru_cache(maxsize=1)
+def _squads_by_canonical_name() -> dict[str, dict]:
+    """Index the squads fixture by :func:`canonical_team_name` for team lookup."""
+    return {canonical_team_name(squad["name"]): squad for squad in _load_squads_fixture()}
+
+
+_WARNED_ROSTER_TEAMS: set[str] = set()
+
+
+def _warn_roster_unmatched_once(team_name: str) -> None:
+    if team_name in _WARNED_ROSTER_TEAMS:
+        return
+    if len(_WARNED_ROSTER_TEAMS) >= 128:
+        _WARNED_ROSTER_TEAMS.clear()
+    _WARNED_ROSTER_TEAMS.add(team_name)
+    log.warning("football_roster: no squad fixture entry for team %r", team_name)
+
+
+def _roster_rows_for_team(team_name: str) -> tuple[str | None, dict[tuple[str, int], tuple]]:
+    """Project the squad fixture's players for ``team_name`` onto row tuples.
+
+    ``team_name`` is a live provider team name (e.g. ESPN ``displayName``);
+    matched against the fixture via :func:`canonical_team_name` so alias
+    spellings (``Türkiye``/``Turkey``) still resolve. Returns ``(None, {})``
+    when the team has no fixture entry (warns once) or has no valid players;
+    otherwise returns ``(team, rows)`` where ``team`` is the canonical
+    display name stamped on every projected row's first PK column — the
+    caller persisting these rows should use this returned name rather than
+    re-deriving it from the rows dict."""
+    squad = _squads_by_canonical_name().get(canonical_team_name(team_name))
+    if squad is None:
+        _warn_roster_unmatched_once(team_name)
+        return None, {}
+    team = canonical_display_name(squad["name"])
+    fifa_code = _to_text(squad.get("fifa_code"))
+    group_name = _to_text(squad.get("group"))
+    rows: dict[tuple[str, int], tuple] = {}
+    for player in squad.get("players") or []:
+        if not isinstance(player, dict):
+            continue
+        number = _to_int(player.get("number"))
+        name = _to_text(player.get("name"))
+        if number is None or not name:
+            continue
+        rows[(team, number)] = (
+            team,
+            fifa_code,
+            group_name,
+            number,
+            _to_text(player.get("pos")),
+            name,
+            fold(name),
+            _to_text(player.get("date_of_birth")),
+        )
+    return team, rows
+
+
+def _persist_roster_for_team(conn: sqlite3.Connection, team_name: str | None) -> None:
+    """Idempotently persist ``team_name``'s squad rows (static data, insert-once).
+
+    Unlike stats/lineups/venue, roster rows never change poll-to-poll — an
+    ``INSERT OR IGNORE`` on the ``(team, number)`` PRIMARY KEY is sufficient
+    and cheaper than a diff-and-replace. A cheap existence check (rather than
+    an in-memory cache, which would need per-database-file scoping to avoid
+    one connection's cache wrongly suppressing a write to a different,
+    unrelated database opened later in the same process) skips the
+    executemany write entirely once a team's rows are already on disk, so a
+    live match's per-poll calls do real write work only once. The lookup
+    itself (``_roster_rows_for_team``) stays cheap regardless — it is backed
+    by ``@lru_cache``'d fixture data."""
+    if not team_name:
+        return
+    stored_team, rows = _roster_rows_for_team(team_name)
+    if not rows:
+        return
+    # stored_team is the same canonical name _roster_rows_for_team already
+    # stamped onto every row's first PK column — using its return value
+    # directly (rather than reaching back into the rows dict) means this
+    # existence check can never disagree with what the insert below writes,
+    # and stays correct if the column order in the row tuples ever changes.
+    already_persisted = conn.execute(
+        "SELECT 1 FROM football_roster WHERE team = ? LIMIT 1", (stored_team,)
+    ).fetchone()
+    if already_persisted is not None:
+        return
+    placeholders = ", ".join("?" for _ in _ROSTER_COLUMN_NAMES)
+    conn.executemany(
+        f"INSERT OR IGNORE INTO football_roster ({_ROSTER_COLUMNS}) VALUES ({placeholders})",  # noqa: S608
+        list(rows.values()),
+    )
+
+
 def _replace_if_changed(
     conn: sqlite3.Connection,
     table: str,
@@ -365,11 +496,13 @@ def persist_football_side_tables(
     when it actually changed."""
     payload = dict(match.payload or {})
     stored_payload = reader.get_stored_payload(conn, seeded_match_id)
-    for key in ("stats", "lineups"):
+    for key in ("stats", "lineups", "stadium", "city"):
         if key in stored_payload:
             payload[key] = stored_payload[key]
     stats = payload.get("stats")
     lineups = payload.get("lineups")
+    stadium = payload.get("stadium")
+    city = payload.get("city")
 
     with conn:
         if isinstance(stats, list):
@@ -390,6 +523,38 @@ def persist_football_side_tables(
                 seeded_match_id,
                 _lineup_rows(writer.source, seeded_match_id, lineups),
             )
+        # Compute the projected rows first and gate on the RESULT being
+        # non-empty (matching the isinstance(stats, list)/isinstance(lineups,
+        # list) guard pattern above), not on the raw stadium/city values.
+        # _venue_rows runs each value through _to_text, which coerces a
+        # malformed/non-scalar value (e.g. a dict) to None -- if the guard
+        # instead checked the raw values, a malformed-but-non-None stadium/
+        # city would pass the guard while _venue_rows yields an EMPTY dict,
+        # and _replace_if_changed(desired={}) against a non-empty `current`
+        # performs an unconditional DELETE, wiping a previously-stored good
+        # venue row over a single bad poll.
+        venue_rows = _venue_rows(writer.source, seeded_match_id, stadium, city)
+        if venue_rows:
+            _replace_if_changed(
+                conn,
+                "football_venue",
+                _VENUE_COLUMNS,
+                writer.source,
+                seeded_match_id,
+                venue_rows,
+            )
+        # Fall back to the canonical schedule row's stored team names when
+        # this poll's snapshot carries neither (e.g. a summary response whose
+        # header.competitions is empty/malformed, so the ESPN adapter never
+        # set NormalizedMatch.home_team/away_team, even though the SAME
+        # response's rosters/lineups are otherwise intact). stored_payload is
+        # already fetched above; per reconcile.py's seed_or_reconcile_match
+        # docstring, a resolved canonical row's payload home_team/away_team
+        # are schedule-owned and never overwritten with provider values, so
+        # this is a safe, already-verified fallback source rather than a
+        # guess at an unverified payload shape.
+        _persist_roster_for_team(conn, match.home_team or stored_payload.get("home_team"))
+        _persist_roster_for_team(conn, match.away_team or stored_payload.get("away_team"))
 
 
 def pack() -> SportPack:

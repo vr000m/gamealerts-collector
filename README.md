@@ -80,6 +80,24 @@ gamecollect squad <match_id> --db games.db --json        # recorded lineup
 gamecollect player-stats <match_id> --db games.db --json # recorded boxscore stats
 ```
 
+**`vocabulary`** returns an installed pack's manifest — taxonomy, prompt
+fragments, display metadata, compaction boundaries — so a data-driven
+consumer (e.g. the gamealerts GameWorker) can render/announce events without
+hardcoding a sport's event-type strings:
+
+```sh
+gamecollect vocabulary football-wc2026 --db games.db --json
+```
+
+**Shared-file access.** A consuming app on the same machine (the gamealerts
+GameWorker, in particular) can open the collector's SQLite file directly
+instead of shelling out to the CLI — `connect()` accepts an explicit `path`,
+or (when `path` is omitted) resolves the shared file via an explicit
+`data_dir` argument, the `GAMECOLLECT_DATA_DIR` env var, or a fixed default
+(`~/.local/share/gamecollect`). See
+[docs/integration/gameworker-contract.md](docs/integration/gameworker-contract.md)
+§2 for the full `data_dir`/lock/startup-ordering contract.
+
 **Collect.** `collect` runs the collector engine for one source: it loads a
 pack, polls its provider, and writes diffed match state into the shared database
 until SIGTERM. `--record` captures the session as a replayable fixture:
@@ -93,6 +111,24 @@ A match first seen already `FINISHED` (collector started late, or the match
 ended before it was ever polled) has its full event list backfilled once,
 same-slate-bounded by construction — pass `--no-finished-backfill` to disable
 (see [docs/DESIGN.md](docs/DESIGN.md) for the retry-cap and scope details).
+
+**Backfill.** `backfill` fills in matches outside that same-slate window —
+prior days, or a whole date range the daemon never ran during. It walks the
+range day by day, asks the provider for each day's finished matches, and
+applies them through the same write path `collect` uses:
+
+```sh
+gamecollect backfill --pack football-wc2026 --db games.db --source wc2026-live \
+    --start-date 2026-06-15 --end-date 2026-06-20
+```
+
+`--source` **must** match the value the live `collect` daemon uses for the
+same tournament — a mismatch is caught and reported as a clear CLI error, not
+a raw traceback. Coverage is capped by what the provider's scoreboard lists
+for the requested dates (no all-match-id endpoint exists), and re-running
+`backfill` over the same range is safe and idempotent. See
+[docs/integration/gameworker-contract.md](docs/integration/gameworker-contract.md)
+§6 for the full coverage-ceiling, cross-source, and retry-semantics contract.
 
 **Replay.** Recorded sessions (and the seed fixtures checked in under
 [fixtures/football/](fixtures/football/)) replay through `ReplayProvider`,
@@ -121,6 +157,13 @@ collector core library     owns the schema (versioned), writer discipline,
 
 Deliberately **no LLM and no prose** in this project: the collector is a pure data
 plane. Commentary, alerts, and voice live in consuming applications.
+
+Consuming apps that share a machine (the gamealerts GameWorker, in
+particular) can also open the collector's SQLite file directly: a generic
+`MatchReadPort` read Protocol, a `data_dir`/admission-lock convention for
+opening the same file, and a `vocabulary` op exposing pack taxonomy for
+data-driven rendering. See
+[docs/integration/gameworker-contract.md](docs/integration/gameworker-contract.md).
 
 ## Why a CLI (and library) rather than an MCP server
 

@@ -22,8 +22,10 @@ typed views belong to the client library layered on top (interfaces plan).
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import urllib.parse
+from collections.abc import Collection
 from pathlib import Path
 from typing import Any
 
@@ -39,9 +41,16 @@ __all__ = [
     "get_state",
     "get_stored_payload",
     "get_events_since",
+    "has_any_event",
+    "get_latest_event_of_type",
     "get_standings",
     "get_entity",
     "find_entities_by_name",
+    "get_side_table_row",
+    "get_side_table_rows",
+    "get_team_side_table_rows",
+    "get_all_team_side_table_rows",
+    "get_match_side_table_rows",
 ]
 
 
@@ -169,6 +178,73 @@ def get_events_since(
     )
 
 
+def has_any_event(conn: sqlite3.Connection, match_id: str) -> bool:
+    """Return whether ``match_id`` has at least one stored event row.
+
+    A bounded existence probe (``SELECT 1 ... LIMIT 1`` on the
+    ``idx_events_match_seq (match_id, seq)`` index) for callers that only need
+    the boolean — e.g. the backfill skip-check's "already fully stored" proxy.
+    Avoids ``get_events_since``'s full ``SELECT *`` fetch-and-materialize of
+    every event row (and its per-row dict construction) just to test
+    ``bool(...)``, mirroring :func:`get_latest_event_of_type`'s bounded
+    single-marker query.
+    """
+    rows = _query(conn, "SELECT 1 FROM events WHERE match_id = ? LIMIT 1", (match_id,))
+    return bool(rows)
+
+
+def get_latest_event_of_type(
+    conn: sqlite3.Connection, match_id: str, types: Collection[str]
+) -> dict[str, Any] | None:
+    """Return the most recent event row for ``match_id`` whose ``type`` is in
+    ``types`` (ordered by ``seq DESC``, one row), or ``None`` if there is none.
+
+    Targeted alternative to decoding the full event history just to find one
+    marker event (e.g. a football pack's last phase-marker event on every
+    ``latest_state()`` poll tick) -- a per-poll hot path where
+    ``get_events_since`` + full decode-and-scan does needless work every
+    call. ``types`` is expected to be a small, caller-controlled set of
+    literal type strings (not user input), so it is passed as bound
+    parameters (safe) rather than interpolated.
+
+    Issues one bounded per-type subquery (each an ``idx_events_match_type_seq
+    (match_id, type, seq)`` index SEEK on ``match_id = ? AND type = ?``,
+    touching only that type's own rows) unioned together, rather than a
+    single ``type IN (...)`` predicate: SQLite's planner cannot satisfy
+    ``ORDER BY seq DESC`` across an IN-list from that composite index (the
+    per-type row groups are not globally seq-ordered without a merge step),
+    so a single-query ``IN (...)`` plan falls back to the OLD
+    ``idx_events_match_seq (match_id, seq)`` full per-match scan this index
+    was added to avoid — confirmed via ``EXPLAIN QUERY PLAN`` against a
+    populated, ``ANALYZE``'d table. The per-type subquery form lets each seek
+    use the composite index directly; the outer query then picks the overall
+    max-``seq`` row among the (at most ``len(types)``) candidates.
+
+    Honest trade-off: this wins big when the caller must scan far back (many
+    events since the last marker of interest — the common case during an
+    active, ongoing match), but is slightly slower than a plain
+    ``type IN (...)`` scan in the steady-state case where the marker is
+    already near the tail (e.g. every poll once ``full_time`` has fired),
+    since it always issues ``len(types)`` index seeks regardless of how close
+    the answer is. Not an unqualified win — do not assume it dominates both
+    cases.
+    """
+    types = tuple(types)
+    if not types:
+        return None
+    subquery = (
+        "SELECT * FROM (SELECT * FROM events WHERE match_id = ? AND type = ? "
+        "ORDER BY seq DESC LIMIT 1)"
+    )
+    params: list[Any] = []
+    for t in types:
+        params.extend((match_id, t))
+    union = " UNION ALL ".join([subquery] * len(types))
+    sql = f"SELECT * FROM ({union}) ORDER BY seq DESC LIMIT 1"
+    rows = _query(conn, sql, params)
+    return rows[0] if rows else None
+
+
 def get_standings(
     conn: sqlite3.Connection, source: str, group_key: str | None = None
 ) -> list[dict[str, Any]]:
@@ -222,3 +298,199 @@ def find_entities_by_name(
         f"SELECT * FROM entities WHERE {' AND '.join(clauses)} ORDER BY source, entity_id",
         params,
     )
+
+
+# ---------------------------------------------------------------------------
+# Generic side-table reads (table-name-parameterized helpers backing
+# pack-owned read adapters, e.g. gamecollect_football's MatchReadPort
+# adapter). Table/column names are supplied by the caller — core stays
+# sport-agnostic; only the calling pack module knows its own table names.
+# ---------------------------------------------------------------------------
+
+_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+# order_by legitimately needs commas, "IS NULL"/"IS NOT NULL", ASC/DESC, and
+# multiple qualified column names (e.g. "team, formation_place IS NULL,
+# formation_place, athlete_id") -- unlike `table`, a bare-identifier regex
+# would reject every real caller. Instead this allowlists the character set
+# such a clause can plausibly need (letters, digits, underscore, dot, comma,
+# whitespace) and separately blocks the SQL constructs that would let an
+# order_by value do something other than order rows: statement separators,
+# comment markers (which can truncate/hide the rest of a query), and DML
+# keywords. This is defense-in-depth for a currently-unreachable parameter
+# (every caller passes a literal), not a full grammar-level parser.
+_ORDER_BY_CHARS_RE = re.compile(r"^[A-Za-z0-9_.,\s]+$")
+_ORDER_BY_DANGEROUS_RE = re.compile(
+    r";|--|/\*|\*/|\b(DROP|DELETE|UPDATE|INSERT|ALTER|ATTACH|PRAGMA)\b", re.IGNORECASE
+)
+
+
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    """Return whether a table named ``table`` currently exists.
+
+    A parameterized ``sqlite_master`` lookup (table name bound, not
+    interpolated) used by helpers that must tolerate a side table a consuming
+    app creates lazily on its own connection (DESIGN.md §3) — e.g. a
+    collector-first boot where the consumer's table does not exist yet.
+    """
+    return bool(
+        _query(
+            conn,
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table,),
+        )
+    )
+
+
+def _assert_identifier_shaped(table: str) -> None:
+    """Cheap defense-in-depth for the ``table`` params below.
+
+    These are exported, generic core helpers that f-string-interpolate a
+    caller-supplied table name into SQL (``# noqa: S608``). Every current
+    caller passes a hardcoded literal, so this is unreachable today, but the
+    functions are public API inviting future misuse. This is NOT a full
+    allowlist against ``sqlite_master`` (that would add a query per call) --
+    just a shape check that rejects anything that couldn't possibly be a bare
+    SQL identifier (e.g. containing ``;``, whitespace, or quotes).
+    """
+    if not _IDENTIFIER_RE.match(table):
+        raise ValueError(f"table must be a bare SQL identifier, got {table!r}")
+
+
+def _assert_order_by_shaped(order_by: str) -> None:
+    """Cheap defense-in-depth for the ``order_by`` params below.
+
+    Same rationale and unreachable-today status as
+    :func:`_assert_identifier_shaped`, but ``order_by`` cannot use a bare
+    single-identifier regex: real callers pass multi-column clauses with
+    ``IS NULL``/``ASC``/``DESC`` (e.g. ``"team, formation_place IS NULL,
+    formation_place, athlete_id"``). Instead this restricts the character set
+    to what such a clause could plausibly need (letters, digits, underscore,
+    dot, comma, whitespace) and separately rejects statement separators,
+    comment markers, and DML/DDL keywords.
+    """
+    if not order_by or not _ORDER_BY_CHARS_RE.match(order_by):
+        raise ValueError(f"order_by contains disallowed characters, got {order_by!r}")
+    if _ORDER_BY_DANGEROUS_RE.search(order_by):
+        raise ValueError(f"order_by contains a disallowed keyword or token, got {order_by!r}")
+
+
+def _append_order_by(sql: str, order_by: str | None) -> str:
+    """Append a validated ``ORDER BY`` clause to *sql* (no-op when *order_by* is
+    falsy).
+
+    Shared by the three side-table read helpers below so the
+    validate-then-append pair (``_assert_order_by_shaped`` + f-string append)
+    lives in exactly one place and cannot be applied inconsistently across
+    them.
+    """
+    if order_by:
+        _assert_order_by_shaped(order_by)
+        sql += f" ORDER BY {order_by}"
+    return sql
+
+
+def get_side_table_row(
+    conn: sqlite3.Connection, table: str, source: str, match_id: str
+) -> dict[str, Any] | None:
+    """Return one ``(source, match_id)``-keyed row from a pack's side table.
+
+    For per-match, single-row side tables (e.g. a venue table). Returns None
+    for an unrecorded match rather than raising.
+    """
+    _assert_identifier_shaped(table)
+    rows = _query(
+        conn,
+        f"SELECT * FROM {table} WHERE source = ? AND match_id = ?",  # noqa: S608
+        (source, match_id),
+    )
+    return rows[0] if rows else None
+
+
+def get_side_table_rows(
+    conn: sqlite3.Connection,
+    table: str,
+    source: str,
+    match_id: str,
+    *,
+    order_by: str | None = None,
+) -> list[dict[str, Any]]:
+    """Return all ``(source, match_id)``-keyed rows from a pack's side table.
+
+    For per-match, multi-row side tables (e.g. a lineup table). Empty list
+    for an unrecorded match rather than raising.
+    """
+    _assert_identifier_shaped(table)
+    sql = f"SELECT * FROM {table} WHERE source = ? AND match_id = ?"  # noqa: S608
+    sql = _append_order_by(sql, order_by)
+    return _query(conn, sql, (source, match_id))
+
+
+def get_team_side_table_rows(
+    conn: sqlite3.Connection, table: str, team: str, *, order_by: str | None = None
+) -> list[dict[str, Any]]:
+    """Return all ``team``-keyed rows from a pack's side table.
+
+    For team-level (not per-match) side tables (e.g. a static squad roster).
+    Empty list when the team has no recorded rows.
+    """
+    _assert_identifier_shaped(table)
+    sql = f"SELECT * FROM {table} WHERE team = ?"  # noqa: S608
+    sql = _append_order_by(sql, order_by)
+    return _query(conn, sql, (team,))
+
+
+def get_all_team_side_table_rows(
+    conn: sqlite3.Connection, table: str, *, order_by: str | None = None
+) -> list[dict[str, Any]]:
+    """Return every row from a pack's team-keyed side table, unfiltered.
+
+    Companion to :func:`get_team_side_table_rows` for callers that need to
+    match ``team`` through a fold-based comparison (casefold + diacritic
+    strip, not just an exact string) rather than an exact SQL equality — the
+    caller fetches the full (small, team-level) table and filters in Python.
+    Empty list for an empty table.
+    """
+    _assert_identifier_shaped(table)
+    sql = f"SELECT * FROM {table}"  # noqa: S608
+    sql = _append_order_by(sql, order_by)
+    return _query(conn, sql)
+
+
+def get_match_side_table_rows(
+    conn: sqlite3.Connection,
+    table: str,
+    match_id: str,
+    *,
+    order_by: str | None = None,
+    limit: int | None = None,
+    tolerate_missing_table: bool = False,
+) -> list[dict[str, Any]]:
+    """Return ``match_id``-keyed rows from a pack/consumer side table.
+
+    For per-match, multi-row tables keyed by ``match_id`` ALONE (no ``source``
+    column) — e.g. a consumer-owned ``commentary`` table. Core stays
+    sport/consumer-agnostic: the table name, ``order_by`` columns, and any
+    ``limit`` are all supplied by the caller (the pack/consumer read adapter
+    that owns that table's vocabulary), not hardcoded here.
+
+    ``tolerate_missing_table=True`` returns ``[]`` (via a parameterized
+    :func:`_table_exists` ``sqlite_master`` check) when the table has not been
+    created yet, instead of letting ``sqlite3.OperationalError`` escape — for
+    tables a consuming app creates lazily on its own scoped connection
+    (DESIGN.md §3), so a collector-first boot / pre-match / replay may have no
+    such table yet. Checking ``sqlite_master`` directly (not string-matching
+    the exception message, which is fragile across SQLite versions) keeps a
+    genuine column-shape mismatch on a table that DOES exist raising — that is
+    a real bug in the consumer's schema, not the tolerated absent-table case.
+    """
+    _assert_identifier_shaped(table)
+    if tolerate_missing_table and not _table_exists(conn, table):
+        return []
+    sql = f"SELECT * FROM {table} WHERE match_id = ?"  # noqa: S608
+    sql = _append_order_by(sql, order_by)
+    params: list[Any] = [match_id]
+    if limit is not None:
+        sql += " LIMIT ?"
+        params.append(limit)
+    return _query(conn, sql, params)

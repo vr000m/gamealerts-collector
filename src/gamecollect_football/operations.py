@@ -22,12 +22,14 @@ from typing import Any
 
 from gamecollect.db import reader
 from gamecollect.registry import Operation, ParamSpec
+from gamecollect_football.reconcile import canonical_display_name
 
 __all__ = [
     "SquadMember",
     "PlayerStats",
     "get_squad",
     "get_player_stats",
+    "resolve_source",
     "SQUAD_OPERATION",
     "PLAYER_STATS_OPERATION",
     "FOOTBALL_OPERATIONS",
@@ -52,7 +54,7 @@ def _rows(conn: sqlite3.Connection, sql: str, params: tuple[Any, ...]) -> list[d
     return [dict(zip(names, row, strict=True)) for row in cursor.fetchall()]
 
 
-def _resolve_source(conn: sqlite3.Connection, match_id: str) -> str | None:
+def resolve_source(conn: sqlite3.Connection, match_id: str) -> str | None:
     """Return the partition ``source`` that owns ``match_id``, or ``None``."""
     state = reader.get_state(conn, match_id)
     return state["source"] if state is not None else None
@@ -138,14 +140,18 @@ def get_squad(
     Resolves the partition ``source`` from the ``matches`` row; returns an
     empty list for an unknown match or a match with no lineups recorded.
     """
-    source = _resolve_source(conn, match_id)
+    source = resolve_source(conn, match_id)
     if source is None:
         return []
     sql = "SELECT * FROM football_lineups WHERE source = ? AND match_id = ?"
     params: list[Any] = [source, match_id]
     if team is not None:
+        # The write path stamps football_lineups.team through
+        # canonical_display_name (Türkiye -> Turkey); canonicalize the caller's
+        # filter the same way so an alias-form argument matches the stored
+        # canonical row instead of binding verbatim and false-emptying.
         sql += " AND team = ?"
-        params.append(team)
+        params.append(canonical_display_name(team))
     sql += " ORDER BY team, formation_place IS NULL, formation_place, athlete_id"
     return [SquadMember.from_row(r) for r in _rows(conn, sql, tuple(params))]
 
@@ -158,14 +164,16 @@ def get_player_stats(
     Resolves the partition ``source`` from the ``matches`` row; returns an
     empty list for an unknown match or a match with no stats recorded.
     """
-    source = _resolve_source(conn, match_id)
+    source = resolve_source(conn, match_id)
     if source is None:
         return []
     sql = "SELECT * FROM football_stats WHERE source = ? AND match_id = ?"
     params: list[Any] = [source, match_id]
     if team is not None:
+        # Same as get_squad: football_stats.team is stored through
+        # canonical_display_name, so canonicalize the filter argument to match.
         sql += " AND team = ?"
-        params.append(team)
+        params.append(canonical_display_name(team))
     sql += " ORDER BY team"
     return [PlayerStats.from_row(r) for r in _rows(conn, sql, tuple(params))]
 

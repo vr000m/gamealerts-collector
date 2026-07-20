@@ -177,7 +177,8 @@ class Registry:
 
 
 # ---------------------------------------------------------------------------
-# Core operations — the four sport-agnostic reads over the core tables.
+# Core operations — the sport-agnostic reads over the core tables, plus
+# `vocabulary` (pack metadata, not a table read).
 # Output schemas ARE the public contract (golden-file tested in Phase 3).
 # ---------------------------------------------------------------------------
 
@@ -234,6 +235,25 @@ _STANDING_ITEM_SCHEMA: dict[str, Any] = {
     },
 }
 
+_TAXONOMY_ENTRY_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "display_name": {"type": "string"},
+        "importance_default": {"type": "integer"},
+    },
+}
+
+_VOCABULARY_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "pack": {"type": "string"},
+        "taxonomy": {"type": "object", "additionalProperties": _TAXONOMY_ENTRY_SCHEMA},
+        "prompt_fragments": {"type": "object", "additionalProperties": {"type": "string"}},
+        "display_metadata": {"type": "object"},
+        "compaction_boundaries": {"type": "array", "items": {"type": "string"}},
+    },
+}
+
 
 CORE_OPERATIONS: tuple[Operation, ...] = (
     Operation(
@@ -282,6 +302,18 @@ CORE_OPERATIONS: tuple[Operation, ...] = (
         ),
         output_schema={"type": "array", "items": _STANDING_ITEM_SCHEMA},
         impl=client.get_standings,
+    ),
+    Operation(
+        name="vocabulary",
+        summary="Return an installed pack's manifest: taxonomy, prompt fragments, "
+        "display metadata, compaction boundaries.",
+        params=(
+            ParamSpec(
+                "pack", "string", required=True, summary="Installed pack name (entry point)."
+            ),
+        ),
+        output_schema=_VOCABULARY_SCHEMA,
+        impl=client.get_vocabulary,
     ),
 )
 

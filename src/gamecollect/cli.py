@@ -34,10 +34,13 @@ import json
 import logging
 import sys
 from collections.abc import Callable, Sequence
+from datetime import date
 from typing import Any
 
 from gamecollect import __version__
+from gamecollect import backfill as backfill_mod
 from gamecollect.db import reader
+from gamecollect.db.writer import CrossPartitionError
 from gamecollect.engine import CollectorEngine
 from gamecollect.packs.registry import PackError, PackNotFoundError, load_pack, pack_names
 from gamecollect.registry import Operation, Registry, build_registry
@@ -49,7 +52,7 @@ log = logging.getLogger(__name__)
 # Subcommands the CLI wires by hand rather than deriving from the registry.
 # The single-source-of-truth test subtracts these from the parser's subcommand
 # set to compare the remainder against the registry op names.
-HAND_WIRED_COMMANDS: tuple[str, ...] = ("collect", "tools")
+HAND_WIRED_COMMANDS: tuple[str, ...] = ("collect", "backfill", "tools")
 # Option names a read subcommand's parser already takes: the CLI's own --db
 # and --json (added by _add_read_arguments) plus argparse's automatic --help.
 # A pack param with one of these names would make sub.add_argument raise
@@ -65,14 +68,27 @@ def _copy_pack_with_operations(pack: Any, operations: tuple[Operation, ...]) -> 
 
 
 def _validated_pack_for_cli(name: str, pack: Any, accepted: list[Any]) -> Any:
-    """Drop pack ops that would break argparse or the merged registry."""
-    existing_names = set(build_registry(accepted).names) | set(HAND_WIRED_COMMANDS)
+    """Drop pack ops that would break argparse or the merged registry.
+
+    A collision with a hand-wired command (``collect``/``backfill``/``tools``) is
+    a hard error, not a droppable op: those subcommands are wired by hand and
+    never derived from the registry, so a same-named pack op would be silently
+    shadowed by the hand-wired parser and never dispatched. Raise loudly, matching
+    the core/pack collision convention in :meth:`Registry.register`, rather than
+    warn-and-drop as we do for a collision with a core or already-merged pack op.
+    """
+    hand_wired = set(HAND_WIRED_COMMANDS)
+    existing_names = set(build_registry(accepted).names)
     kept: list[Operation] = []
     for op in getattr(pack, "operations", ()):
+        if op.name in hand_wired:
+            raise ValueError(
+                f"pack {name!r} operation {op.name!r} collides with hand-wired command {op.name!r}"
+            )
         if op.name in existing_names:
             log.warning(
                 "skipping operation %r from pack %r for CLI registry: name collides "
-                "with an existing or hand-wired command",
+                "with an existing command",
                 op.name,
                 name,
             )
@@ -246,6 +262,34 @@ def build_parser(registry: Registry) -> argparse.ArgumentParser:
         ),
     )
 
+    backfill = subs.add_parser(
+        "backfill",
+        help="One-shot ingest of completed matches from prior days.",
+        description=(
+            "Enumerate completed matches over a date range via the provider's "
+            "fetch_schedule(dates=...) and write them through the same apply path "
+            "the live collector uses, then exit."
+        ),
+    )
+    backfill.add_argument("--pack", required=True, help="Installed pack name (entry point).")
+    backfill.add_argument("--db", required=True, help="SQLite database to write into.")
+    backfill.add_argument(
+        "--source",
+        required=True,
+        help=(
+            "Partition to write into. Must equal the live daemon's --source exactly "
+            "for this data to ever be recognized as the same partition as live-seen "
+            "matches — a mismatch is rejected with a non-zero exit, not a silent "
+            "duplicate."
+        ),
+    )
+    backfill.add_argument(
+        "--start-date", required=True, help="First calendar day to cover, YYYY-MM-DD."
+    )
+    backfill.add_argument(
+        "--end-date", required=True, help="Last calendar day to cover, YYYY-MM-DD."
+    )
+
     tools = subs.add_parser(
         "tools",
         help="Emit the operation manifest (runtime capability discovery).",
@@ -284,11 +328,32 @@ def _render_text(payload: Any) -> None:
 
 
 def _run_read(op: Operation, args: argparse.Namespace) -> int:
-    """Execute a registry read operation and print its result."""
+    """Execute a registry read operation and print its result.
+
+    A read op whose impl loads a pack internally (``vocabulary`` via
+    ``client.get_vocabulary``) can raise ``PackError``/``PackNotFoundError``
+    for an unknown or malformed pack. Surface that as the same clean one-line
+    stderr error + exit 2 that ``collect``/``backfill`` produce (see
+    :func:`_resolve_pack`) rather than a raw traceback. Every op that raises
+    these today carries a ``pack`` param, but nothing in ``registry.py``
+    structurally guarantees that pairing, so the message reads the pack name
+    defensively via ``kwargs.get`` — a future op that loads a pack under a
+    differently-named (or no) param degrades to a slightly-less-precise
+    message instead of a ``KeyError`` masking the real pack error.
+    """
     kwargs = {param.name: getattr(args, param.name) for param in op.params}
     conn = reader.open_reader(args.db)
     try:
         result = op.impl(conn, **kwargs)
+    except PackNotFoundError:
+        print(f"error: no pack named {kwargs.get('pack', '<unknown>')!r}", file=sys.stderr)
+        return 2
+    except PackError as exc:
+        print(
+            f"error: pack {kwargs.get('pack', '<unknown>')!r} failed to load: {exc}",
+            file=sys.stderr,
+        )
+        return 2
     finally:
         conn.close()
     payload = op.to_json(result)
@@ -314,6 +379,31 @@ def _default_runner(engine: CollectorEngine) -> None:
     engine.run()
 
 
+def _resolve_pack(
+    args: argparse.Namespace,
+    pack_loader: Callable[[str], Any],
+    loaded_packs: dict[str, Any] | None,
+) -> Any | None:
+    """Resolve ``args.pack`` to a loaded pack, reusing a registry-loaded one.
+
+    Returns the pack already merged during registry construction
+    (``loaded_packs``) when present, else loads it via ``pack_loader``. On a load
+    failure prints the ``collect``/``backfill`` error message to stderr and
+    returns ``None`` so the caller can exit 2; a loaded pack is never ``None``.
+    """
+    pack = (loaded_packs or {}).get(args.pack)
+    if pack is not None:
+        return pack
+    try:
+        return pack_loader(args.pack)
+    except PackNotFoundError:
+        print(f"error: no pack named {args.pack!r}", file=sys.stderr)
+        return None
+    except PackError as exc:
+        print(f"error: pack {args.pack!r} failed to load: {exc}", file=sys.stderr)
+        return None
+
+
 def _run_collect(
     args: argparse.Namespace,
     *,
@@ -336,16 +426,9 @@ def _run_collect(
     seams: the in-phase unit test drives a single poll with a fake provider and a
     one-shot runner instead of the real ESPN provider and blocking loop.
     """
-    pack = (loaded_packs or {}).get(args.pack)
+    pack = _resolve_pack(args, pack_loader, loaded_packs)
     if pack is None:
-        try:
-            pack = pack_loader(args.pack)
-        except PackNotFoundError:
-            print(f"error: no pack named {args.pack!r}", file=sys.stderr)
-            return 2
-        except PackError as exc:
-            print(f"error: pack {args.pack!r} failed to load: {exc}", file=sys.stderr)
-            return 2
+        return 2
     engine = engine_factory(
         pack,
         args.db,
@@ -358,6 +441,77 @@ def _run_collect(
         (runner or _default_runner)(engine)
     finally:
         engine.close()
+    return 0
+
+
+def _run_backfill(
+    args: argparse.Namespace,
+    *,
+    provider: Any = None,
+    engine_factory: Callable[..., CollectorEngine] = CollectorEngine,
+    pack_loader: Callable[[str], Any] = load_pack,
+    loaded_packs: dict[str, Any] | None = None,
+) -> int:
+    """Run a one-shot historical backfill for one source, then exit.
+
+    Mirrors :func:`_run_collect`'s structure: reuse a pack already loaded for
+    the registry when available, otherwise ``pack_loader``; resolve
+    ``provider`` via the injection seam or ``pack.provider_factory()``.
+    Unlike ``_run_collect``, the provider's historical-enumeration capability
+    (``fetch_schedule`` *and* ``fetch_match_detail``) is checked *before* the
+    engine is constructed, so an unsupported provider never creates/stamps a
+    DB file it is about to fail out of. ``provider``/``engine_factory``/
+    ``pack_loader`` are the same injection seams ``_run_collect`` uses so
+    tests never hit real ESPN or real time.
+    """
+    pack = _resolve_pack(args, pack_loader, loaded_packs)
+    if pack is None:
+        return 2
+
+    resolved_provider = provider if provider is not None else pack.provider_factory()
+    if not hasattr(resolved_provider, "fetch_schedule") or not hasattr(
+        resolved_provider, "fetch_match_detail"
+    ):
+        print(
+            f"error: provider {resolved_provider!r} does not support historical "
+            "backfill (missing fetch_schedule and/or fetch_match_detail)",
+            file=sys.stderr,
+        )
+        return 2
+
+    try:
+        start = date.fromisoformat(args.start_date)
+        end = date.fromisoformat(args.end_date)
+    except ValueError as exc:
+        print(f"error: invalid --start-date/--end-date: {exc}", file=sys.stderr)
+        return 2
+
+    engine = engine_factory(pack, args.db, args.source, provider=resolved_provider)
+    try:
+        try:
+            report = backfill_mod.run_backfill(
+                engine,
+                resolved_provider,
+                backfill_mod.chunk_date_range(start, end),
+                source=args.source,
+            )
+        except CrossPartitionError as exc:
+            print(
+                f"error: backfill aborted — {exc} (the offending match_id is already "
+                f"owned by a different source; --source must equal the live daemon's "
+                "--source for this data to merge with live-seen matches)",
+                file=sys.stderr,
+            )
+            return 1
+    finally:
+        engine.close()
+
+    print(
+        f"backfill complete: enumerated={report.enumerated} "
+        f"already_stored_skipped={report.already_stored_skipped} "
+        f"applied={report.applied} failed={len(report.failed)} "
+        f"failed_chunks={len(report.failed_chunks)}"
+    )
     return 0
 
 
@@ -393,6 +547,14 @@ def main(
             provider=provider,
             engine_factory=engine_factory,
             runner=runner,
+            pack_loader=pack_loader,
+            loaded_packs=loaded_packs,
+        )
+    if command == "backfill":
+        return _run_backfill(
+            args,
+            provider=provider,
+            engine_factory=engine_factory,
             pack_loader=pack_loader,
             loaded_packs=loaded_packs,
         )

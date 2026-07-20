@@ -322,6 +322,53 @@
       }
     },
     {
+      "name": "vocabulary",
+      "params": [
+        {
+          "name": "pack",
+          "type": "string",
+          "required": true
+        }
+      ],
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "pack": {
+            "type": "string"
+          },
+          "taxonomy": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "object",
+              "properties": {
+                "display_name": {
+                  "type": "string"
+                },
+                "importance_default": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "prompt_fragments": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            }
+          },
+          "display_metadata": {
+            "type": "object"
+          },
+          "compaction_boundaries": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    {
       "name": "squad",
       "params": [
         {

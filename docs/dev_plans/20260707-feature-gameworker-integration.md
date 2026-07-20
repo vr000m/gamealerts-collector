@@ -1,6 +1,6 @@
 # Task: GameWorker integration — generic read Protocol, shared-file write model, pack-manifest vocabulary
 
-**Status**: Not Started
+**Status**: Complete
 **Component**: collector
 **Assigned to**: Claude
 **Priority**: High
@@ -197,20 +197,24 @@ _(EXCLUSIVE on the admission lock is reserved for a destructive reset; SHARED wr
 
 ## Acceptance Criteria
 
-- [ ] The collector creates + stamps the file first; both processes then open it via the shared `data_dir`/env convention; explicit-path `connect()` still works.
-- [ ] Writes are serialized by SQLite WAL + `busy_timeout`; the SHARED admission lock is present and its EXCLUSIVE-fences-SHARED direction is tested; concurrent reads via WAL never block; no corruption in the integration test.
-- [ ] A `MatchReadPort` adapter (in `gamecollect_football`, not core) satisfies the worker's 10-method surface with generically-shaped returns, validated over seeded data + the knockout fixtures; the adapter tolerates an absent `commentary` table.
-- [ ] The generic `readport.py` Protocol carries **no football column names in its type signatures** — asserted by a source/AST/grep test.
-- [ ] `vocabulary` op returns the football pack's taxonomy/prompts/`compaction_boundaries`; exposed in client, CLI, and `tools --json` manifest.
-- [ ] Collector writes zero `commentary` rows and creates no gamealerts pollution tables (tested); commentary is readable through the contract when present.
-- [ ] Cross-repo contract doc committed; DESIGN.md/README/AGENTS updated; the 7 Integration Seams are written up for the gamealerts side.
-- [ ] Full suite + both CI lint gates green.
+- [x] The collector creates + stamps the file first; both processes then open it via the shared `data_dir`/env convention; explicit-path `connect()` still works.
+- [x] Writes are serialized by SQLite WAL + `busy_timeout`; the SHARED admission lock is present and its EXCLUSIVE-fences-SHARED direction is tested; concurrent reads via WAL never block; no corruption in the integration test.
+- [x] A `MatchReadPort` adapter (in `gamecollect_football`, not core) satisfies the worker's 10-method surface with generically-shaped returns, validated over seeded data + the knockout fixtures; the adapter tolerates an absent `commentary` table.
+- [x] The generic `readport.py` Protocol carries **no football column names in its type signatures** — asserted by a source/AST/grep test.
+- [x] `vocabulary` op returns the football pack's taxonomy/prompts/`compaction_boundaries`; exposed in client, CLI, and `tools --json` manifest.
+- [x] Collector writes zero `commentary` rows and creates no gamealerts pollution tables (tested); commentary is readable through the contract when present.
+- [x] Cross-repo contract doc committed; DESIGN.md/README/AGENTS updated; the 7 Integration Seams are written up for the gamealerts side.
+- [x] Full suite + both CI lint gates green.
 
 <!-- reviewed: 2026-07-08 @ 3c367820ad58712a0dade1d21463a001ad8dee7e -->
 
 ## Progress
 
-- (not started)
+- [x] Phase 1: Shared-store access model — data_dir resolver + admission lock (`10ac069`)
+- [x] Phase 2: Durable rich data for the read surface — venue + roster (`bb42bf7`)
+- [x] Phase 3: Generic read Protocol + collector-backed adapter (`6cdc00d`)
+- [x] Phase 4: Pack-manifest vocabulary operation (`5a43eeb`)
+- [x] Phase 5: Integration validation, docs, cross-repo contract (`5af0fcd`)
 
 ## Findings
 
@@ -231,8 +235,71 @@ _(EXCLUSIVE on the admission lock is reserved for a destructive reset; SHARED wr
 
 ## Issues & Solutions
 
-- (none yet)
+- **Cross-directory test imports broke outside full-suite collection order.** Two subagent-authored test files (`tests/test_readport_contract.py` in Phase 3, `tests/test_vocabulary_op.py` in Phase 4) imported helpers from sibling test files/directories without proper path setup (`tests.test_cli` treated as a package that doesn't exist; `tests/football/_football_helpers` imported cross-directory without a `sys.path` addition). Both passed when run as part of the full suite (collection-order side effects) but failed standalone. Fixed with the repo's existing same-directory-import convention (`from test_cli import ...`) and an explicit `sys.path.insert` for the one genuinely cross-directory case, then verified both standalone and combined.
+- **Adding the `vocabulary` op broke 5 pre-existing tests hardcoding the exact 4-core-op set.** A legitimate blast-radius hit from Phase 4, not a workaround target — fixed by updating each assertion (4 in `tests/test_cli.py`, 1 renamed+updated in `tests/test_client.py`) to include `vocabulary`.
+- **Phase 5's integration test caught a real event-payload seeding bug.** The Phase 5 test-writer's fixture-seeding helper stamped every event's participant name under the generic `player` payload key, but the real write path (`gamecollect.engine._event_to_row`/`_participant_key`) stamps goal-family events (`goal`/`own_goal`) under `scorer` instead — a distinction `FootballReadPort` relies on when reading events back. Earlier phases' simplified test helpers (Phase 3's `seeded_db` fixture) never asserted a specific scorer name, so the gap was invisible until Phase 5's end-to-end "who scored" assertion. Fixed by seeding through the real `_event_to_row` instead of a hand-rolled re-derivation.
+- A `phase4-tests` subagent run hit a mid-response API connection error but had already written complete, correct files before crashing; verified and used them directly rather than respawning.
+
+### Post-completion review-gauntlet hardening (2026-07-09 – 2026-07-17)
+
+Three review-gauntlet rounds ran against the completed 5-phase branch and found real bugs beyond the phases' own tests, all fixed on this branch:
+
+- **Team-name canonicalization gap swept across read AND write paths.** The first round's fix applied fold-based (casefold + diacritic-strip) team-name matching only to `football_lineups`. A full-diff re-review in the second round caught the identical gap in `football_roster` and `football_stats`, on both their read paths (comparisons against a stored/query name) and write paths (the value actually persisted) — an alias-dict lookup is brittle against the same name arriving with different casing/accents from different ESPN payload shapes, so every side-table team-name touch point now goes through the same `fold()` comparison rather than each having its own hand-rolled check. Lesson: a canonicalization fix scoped to "the table that failed" needs a follow-up grep across every other table sharing the same key, not just the one the reviewer's fixture happened to exercise.
+- **Hand-maintained migratable-side-table list replaced with a structural derivation.** The set of side tables eligible for migration during stub adoption was a manually-updated list that had already caused one data-loss bug (a table added to `pack.py` but never added to the list silently failed to migrate, e.g. `football_venue` rows dropped during stub adoption — fixed in `168e3eb`). The list is now derived structurally from `SideTableSpec` tags (`_MIGRATABLE_SIDE_TABLES`), so adding a new side table can no longer silently omit itself from migration.
+- **Phase-marker lookup got a real covering index.** `get_latest_event_of_type` (the per-poll hot path for the last phase-marker event) was doing a full per-match event scan; a targeted per-type-seek query plus a new covering index (`idx_events_match_type_seq`, with a `schema_meta` minor-version bump) replaced it, confirmed via `EXPLAIN QUERY PLAN` to actually change the query plan rather than just adding an index that goes unused.
+- Smaller fixes in the same rounds: a DDL structural-consistency check now runs at import time (catches a `SideTableSpec.match_keyed` mismatch against its own DDL immediately rather than at first migration); ESPN summary parsing now tolerates an explicit `gameInfo: null` (previously assumed the key, if present, was always an object); docs (`README.md`, `AGENTS.md`) and the core-op count were updated for the `vocabulary` CLI op, which had shipped in Phase 4 without a matching doc update.
+- **This same fixer round** additionally validated the `order_by` parameter in the generic side-table read helpers (`get_side_table_rows`/`get_team_side_table_rows`/`get_all_team_side_table_rows` in `src/gamecollect/db/reader.py`) — the `table` parameter had been defended against non-identifier input in an earlier round, but `order_by` was still interpolated unchecked. Both are currently unreachable (every caller passes a literal) but are exported, generic core API, so the same defense-in-depth rationale applies to both parameters.
+
+### Post-handoff contract extension (2026-07-17)
+
+While the gamealerts session built against PR #5 (contract kept open
+deliberately for exactly this), it flagged a real gap: `MatchReadPort`'s 10
+methods all require an already-known `match_id`/`participant` — none let a
+consumer holding only the port list matches or resolve a spoken/typed team
+name to a `match_id`. `gamecollect.client.list_matches` existed but returns
+a typed `MatchState` dataclass with soft entity refs, not this Protocol's
+plain-dict `participants` shape, so it wasn't a substitute for port-only
+consumers.
+
+Closed by adding `MatchReadPort.list_matches(*, source=None, status=None) ->
+list[dict]` (`src/gamecollect/readport.py`, `src/gamecollect_football/readport.py`),
+returning `{"match_id", "source", "status", "kickoff_utc", "participants":
+[...]}` per match — the same `participants` shape as `latest_state`,
+reusing its existing canonical-name projection logic (extracted into a
+shared `_project_participants` helper rather than duplicated). Deliberately
+excludes `phase`/`extra`/`display_clock`/`minute`/`period` — those need a
+targeted per-match query this method shouldn't pay for across a whole
+result set.
+
+Explicitly **not** added: a separate `resolve_team_by_name(name) ->
+match_id` method. `list_matches` plus caller-side fold-matching against
+`participants[].name` (already guaranteed canonical by the write-seam
+canonicalization) covers the resolution need without growing the Protocol
+for a query pattern that legitimately varies by consumer. gamealerts is
+proceeding client-side for `resolve_team_by_name`/`card_counts` derivation
+per its own note back — no ask on those.
+
+Updated: `docs/integration/gameworker-contract.md` §1 (method table +
+discovery/resolution note), `scripts/smoke_gameworker_contract.py` (2 new
+checks), `tests/football/test_football_readport.py` (new `TestListMatches`
+class, 7 tests including a canonicalization regression guard mirroring
+`TestLegacyRowCanonicalization`). Full suite: 678 passed, 1 skipped;
+`ruff check`/`ruff format --check` clean.
 
 ## Final Results
 
-- (pending)
+All 5 phases implemented, tested, and committed on `feature/gameworker-integration` (off `main`, base `8dcd647`):
+
+| Phase | Commit | Summary |
+|---|---|---|
+| 1 | `10ac069` | `gamecollect.db.paths`/`locking`: `data_dir` resolution + SHARED/EXCLUSIVE admission lock mirroring gamealerts' convention |
+| 2 | `bb42bf7` | `football_venue`/`football_roster` side tables; `worldcup.squads.json` loader wired per-poll |
+| 3 | `6cdc00d` | `gamecollect.readport.MatchReadPort` (generic Protocol) + `gamecollect_football.readport.FootballReadPort` (concrete adapter) |
+| 4 | `5a43eeb` | `vocabulary` core op: pack taxonomy/prompt_fragments/display_metadata/compaction_boundaries, `pack`-param-selected |
+| 5 | `5af0fcd` | `docs/integration/gameworker-contract.md`; DESIGN.md/README updated; end-to-end shared-file integration test |
+
+Full suite as of the initial 5-phase completion: 623 passed, 3 skipped (one is a discovery-test artifact confirmed working manually — Phase 2's roster loader is a private per-poll hook, not a separately-callable public function). Both `ruff check` and `ruff format --check` clean throughout.
+
+**Updated after 3 post-completion review-gauntlet rounds** (see "Post-completion review-gauntlet hardening" under Findings): full suite now 670 passed, 1 skipped (net growth reflects new regression tests for each fixed finding, including this round's `order_by` validation tests; the other two skips resolved as the underlying tests were fixed or removed). `ruff check`/`ruff format --check` remain clean.
+
+The gamealerts-side work (7 Integration Seams in `docs/integration/gameworker-contract.md` §5) is out of scope for this repo and tracked as a companion dev plan in the gamealerts repo.
