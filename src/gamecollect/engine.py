@@ -728,13 +728,16 @@ class CollectorEngine:
         # from an ordinary match's ``_apply`` failure (unrelated to backfill
         # retry accounting).
         self._backfill_apply_pending: set[str] = set()
-        # Last-logged drift signature per (seeded_id, seq) — see
-        # _log_drift_once. A drifted seq's stored row is never mutated, so
-        # the SAME mismatch would otherwise re-diff and re-log at ERROR every
-        # poll for the rest of the match; this caps each distinct mismatch to
-        # one ERROR, demoting identical repeats to DEBUG while still
-        # re-escalating if the mismatch itself changes shape.
-        self._logged_drift: dict[tuple[str, int], str] = {}
+        # Last-logged drift signature per provider_match_id -> {seq: signature}
+        # — see _log_drift_once. A drifted seq's stored row is never mutated,
+        # so the SAME mismatch would otherwise re-diff and re-log at ERROR
+        # every poll for the rest of the match; this caps each distinct
+        # mismatch to one ERROR, demoting identical repeats to DEBUG while
+        # still re-escalating if the mismatch's content changes. Keyed (like
+        # self._cooldowns/_transitions/_backfill) by provider-native match id
+        # so _resolve_tracker/_resolve_backfill_tracker can evict a resolved
+        # match's entries instead of leaking for the life of the process.
+        self._logged_drift: dict[str, dict[Any, str]] = {}
         self._backoff_multiplier = 1
         # One-time restart scan latch: on the FIRST successful poll the stored
         # matches table is scanned for rows this source left live at shutdown
@@ -1087,6 +1090,12 @@ class CollectorEngine:
         appended_this_batch: set[int] = set()
         for row in rows:
             seq = row.get("seq")
+            # The incoming row's FULL content, not just the seq or the
+            # exception's changed-column names — see _log_drift_once: a
+            # dedup signature narrower than the row itself would silently
+            # demote a genuinely different re-drift (new value on the same
+            # column, or a different retroactive event) to DEBUG.
+            row_signature = repr(sorted(row.items()))
             if head is not None and isinstance(seq, int) and seq <= head:
                 if seq in appended_this_batch:
                     # The SAME snapshot carried this seq twice and the first
@@ -1107,9 +1116,9 @@ class CollectorEngine:
                         self._writer.append_events(seeded_id, [row])
                     except SequenceError as exc:
                         self._log_drift_once(
-                            seeded_id,
+                            provider_match_id,
                             seq,
-                            signature=str(exc),
+                            signature=f"conflict:{row_signature}",
                             message=(
                                 "event drift for match %s seq %s on source %s: %s "
                                 "(keeping stored row, skipping this event)"
@@ -1118,9 +1127,9 @@ class CollectorEngine:
                         )
                 else:
                     self._log_drift_once(
-                        seeded_id,
+                        provider_match_id,
                         seq,
-                        signature="retroactive",
+                        signature=f"retroactive:{row_signature}",
                         message=(
                             "event drift for match %s seq %s on source %s: retroactive "
                             "event insertion below stored head %s; event NOT written"
@@ -1133,12 +1142,14 @@ class CollectorEngine:
             except SequenceError as exc:
                 # Defensive: a malformed seq (non-int, duplicate) the head
                 # check above could not classify.
-                log.error(
-                    "event drift for match %s seq %s on source %s: %s (skipping this event)",
+                self._log_drift_once(
                     provider_match_id,
                     seq,
-                    self._source,
-                    exc,
+                    signature=f"malformed:{row_signature}",
+                    message=(
+                        "event drift for match %s seq %s on source %s: %s (skipping this event)"
+                    ),
+                    args=(provider_match_id, seq, self._source, exc),
                 )
                 continue
             if isinstance(seq, int):
@@ -1149,8 +1160,8 @@ class CollectorEngine:
 
     def _log_drift_once(
         self,
-        seeded_id: str,
-        seq: int,
+        provider_match_id: str,
+        seq: Any,
         *,
         signature: str,
         message: str,
@@ -1162,16 +1173,27 @@ class CollectorEngine:
         identically on every subsequent poll for the rest of the match —
         logging it at ERROR every time drowns real signal (a NEW mismatch
         elsewhere) in noise. The first occurrence of a given ``signature``
-        for a ``(seeded_id, seq)`` pair still logs at ERROR; identical
-        repeats are demoted to DEBUG. If the mismatch itself changes shape
-        (e.g. more columns diverge), the signature changes too and it
-        re-escalates to ERROR as new information.
+        for a ``(provider_match_id, seq)`` pair still logs at ERROR;
+        identical repeats are demoted to DEBUG. ``signature`` must capture
+        the incoming row's full content (not e.g. a static literal or the
+        exception's changed-column names alone) so a re-drift with genuinely
+        different content — a different retroactive event, or a fresh
+        in-place correction to a new wrong value on the same column —
+        re-escalates to ERROR as new information rather than being silently
+        demoted.
+
+        Keyed by ``provider_match_id`` (not the internal ``seeded_id``) so
+        :meth:`_resolve_tracker` / :meth:`_resolve_backfill_tracker` can evict
+        a resolved match's entries the same way they already do for
+        ``self._cooldowns`` / ``self._transitions`` / ``self._backfill`` —
+        without this, drift memory for finished matches would linger for the
+        life of the process.
         """
-        key = (seeded_id, seq)
-        if self._logged_drift.get(key) == signature:
+        match_signatures = self._logged_drift.setdefault(provider_match_id, {})
+        if match_signatures.get(seq) == signature:
             log.debug(message, *args)
             return
-        self._logged_drift[key] = signature
+        match_signatures[seq] = signature
         log.error(message, *args)
 
     def _stored_events(self, seeded_id: str) -> list[NormalizedEvent]:
@@ -2647,6 +2669,7 @@ class CollectorEngine:
         gated behind this (non-live-only) method.
         """
         self._cooldowns.pop(match_id, None)
+        self._logged_drift.pop(match_id, None)
         tracker = self._transitions.pop(match_id, None)
         if tracker is None or not tracker.give_up_pending:
             return

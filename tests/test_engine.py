@@ -1003,6 +1003,153 @@ def test_retroactive_insert_below_head_is_never_written_and_stays_loud(tmp_path,
     )
 
 
+def test_drift_dedup_signature_is_content_based_not_a_static_literal(tmp_path, caplog):
+    """The retroactive-insertion dedup signature must capture the incoming
+    row's actual content, not a static literal like "retroactive" — otherwise
+    a SECOND, materially different retroactive insertion at the same seq
+    (different detail/content) would be wrongly demoted to DEBUG instead of
+    re-escalating to ERROR as new information."""
+    db = tmp_path / "engine.db"
+    p1 = nm("m1", (ev(0, "goal"), ev(1, "yellow", detail="Booking"), ev(3, "sub", minute=46)))
+    # Poll 2: retroactively insert seq 2 with content A.
+    p2 = nm(
+        "m1",
+        (
+            ev(0, "goal"),
+            ev(1, "yellow", detail="Booking"),
+            ev(2, "goal", minute=25, detail="VAR-restored A"),
+            ev(3, "sub", minute=46),
+        ),
+    )
+    # Poll 3: a DIFFERENT retroactive insertion at the SAME seq — content B.
+    p3 = nm(
+        "m1",
+        (
+            ev(0, "goal"),
+            ev(1, "yellow", detail="Booking"),
+            ev(2, "goal", minute=25, detail="VAR-restored B"),
+            ev(3, "sub", minute=46),
+        ),
+    )
+    provider = ScriptedProvider([[p1], [p2], [p3]])
+    with caplog.at_level(logging.DEBUG):
+        run_engine(_engine(make_pack(provider), db), provider)
+
+    retro_records = [
+        r for r in caplog.records if "seq 2" in r.getMessage() and "retroactive" in r.getMessage()
+    ]
+    assert sum(1 for r in retro_records if r.levelno >= logging.ERROR) == 2, (
+        "a retroactive insertion with genuinely different content must re-escalate to ERROR, "
+        "not be silently demoted because the dedup signature was too coarse (e.g. a static "
+        "literal instead of the row's content)"
+    )
+
+
+def test_inplace_correction_signature_reflects_value_not_just_changed_columns(tmp_path, caplog):
+    """``str(exc)`` alone only encodes the SORTED LIST OF CHANGED COLUMN
+    NAMES, not their values — a second, differently-valued correction to the
+    SAME column must still re-escalate to ERROR rather than being demoted
+    because the changed-column-name signature is identical to the first
+    correction's."""
+    db = tmp_path / "engine.db"
+    p1 = nm("A", (ev(0, "goal", detail="Opener"), ev(1, "goal", minute=20, detail="Second")))
+    # Poll 2: seq 1's player is corrected to a WRONG value A.
+    p2 = nm(
+        "A",
+        (
+            ev(0, "goal", detail="Opener"),
+            ev(1, "goal", minute=20, player="Wrong Name A", detail="Second"),
+        ),
+    )
+    # Poll 3: seq 1's player is corrected AGAIN, to a DIFFERENT wrong value B
+    # — same changed column ("player"/scorer), different content.
+    p3 = nm(
+        "A",
+        (
+            ev(0, "goal", detail="Opener"),
+            ev(1, "goal", minute=20, player="Wrong Name B", detail="Second"),
+        ),
+    )
+    provider = ScriptedProvider([[p1], [p2], [p3]])
+    with caplog.at_level(logging.DEBUG):
+        run_engine(_engine(make_pack(provider), db), provider)
+
+    drift_records = [
+        r for r in caplog.records if "drift" in r.getMessage() and "seq 1" in r.getMessage()
+    ]
+    assert sum(1 for r in drift_records if r.levelno >= logging.ERROR) == 2, (
+        "a second correction with a DIFFERENT value on the same column must re-escalate to "
+        "ERROR, not be demoted because the changed-column-NAME signature is identical"
+    )
+
+
+def test_defensive_malformed_seq_branch_dedups_via_log_drift_once(tmp_path, caplog):
+    """The third (defensive) SequenceError branch in _reconcile_sequence_conflict
+    — a seq the head-comparison could not classify (e.g. non-int) — must route
+    through _log_drift_once like its two sibling branches, not call
+    ``log.error`` unconditionally. An unrouted branch would reintroduce
+    ERROR-spam for this one call site while the other two stay deduped."""
+    db = tmp_path / "engine.db"
+    p1 = nm("m1", (ev(0, "goal"),))
+    provider = ScriptedProvider([[p1]])
+    engine = _engine(make_pack(provider), db)
+    # A single poll_once() (not the full run loop) so the connection stays
+    # open afterward for the direct _reconcile_sequence_conflict calls below.
+    engine.poll_once()
+
+    seeded_id = qualified("m1")
+    bad_row = {"seq": "not-an-int", "type": "goal", "detail": "bad"}
+    with caplog.at_level(logging.DEBUG):
+        engine._reconcile_sequence_conflict(seeded_id, "m1", [bad_row])
+        engine._reconcile_sequence_conflict(seeded_id, "m1", [bad_row])
+    engine.close()
+
+    drift_records = [r for r in caplog.records if "seq not-an-int" in r.getMessage()]
+    assert sum(1 for r in drift_records if r.levelno >= logging.ERROR) == 1, (
+        "the defensive malformed-seq branch must ERROR once and dedup an identical repeat"
+    )
+    assert sum(1 for r in drift_records if r.levelno == logging.DEBUG) >= 1, (
+        "an identical repeat must still be tracked at DEBUG, not spam ERROR every call"
+    )
+
+
+def test_logged_drift_is_evicted_on_terminal_match_resolution(tmp_path):
+    """``self._logged_drift`` is keyed like ``self._cooldowns``/``_transitions``
+    (by provider-native match id) specifically so it can be evicted the same
+    way when a match resolves terminally — otherwise drift memory for every
+    match that ever drifted would leak for the life of a long-running
+    collector process."""
+    db = tmp_path / "engine.db"
+    p1 = nm("m1", (ev(0, "goal"), ev(1, "yellow", detail="Booking"), ev(3, "sub", minute=46)))
+    # Poll 2: a retroactive insertion below head — populates self._logged_drift.
+    p2 = nm(
+        "m1",
+        (
+            ev(0, "goal"),
+            ev(1, "yellow", detail="Booking"),
+            ev(2, "goal", minute=25, detail="VAR-restored"),
+            ev(3, "sub", minute=46),
+        ),
+    )
+    # Poll 3: the match resolves terminally (FINISHED) — a durable non-live
+    # apply, which must evict this match's self._logged_drift entries.
+    p3 = nm(
+        "m1",
+        (*p2.events,),
+        status=MatchStatus.FINISHED,
+        minute=None,
+        display_clock="FT",
+    )
+    provider = ScriptedProvider([[p1], [p2], [p3]])
+    engine = _engine(make_pack(provider), db)
+    run_engine(engine, provider)
+
+    assert "m1" not in engine._logged_drift, (
+        "a terminally-resolved match's drift memory must be evicted, not leak for the "
+        "life of the process"
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Detail hydration: live→final transition, per-match failure isolation, merge
 # --------------------------------------------------------------------------- #
