@@ -40,7 +40,7 @@ import logging
 import random
 import signal
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Hashable
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -1090,12 +1090,6 @@ class CollectorEngine:
         appended_this_batch: set[int] = set()
         for row in rows:
             seq = row.get("seq")
-            # The incoming row's FULL content, not just the seq or the
-            # exception's changed-column names — see _log_drift_once: a
-            # dedup signature narrower than the row itself would silently
-            # demote a genuinely different re-drift (new value on the same
-            # column, or a different retroactive event) to DEBUG.
-            row_signature = repr(sorted(row.items()))
             if head is not None and isinstance(seq, int) and seq <= head:
                 if seq in appended_this_batch:
                     # The SAME snapshot carried this seq twice and the first
@@ -1115,21 +1109,35 @@ class CollectorEngine:
                     try:
                         self._writer.append_events(seeded_id, [row])
                     except SequenceError as exc:
+                        # The incoming row's FULL content, not just the seq
+                        # or the exception's changed-column names — see
+                        # _log_drift_once: a dedup signature narrower than
+                        # the row itself would silently demote a genuinely
+                        # different re-drift (new value on the same column,
+                        # or a different retroactive event) to WARNING.
                         self._log_drift_once(
                             provider_match_id,
                             seq,
-                            signature=f"conflict:{row_signature}",
+                            signature=f"conflict:{repr(sorted(row.items()))}",
                             message=(
                                 "event drift for match %s seq %s on source %s: %s "
                                 "(keeping stored row, skipping this event)"
                             ),
                             args=(provider_match_id, seq, self._source, exc),
                         )
+                    else:
+                        # The provider's fingerprint reverted to match the
+                        # stored row (an idempotent no-op write): the prior
+                        # drift is resolved, so its cached signature must be
+                        # cleared — otherwise a genuinely NEW recurrence of
+                        # the same wrong value later would be silently
+                        # demoted to WARNING as a stale "repeat".
+                        self._logged_drift.get(provider_match_id, {}).pop(seq, None)
                 else:
                     self._log_drift_once(
                         provider_match_id,
                         seq,
-                        signature=f"retroactive:{row_signature}",
+                        signature=f"retroactive:{repr(sorted(row.items()))}",
                         message=(
                             "event drift for match %s seq %s on source %s: retroactive "
                             "event insertion below stored head %s; event NOT written"
@@ -1145,7 +1153,7 @@ class CollectorEngine:
                 self._log_drift_once(
                     provider_match_id,
                     seq,
-                    signature=f"malformed:{row_signature}",
+                    signature=f"malformed:{repr(sorted(row.items()))}",
                     message=(
                         "event drift for match %s seq %s on source %s: %s (skipping this event)"
                     ),
@@ -1167,20 +1175,29 @@ class CollectorEngine:
         message: str,
         args: tuple[Any, ...],
     ) -> None:
-        """Log a drift ERROR once per distinct (match, seq) mismatch; repeats stay at DEBUG.
+        """Log a drift ERROR once per distinct (match, seq) mismatch; repeats stay at WARNING.
 
         The stored row is never mutated, so an unresolved drift re-diffs
         identically on every subsequent poll for the rest of the match —
         logging it at ERROR every time drowns real signal (a NEW mismatch
         elsewhere) in noise. The first occurrence of a given ``signature``
         for a ``(provider_match_id, seq)`` pair still logs at ERROR;
-        identical repeats are demoted to DEBUG. ``signature`` must capture
-        the incoming row's full content (not e.g. a static literal or the
-        exception's changed-column names alone) so a re-drift with genuinely
-        different content — a different retroactive event, or a fresh
-        in-place correction to a new wrong value on the same column —
-        re-escalates to ERROR as new information rather than being silently
-        demoted.
+        identical repeats are demoted to WARNING (not DEBUG — this project
+        never configures logging, so its effective level is the stdlib
+        default of WARNING; a DEBUG repeat would be emitted nowhere,
+        silently swallowing an ongoing drift the docstring promises stays
+        loud-but-alive). ``signature`` must capture the incoming row's full
+        content (not e.g. a static literal or the exception's changed-column
+        names alone) so a re-drift with genuinely different content — a
+        different retroactive event, or a fresh in-place correction to a new
+        wrong value on the same column — re-escalates to ERROR as new
+        information rather than being silently demoted.
+
+        ``seq`` may be any JSON-decoded value, including an unhashable one
+        (a malformed provider payload can carry a list/dict where an int
+        seq is expected) — it is never used as a dict key directly, only
+        via a hashable derivative, so a malformed seq still logs instead of
+        raising ``TypeError``.
 
         Keyed by ``provider_match_id`` (not the internal ``seeded_id``) so
         :meth:`_resolve_tracker` / :meth:`_resolve_backfill_tracker` can evict
@@ -1189,11 +1206,12 @@ class CollectorEngine:
         without this, drift memory for finished matches would linger for the
         life of the process.
         """
+        key = seq if isinstance(seq, Hashable) else repr(seq)
         match_signatures = self._logged_drift.setdefault(provider_match_id, {})
-        if match_signatures.get(seq) == signature:
-            log.debug(message, *args)
+        if match_signatures.get(key) == signature:
+            log.warning(message, *args)
             return
-        match_signatures[seq] = signature
+        match_signatures[key] = signature
         log.error(message, *args)
 
     def _stored_events(self, seeded_id: str) -> list[NormalizedEvent]:
@@ -2093,11 +2111,12 @@ class CollectorEngine:
         at 0 (normally popped only by a durable apply) so the ``epoch`` of the
         NEXT abandonment keeps growing the interval.
 
-        To keep ``_cooldowns`` bounded when that durable apply never comes — a
-        match that ended and dropped off the slate — an expired entry whose match
-        is UNSEEN (absent from ``slate_ids``, ``self._transitions``, AND
-        ``self._backfill``) for a full cap-length window (``_COOLDOWN_MAX_POLLS``
-        consecutive polls) is purged. ``self._backfill`` must be checked here too:
+        To keep ``_cooldowns`` (and ``self._logged_drift``, purged alongside it)
+        bounded when that durable apply never comes — a match that ended and
+        dropped off the slate — an expired entry whose match is UNSEEN (absent
+        from ``slate_ids``, ``self._transitions``, AND ``self._backfill``) for
+        a full cap-length window (``_COOLDOWN_MAX_POLLS`` consecutive polls) is
+        purged. ``self._backfill`` must be checked here too:
         a backfill tracker actively being retried off-slate (see
         :meth:`_hydrate_vanished_backfill_matches`) while a PRIOR give-up cycle's
         cooldown is still counting down is genuinely still tracked, not unseen —
@@ -2123,6 +2142,7 @@ class CollectorEngine:
                 purge.append(match_id)
         for match_id in purge:
             del self._cooldowns[match_id]
+            self._logged_drift.pop(match_id, None)
 
     def _cooling_down(self, match_id: str) -> bool:
         """True while ``match_id`` is within an unexpired abandonment cooldown."""
@@ -2699,23 +2719,24 @@ class CollectorEngine:
         never set), a give-up apply landing, AND the case of a merged detail
         resolving LIVE for a backfill-tracked match (e.g. a provider
         correcting a stale terminal/scheduled read) — ``self._backfill`` must
-        never leak any of these ways. Also pops any ``self._cooldowns`` entry
-        left by ``_emit_backfill_give_up``'s exhaustion branch — but ONLY
-        when a ``self._backfill`` entry actually existed here (``tracker is
-        not None``): unlike :meth:`_resolve_tracker` (only reached on the
-        non-live tail, where a cooldown pop is always safe), this method runs
-        for EVERY durable apply on EVERY match, including ones that were
-        never backfill-tracked and may be cooling down for an unrelated
-        transition abandonment — popping unconditionally would clear that
-        cooldown's epoch/backoff memory out from under the transition path's
-        own L1 preserve-epoch invariant (:meth:`_clear_cooling_gate`). Gating
-        on ``tracker is not None`` is sound because a backfill tracker and a
-        transition-abandonment cooldown are mutually exclusive by
-        construction for the same match id.
+        never leak any of these ways. Also pops any ``self._cooldowns`` (and
+        ``self._logged_drift``) entry left by ``_emit_backfill_give_up``'s
+        exhaustion branch — but ONLY when a ``self._backfill`` entry actually
+        existed here (``tracker is not None``): unlike :meth:`_resolve_tracker`
+        (only reached on the non-live tail, where a cooldown pop is always
+        safe), this method runs for EVERY durable apply on EVERY match,
+        including ones that were never backfill-tracked and may be cooling
+        down for an unrelated transition abandonment — popping unconditionally
+        would clear that cooldown's epoch/backoff memory out from under the
+        transition path's own L1 preserve-epoch invariant
+        (:meth:`_clear_cooling_gate`). Gating on ``tracker is not None`` is
+        sound because a backfill tracker and a transition-abandonment cooldown
+        are mutually exclusive by construction for the same match id.
         """
         tracker = self._backfill.pop(match_id, None)
         if tracker is not None:
             self._cooldowns.pop(match_id, None)
+            self._logged_drift.pop(match_id, None)
         if tracker is None or not tracker.give_up_pending:
             return
         log.error(

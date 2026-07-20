@@ -874,7 +874,7 @@ def test_sequence_drift_skips_match_but_others_keep_collecting(tmp_path, caplog)
     assert event_seqs(db, qualified("A")) == sorted(set(event_seqs(db, qualified("A"))))
     # The drift was logged loudly (ERROR) on its FIRST occurrence. Once the
     # identical shift re-diffs on a later poll, the repeat is demoted to
-    # DEBUG — still tracked/visible, not silently dropped, but no longer
+    # WARNING — still tracked/visible, not silently dropped, but no longer
     # spamming ERROR every poll for the rest of the match.
     drift_records = [
         r for r in caplog.records if "drift" in r.getMessage() and "seq 0" in r.getMessage()
@@ -882,8 +882,8 @@ def test_sequence_drift_skips_match_but_others_keep_collecting(tmp_path, caplog)
     assert sum(1 for r in drift_records if r.levelno >= logging.ERROR) == 1, (
         "a persistent identical drift must ERROR only on its first occurrence"
     )
-    assert sum(1 for r in drift_records if r.levelno == logging.DEBUG) >= 1, (
-        "repeat occurrences of the same drift must still be logged, just demoted to DEBUG"
+    assert sum(1 for r in drift_records if r.levelno == logging.WARNING) >= 1, (
+        "repeat occurrences of the same drift must still be logged, just demoted to WARNING"
     )
 
 
@@ -896,7 +896,7 @@ def test_inplace_correction_skips_conflicted_seq_but_new_events_keep_landing(tmp
     reconciles against the stored rows: the conflicted seq is skipped loudly
     (stored row kept — append-only), the new seqs beyond the stored head land,
     and the baseline is rebuilt from the STORED rows, so the still-mutated seq
-    keeps being tracked on later polls (loud once, then DEBUG — not silently
+    keeps being tracked on later polls (loud once, then WARNING — not silently
     baselined away) while collection continues. A sibling match in the same
     poll is unaffected."""
     db = tmp_path / "engine.db"
@@ -943,17 +943,17 @@ def test_inplace_correction_skips_conflicted_seq_but_new_events_keep_landing(tmp
         "stored event must NOT be mutated by the correction"
     )
     # The skip was loud: an ERROR record naming the conflicted seq on its
-    # FIRST poll. Poll 3's identical mismatch is demoted to DEBUG — still
+    # FIRST poll. Poll 3's identical mismatch is demoted to WARNING — still
     # tracked (baseline from stored rows means it keeps re-surfacing rather
     # than being silently baselined away), just not spamming ERROR again.
     drift_records = [
         r for r in caplog.records if "drift" in r.getMessage() and "seq 1" in r.getMessage()
     ]
     assert sum(1 for r in drift_records if r.levelno >= logging.ERROR) == 1, (
-        "the conflicted seq must ERROR once; an identical repeat demotes to DEBUG"
+        "the conflicted seq must ERROR once; an identical repeat demotes to WARNING"
     )
-    assert sum(1 for r in drift_records if r.levelno == logging.DEBUG) >= 1, (
-        "the still-mutated seq must keep being tracked (DEBUG) on later polls, not go silent"
+    assert sum(1 for r in drift_records if r.levelno == logging.WARNING) >= 1, (
+        "the still-mutated seq must keep being tracked (WARNING) on later polls, not go silent"
     )
     # The sibling match kept collecting in the same polls.
     assert event_seqs(db, qualified("B")) == [0, 1]
@@ -964,7 +964,7 @@ def test_retroactive_insert_below_head_is_never_written_and_stays_loud(tmp_path,
     VAR-restored goal) must never be written — inserting under the head would
     violate the writer's monotonic invariant and could interleave two
     timelines — but it must NOT be silently baselined away either: it is
-    logged at ERROR the first time it's seen and kept tracked at DEBUG on
+    logged at ERROR the first time it's seen and kept tracked at WARNING on
     every later poll it persists (loud once, alive thereafter), while
     genuinely new events beyond the head keep landing."""
     db = tmp_path / "engine.db"
@@ -990,16 +990,16 @@ def test_retroactive_insert_below_head_is_never_written_and_stays_loud(tmp_path,
     # Seq 4 landed (no wedge); seq 2 was never written (no insert below head).
     assert event_seqs(db, qualified("m1")) == [0, 1, 3, 4]
     # The retro insert was logged at ERROR the first time; poll 3's identical
-    # repeat demotes to DEBUG — it was not baked into the baseline and
+    # repeat demotes to WARNING — it was not baked into the baseline and
     # silently swallowed, just no longer spamming ERROR every poll.
     retro_records = [
         r for r in caplog.records if "seq 2" in r.getMessage() and "retroactive" in r.getMessage()
     ]
     assert sum(1 for r in retro_records if r.levelno >= logging.ERROR) == 1, (
-        "a retroactively-inserted seq must ERROR once; an identical repeat demotes to DEBUG"
+        "a retroactively-inserted seq must ERROR once; an identical repeat demotes to WARNING"
     )
-    assert sum(1 for r in retro_records if r.levelno == logging.DEBUG) >= 1, (
-        "the persisting retro insert must still be tracked at DEBUG, not silently dropped"
+    assert sum(1 for r in retro_records if r.levelno == logging.WARNING) >= 1, (
+        "the persisting retro insert must still be tracked at WARNING, not silently dropped"
     )
 
 
@@ -1007,7 +1007,7 @@ def test_drift_dedup_signature_is_content_based_not_a_static_literal(tmp_path, c
     """The retroactive-insertion dedup signature must capture the incoming
     row's actual content, not a static literal like "retroactive" — otherwise
     a SECOND, materially different retroactive insertion at the same seq
-    (different detail/content) would be wrongly demoted to DEBUG instead of
+    (different detail/content) would be wrongly demoted to WARNING instead of
     re-escalating to ERROR as new information."""
     db = tmp_path / "engine.db"
     p1 = nm("m1", (ev(0, "goal"), ev(1, "yellow", detail="Booking"), ev(3, "sub", minute=46)))
@@ -1083,6 +1083,53 @@ def test_inplace_correction_signature_reflects_value_not_just_changed_columns(tm
     )
 
 
+def test_inplace_correction_resolving_then_recurring_re_escalates_to_error(tmp_path, caplog):
+    """When an in-place conflict resolves (the provider self-corrects back to
+    the stored fingerprint, landing as an idempotent no-op write) and the
+    SAME wrong value reappears later, that recurrence is genuinely NEW
+    information — the drift went away and came back — and must re-escalate
+    to ERROR, not be silently demoted to WARNING against a stale cached
+    signature from before the resolution.
+
+    Drives ``_reconcile_sequence_conflict`` directly (like the malformed-seq
+    dedup test above) rather than through the full poll loop: the diff
+    baseline is rebuilt from the STORED rows after a conflict, so a snapshot
+    that reverts to the original stored fingerprint never re-diffs seq 1 at
+    all through ``diff_matches`` — the idempotent-no-op resolution path only
+    fires when ``append_events`` is actually invoked for that seq again."""
+    from gamecollect.engine import _event_to_row
+
+    db = tmp_path / "engine.db"
+    p1 = nm("A", (ev(0, "goal", detail="Opener"), ev(1, "goal", minute=20, detail="Second")))
+    provider = ScriptedProvider([[p1]])
+    engine = _engine(make_pack(provider), db)
+    engine.poll_once()
+
+    seeded_id = qualified("A")
+    wrong_row = _event_to_row(ev(1, "goal", minute=20, player="Wrong Name", detail="Second"))
+    original_row = _event_to_row(ev(1, "goal", minute=20, detail="Second"))
+    try:
+        with caplog.at_level(logging.DEBUG):
+            # First conflict: wrong value → ERROR, signature cached.
+            engine._reconcile_sequence_conflict(seeded_id, "A", [wrong_row])
+            # The provider reverts to the ORIGINAL stored fingerprint: the
+            # write succeeds (idempotent no-op), resolving the drift and
+            # clearing its cached signature.
+            engine._reconcile_sequence_conflict(seeded_id, "A", [original_row])
+            # The identical wrong value reappears — genuinely new information.
+            engine._reconcile_sequence_conflict(seeded_id, "A", [wrong_row])
+    finally:
+        engine.close()
+
+    drift_records = [
+        r for r in caplog.records if "drift" in r.getMessage() and "seq 1" in r.getMessage()
+    ]
+    assert sum(1 for r in drift_records if r.levelno >= logging.ERROR) == 2, (
+        "a drift that resolves and then recurs with identical content must re-escalate to "
+        "ERROR, not be demoted against a stale pre-resolution signature"
+    )
+
+
 def test_defensive_malformed_seq_branch_dedups_via_log_drift_once(tmp_path, caplog):
     """The third (defensive) SequenceError branch in _reconcile_sequence_conflict
     — a seq the head-comparison could not classify (e.g. non-int) — must route
@@ -1108,8 +1155,40 @@ def test_defensive_malformed_seq_branch_dedups_via_log_drift_once(tmp_path, capl
     assert sum(1 for r in drift_records if r.levelno >= logging.ERROR) == 1, (
         "the defensive malformed-seq branch must ERROR once and dedup an identical repeat"
     )
-    assert sum(1 for r in drift_records if r.levelno == logging.DEBUG) >= 1, (
-        "an identical repeat must still be tracked at DEBUG, not spam ERROR every call"
+    assert sum(1 for r in drift_records if r.levelno == logging.WARNING) >= 1, (
+        "an identical repeat must still be tracked at WARNING, not spam ERROR every call"
+    )
+
+
+def test_defensive_malformed_seq_branch_handles_unhashable_seq_without_crashing(tmp_path, caplog):
+    """The defensive malformed-seq branch must tolerate a ``seq`` that is not
+    just non-int but genuinely UNHASHABLE (e.g. a list, from a malformed
+    provider payload) — ``_log_drift_once`` dedups on a hashable derivative
+    of ``seq``, never the raw value, so this must log instead of raising
+    ``TypeError: unhashable type``."""
+    db = tmp_path / "engine.db"
+    p1 = nm("m1", (ev(0, "goal"),))
+    provider = ScriptedProvider([[p1]])
+    engine = _engine(make_pack(provider), db)
+    engine.poll_once()
+
+    seeded_id = qualified("m1")
+    bad_row = {"seq": [1, 2], "type": "goal", "detail": "bad"}
+    try:
+        with caplog.at_level(logging.DEBUG):
+            engine._reconcile_sequence_conflict(seeded_id, "m1", [bad_row])
+            engine._reconcile_sequence_conflict(seeded_id, "m1", [bad_row])
+    finally:
+        engine.close()
+
+    drift_records = [
+        r for r in caplog.records if "drift" in r.getMessage() and "m1" in r.getMessage()
+    ]
+    assert sum(1 for r in drift_records if r.levelno >= logging.ERROR) == 1, (
+        "an unhashable seq must still ERROR once instead of crashing the reconciliation"
+    )
+    assert sum(1 for r in drift_records if r.levelno == logging.WARNING) >= 1, (
+        "an identical repeat with the same unhashable seq must dedup, not re-raise or re-ERROR"
     )
 
 
@@ -5992,6 +6071,40 @@ def test_expired_and_unseen_cooldown_entry_is_purged(tmp_path):
         )
         assert "active" in engine._cooldowns and engine._cooldowns["active"].remaining == 4, (
             "a still-counting cooldown must only age one poll, never be purged"
+        )
+    finally:
+        engine.close()
+
+
+def test_expired_and_unseen_cooldown_purge_also_evicts_logged_drift(tmp_path):
+    """``self._logged_drift`` has no eviction path of its own for a match that
+    abandons and never lands a durable non-live apply — it must piggyback on
+    ``_age_cooldowns``' expired-unseen purge (the only other eviction point
+    besides a terminal ``_resolve_tracker``/``_resolve_backfill_tracker``
+    apply), or drift memory for every abandoned match leaks for the life of
+    the process."""
+    from gamecollect.engine import _COOLDOWN_MAX_POLLS, CollectorEngine, _Cooldown
+
+    db = tmp_path / "engine.db"
+    provider = ScriptedDetailProvider([])
+    engine = CollectorEngine(make_pack(provider), str(db), SOURCE, 0.01, provider=provider)
+    try:
+        engine._cooldowns["gone"] = _Cooldown(
+            remaining=0, epoch=3, expired_unseen=_COOLDOWN_MAX_POLLS - 1
+        )
+        engine._logged_drift["gone"] = {0: "conflict:stale"}
+        engine._cooldowns["seen"] = _Cooldown(
+            remaining=0, epoch=2, expired_unseen=_COOLDOWN_MAX_POLLS - 1
+        )
+        engine._logged_drift["seen"] = {0: "conflict:stale"}
+
+        engine._age_cooldowns({"seen"})
+
+        assert "gone" not in engine._logged_drift, (
+            "drift memory for a purged, abandoned match must be evicted alongside its cooldown"
+        )
+        assert "seen" in engine._logged_drift, (
+            "a match seen on the slate must keep its drift memory, not be purged"
         )
     finally:
         engine.close()
