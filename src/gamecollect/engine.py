@@ -45,8 +45,9 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
-from gamecollect.db import reader
+from gamecollect.db import paths, reader
 from gamecollect.db.connection import connect
+from gamecollect.db.locking import AdvisoryLock, live_db_admission_lock
 from gamecollect.db.writer import (
     CrossPartitionError,
     PartitionWriter,
@@ -673,6 +674,17 @@ class CollectorEngine:
 
         self._conn = connect(self._db_path, side_table_ddl=pack.side_table_ddl)
         self._writer = PartitionWriter(self._conn, source, taxonomy=pack.taxonomy)
+        # Directory holding the SHARED/EXCLUSIVE admission lock (Phase 1). The
+        # data_dir is the DB file's parent: the shared-file model puts the DB
+        # directly under data_dir (paths.db_path), so paths.lock_dir(parent)
+        # yields the same <data_dir>/locks gamealerts' commentary writer uses.
+        # For an explicit-path connection (the pre-shared-file `path=` form) the
+        # lock still lands in a `locks/` sibling of the DB — no resolvable
+        # data_dir is required, so backward compatibility is preserved. Every
+        # write session (poll_once, apply_one_off_match) holds this SHARED for
+        # its duration so a future destructive EXCLUSIVE reset fences in-flight
+        # writers; SHARED holders coexist and never block one another.
+        self._lock_dir = paths.lock_dir(self._db_path.parent)
 
         # Last-written provider snapshot per provider-native match_id (the diff
         # baseline) and, when recording, the merged fixture accumulator.
@@ -805,6 +817,23 @@ class CollectorEngine:
         self._backoff_multiplier = 1
         return self._jittered_interval()
 
+    def _admission_lock(self) -> AdvisoryLock:
+        """SHARED admission lock over ``self._lock_dir`` for one write session.
+
+        Acquired SHARED (the default) and held for the duration of a single
+        collector write session — a ``poll_once`` batch or a one-shot
+        ``apply_one_off_match`` — mirroring gamealerts' commentary writer, so a
+        future destructive EXCLUSIVE reset (:mod:`gamecollect.db.locking`)
+        fences in-flight writers. SHARED holders coexist and never block one
+        another, so per-write acquisition adds zero contention between concurrent
+        collector/commentary writers while still admitting the reset BETWEEN
+        write sessions; a daemon-lifetime hold would instead starve it forever.
+        No EXCLUSIVE user exists yet, so today the lock fences nothing at
+        runtime — this closes the documented "collector holds it SHARED for its
+        write session" gap ahead of that user landing.
+        """
+        return live_db_admission_lock(self._lock_dir)
+
     def poll_once(self) -> None:
         """Fetch, diff, and write one poll's worth of matches.
 
@@ -833,87 +862,93 @@ class CollectorEngine:
         matches, live_resumptions = self._fetch_poll_snapshots()
         if self._recorder is not None:
             self._recorder.accumulate(matches)
-        for diff in diff_matches(matches, self._last):
-            if not diff.has_changes:
-                # Stored state already durably matches this snapshot. For a
-                # non-live snapshot this is a genuine durable state (the row IS
-                # persisted terminal), so a pending terminal tracker resolves
-                # and its cooldown clears. But a no-change LIVE snapshot
-                # advanced NOTHING (snapshot == baseline, zero writes): it must
-                # NOT clear a cooldown or drop a resumption's tracker, so it is
-                # routed with ``state_advanced=False`` (its live branch is a
-                # no-op) — see _on_durable_snapshot.
-                self._on_durable_snapshot(
-                    diff.match.match_id,
-                    diff.match,
-                    live_resumptions=live_resumptions,
-                    state_advanced=False,
-                )
-                continue
-            try:
-                baseline = self._apply(diff)
-            except SequenceError as exc:
-                # Defensive net: _apply reconciles fingerprint drift itself
-                # against the stored rows, so this only fires for a batch that
-                # failed pre-insert validation in a way the reconciliation also
-                # could not absorb. Leave self._last unchanged so a corrected
-                # list re-syncs.
-                log.error(
-                    "event drift for match %s on source %s: %s (skipping match this poll)",
-                    diff.match.match_id,
-                    self._source,
-                    exc,
-                )
-                # This _apply raised AFTER seed_match may already have
-                # durably written the matches row (seed-before-child-write),
-                # so a match this poll's fetch confirmed as ``is_backfill``
-                # must still count this as a backfill attempt — otherwise a
-                # row now exists with no tracker to keep is_backfill alive,
-                # permanently foreclosing retry. Not reached for a
-                # non-backfill match (absent from
-                # ``self._backfill_apply_pending``).
-                if diff.match.match_id in self._backfill_apply_pending:
+        # Hold the SHARED admission lock for this poll's write session only (not
+        # the network fetch above, which acquires nothing): the diff/apply loop
+        # is where every DB write lands. Per-poll (not daemon-lifetime) so a
+        # future EXCLUSIVE reset can be admitted between polls — see
+        # _admission_lock. Readers never acquire the lock.
+        with self._admission_lock():
+            for diff in diff_matches(matches, self._last):
+                if not diff.has_changes:
+                    # Stored state already durably matches this snapshot. For a
+                    # non-live snapshot this is a genuine durable state (the row IS
+                    # persisted terminal), so a pending terminal tracker resolves
+                    # and its cooldown clears. But a no-change LIVE snapshot
+                    # advanced NOTHING (snapshot == baseline, zero writes): it must
+                    # NOT clear a cooldown or drop a resumption's tracker, so it is
+                    # routed with ``state_advanced=False`` (its live branch is a
+                    # no-op) — see _on_durable_snapshot.
+                    self._on_durable_snapshot(
+                        diff.match.match_id,
+                        diff.match,
+                        live_resumptions=live_resumptions,
+                        state_advanced=False,
+                    )
+                    continue
+                try:
+                    baseline = self._apply(diff)
+                except SequenceError as exc:
+                    # Defensive net: _apply reconciles fingerprint drift itself
+                    # against the stored rows, so this only fires for a batch that
+                    # failed pre-insert validation in a way the reconciliation also
+                    # could not absorb. Leave self._last unchanged so a corrected
+                    # list re-syncs.
+                    log.error(
+                        "event drift for match %s on source %s: %s (skipping match this poll)",
+                        diff.match.match_id,
+                        self._source,
+                        exc,
+                    )
+                    # This _apply raised AFTER seed_match may already have
+                    # durably written the matches row (seed-before-child-write),
+                    # so a match this poll's fetch confirmed as ``is_backfill``
+                    # must still count this as a backfill attempt — otherwise a
+                    # row now exists with no tracker to keep is_backfill alive,
+                    # permanently foreclosing retry. Not reached for a
+                    # non-backfill match (absent from
+                    # ``self._backfill_apply_pending``).
+                    if diff.match.match_id in self._backfill_apply_pending:
+                        self._register_backfill_apply_failure(diff.match)
+                    continue
+                except (TaxonomyError, UnseededMatchError, CrossPartitionError) as exc:
+                    # Undeclared type / unseeded / foreign-partition write: a bad
+                    # match must not crash the daemon. Log loudly and skip; the
+                    # baseline is untouched so a corrected poll re-tries the full
+                    # list. Non-writer exceptions stay fatal (they propagate).
+                    log.error(
+                        "writer rejected match %s on source %s: %s (skipping match this poll)",
+                        diff.match.match_id,
+                        self._source,
+                        exc,
+                    )
+                    # Same rationale as the SequenceError branch above.
+                    if diff.match.match_id in self._backfill_apply_pending:
+                        self._register_backfill_apply_failure(diff.match)
+                    continue
+                if baseline is not None:
+                    self._last[diff.match.match_id] = baseline
+                    # CONSUME point of the transition state machine: a DURABLE apply
+                    # (a real write landed, ``state_advanced=True``) resolves a
+                    # pending terminal tracker (and clears any abandonment cooldown),
+                    # or reconciles a live resumption's fallback against the applied
+                    # state. An apply failure above (baseline None / exception)
+                    # retains the tracker so the captured terminal state is retried
+                    # next poll.
+                    self._on_durable_snapshot(
+                        diff.match.match_id,
+                        baseline,
+                        live_resumptions=live_resumptions,
+                        state_advanced=True,
+                    )
+                elif diff.match.match_id in self._backfill_apply_pending:
+                    # seed_match returned None (missing identity) after a
+                    # successful detail fetch for an is_backfill match — no
+                    # durable write landed, so nothing was foreclosed, but without
+                    # registering a failure here nothing ever counts against
+                    # _BACKFILL_MAX_ATTEMPTS either, and _first_sight_finished
+                    # would keep re-firing (fetching detail again) every poll
+                    # forever.
                     self._register_backfill_apply_failure(diff.match)
-                continue
-            except (TaxonomyError, UnseededMatchError, CrossPartitionError) as exc:
-                # Undeclared type / unseeded / foreign-partition write: a bad
-                # match must not crash the daemon. Log loudly and skip; the
-                # baseline is untouched so a corrected poll re-tries the full
-                # list. Non-writer exceptions stay fatal (they propagate).
-                log.error(
-                    "writer rejected match %s on source %s: %s (skipping match this poll)",
-                    diff.match.match_id,
-                    self._source,
-                    exc,
-                )
-                # Same rationale as the SequenceError branch above.
-                if diff.match.match_id in self._backfill_apply_pending:
-                    self._register_backfill_apply_failure(diff.match)
-                continue
-            if baseline is not None:
-                self._last[diff.match.match_id] = baseline
-                # CONSUME point of the transition state machine: a DURABLE apply
-                # (a real write landed, ``state_advanced=True``) resolves a
-                # pending terminal tracker (and clears any abandonment cooldown),
-                # or reconciles a live resumption's fallback against the applied
-                # state. An apply failure above (baseline None / exception)
-                # retains the tracker so the captured terminal state is retried
-                # next poll.
-                self._on_durable_snapshot(
-                    diff.match.match_id,
-                    baseline,
-                    live_resumptions=live_resumptions,
-                    state_advanced=True,
-                )
-            elif diff.match.match_id in self._backfill_apply_pending:
-                # seed_match returned None (missing identity) after a
-                # successful detail fetch for an is_backfill match — no
-                # durable write landed, so nothing was foreclosed, but without
-                # registering a failure here nothing ever counts against
-                # _BACKFILL_MAX_ATTEMPTS either, and _first_sight_finished
-                # would keep re-firing (fetching detail again) every poll
-                # forever.
-                self._register_backfill_apply_failure(diff.match)
 
     @property
     def source(self) -> str:
@@ -1020,7 +1055,11 @@ class CollectorEngine:
         # side_tables_first: a one-shot finished match must be applied
         # all-or-(events-)nothing so the backfill skip-check's has_events()
         # proxy reliably means "fully stored" — see _apply's docstring.
-        return self._apply(diff, side_tables_first=True)
+        # Hold the SHARED admission lock for this one match's write session,
+        # exactly as the poll loop does (see _admission_lock): backfill is a
+        # live-DB writer too, so a future EXCLUSIVE reset must fence it.
+        with self._admission_lock():
+            return self._apply(diff, side_tables_first=True)
 
     def _apply(self, diff: MatchDiff, *, side_tables_first: bool = False) -> NormalizedMatch | None:
         """Seed the match through the pack hook, then persist events + side tables.

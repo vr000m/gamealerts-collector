@@ -45,6 +45,8 @@ import threading
 import pytest
 
 from gamecollect.db import reader
+from gamecollect.db.locking import live_db_admission_lock
+from gamecollect.db.paths import lock_dir as resolve_lock_dir
 from gamecollect.packs.spec import EventTypeDecl, SportPack, default_seed_match
 from gamecollect.provider import (
     MatchDataProvider,
@@ -8783,3 +8785,92 @@ def test_client_goal_family_matches_engine():
         f"gamecollect.client.GOAL_FAMILY_EVENT_TYPES {sorted(client_set)} drifted from "
         f"gamecollect.engine._GOAL_FAMILY_EVENT_TYPES {sorted(engine_set)}"
     )
+
+
+# --------------------------------------------------------------------------- #
+# SHARED admission-lock hold over the write session
+# --------------------------------------------------------------------------- #
+
+
+def _assert_write_path_holds_shared_lock(write_call, lock_directory) -> None:
+    """Prove ``write_call`` runs its write session under the SHARED admission lock.
+
+    Holds ``_live_db_admission.lock`` EXCLUSIVE (the future destructive-reset
+    fence) on a background thread, then runs ``write_call`` on another thread. A
+    write path that correctly acquires the lock SHARED must BLOCK behind the
+    EXCLUSIVE holder and only complete after it releases; a write path that never
+    acquires the lock completes immediately despite the EXCLUSIVE hold, failing
+    the first assertion. flock(2) locks are per open-file-description, so two
+    ``live_db_admission_lock`` context managers in one process contend exactly as
+    two separate processes would (see tests/test_db_locking.py::_Holder).
+    """
+    exclusive_acquired = threading.Event()
+    release_exclusive = threading.Event()
+
+    def hold_exclusive() -> None:
+        with live_db_admission_lock(lock_directory, exclusive=True):
+            exclusive_acquired.set()
+            release_exclusive.wait(5.0)
+
+    holder = threading.Thread(target=hold_exclusive, daemon=True)
+    holder.start()
+    try:
+        assert exclusive_acquired.wait(5.0), "EXCLUSIVE holder never acquired the admission lock"
+
+        write_done = threading.Event()
+
+        def run_write() -> None:
+            write_call()
+            write_done.set()
+
+        writer = threading.Thread(target=run_write, daemon=True)
+        writer.start()
+        try:
+            assert not write_done.wait(0.5), (
+                "the collector write path completed while an EXCLUSIVE admission lock "
+                "was held — it did not acquire the SHARED lock for its write session"
+            )
+            release_exclusive.set()
+            assert write_done.wait(5.0), (
+                "the collector write path never completed after the EXCLUSIVE holder released"
+            )
+        finally:
+            release_exclusive.set()
+            writer.join(5.0)
+    finally:
+        release_exclusive.set()
+        holder.join(5.0)
+
+
+def test_poll_once_holds_shared_admission_lock(tmp_path):
+    """poll_once's write session must run under the SHARED admission lock so a
+    future EXCLUSIVE collector-side reset correctly fences an in-flight poll (dev
+    plan 20260707 data-flow table: 'SHARED admission lock held for the write
+    session | Per poll')."""
+    provider = ScriptedProvider([[nm("m1", (ev(1),))]])
+    pack = make_pack(provider)
+    db_path = tmp_path / "collector.db"
+    engine = _engine(pack, db_path)
+    try:
+        _assert_write_path_holds_shared_lock(engine.poll_once, resolve_lock_dir(db_path.parent))
+    finally:
+        engine.close()
+
+
+def test_apply_one_off_match_holds_shared_admission_lock(tmp_path):
+    """The one-shot backfill write path (apply_one_off_match) also writes to the
+    live DB and must hold the SHARED admission lock for its write session, for
+    the same reset-fence reason as the poll loop."""
+    provider = ScriptedProvider([])
+    pack = make_pack(provider)
+    db_path = tmp_path / "collector.db"
+    engine = _engine(pack, db_path)
+    scoreboard = nm("m1", (), status=MatchStatus.FINISHED)
+    detail = nm("m1", (ev(1),), status=MatchStatus.FINISHED)
+    try:
+        _assert_write_path_holds_shared_lock(
+            lambda: engine.apply_one_off_match(scoreboard, detail),
+            resolve_lock_dir(db_path.parent),
+        )
+    finally:
+        engine.close()
