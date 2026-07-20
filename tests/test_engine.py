@@ -872,14 +872,19 @@ def test_sequence_drift_skips_match_but_others_keep_collecting(tmp_path, caplog)
     # below the stored head (no duplicate seq-0 row, strictly monotonic tail).
     assert event_types(db, qualified("A"))[0] == "goal"
     assert event_seqs(db, qualified("A")) == sorted(set(event_seqs(db, qualified("A"))))
-    # The drift was logged loudly (WARNING or higher) — and on EVERY poll the
-    # shifted snapshot persisted, not just the first.
-    drift_logs = [
-        r
-        for r in caplog.records
-        if r.levelno >= logging.WARNING and "drift" in r.getMessage() and "seq 0" in r.getMessage()
+    # The drift was logged loudly (ERROR) on its FIRST occurrence. Once the
+    # identical shift re-diffs on a later poll, the repeat is demoted to
+    # DEBUG — still tracked/visible, not silently dropped, but no longer
+    # spamming ERROR every poll for the rest of the match.
+    drift_records = [
+        r for r in caplog.records if "drift" in r.getMessage() and "seq 0" in r.getMessage()
     ]
-    assert len(drift_logs) >= 2, "persistent shift drift must be re-logged on every poll"
+    assert sum(1 for r in drift_records if r.levelno >= logging.ERROR) == 1, (
+        "a persistent identical drift must ERROR only on its first occurrence"
+    )
+    assert sum(1 for r in drift_records if r.levelno == logging.DEBUG) >= 1, (
+        "repeat occurrences of the same drift must still be logged, just demoted to DEBUG"
+    )
 
 
 def test_inplace_correction_skips_conflicted_seq_but_new_events_keep_landing(tmp_path, caplog):
@@ -891,8 +896,9 @@ def test_inplace_correction_skips_conflicted_seq_but_new_events_keep_landing(tmp
     reconciles against the stored rows: the conflicted seq is skipped loudly
     (stored row kept — append-only), the new seqs beyond the stored head land,
     and the baseline is rebuilt from the STORED rows, so the still-mutated seq
-    keeps re-logging on later polls (loud-but-alive) while collection
-    continues. A sibling match in the same poll is unaffected."""
+    keeps being tracked on later polls (loud once, then DEBUG — not silently
+    baselined away) while collection continues. A sibling match in the same
+    poll is unaffected."""
     db = tmp_path / "engine.db"
     # Poll 1: match A has seqs 0-1; match B has seq 0.
     p1_a = nm("A", (ev(0, "goal", detail="Opener"), ev(1, "goal", minute=20, detail="Second")))
@@ -936,16 +942,18 @@ def test_inplace_correction_skips_conflicted_seq_but_new_events_keep_landing(tmp
     assert json.loads(seq1_payload)["scorer"] == "Jonathan David", (
         "stored event must NOT be mutated by the correction"
     )
-    # The skip was loud: an ERROR record naming the conflicted seq — on BOTH
-    # polls where the mutated seq 1 persisted (baseline from stored rows means
-    # unresolved drift keeps re-surfacing rather than being baselined away).
-    drift_errors = [
-        r
-        for r in caplog.records
-        if r.levelno >= logging.ERROR and "drift" in r.getMessage() and "seq 1" in r.getMessage()
+    # The skip was loud: an ERROR record naming the conflicted seq on its
+    # FIRST poll. Poll 3's identical mismatch is demoted to DEBUG — still
+    # tracked (baseline from stored rows means it keeps re-surfacing rather
+    # than being silently baselined away), just not spamming ERROR again.
+    drift_records = [
+        r for r in caplog.records if "drift" in r.getMessage() and "seq 1" in r.getMessage()
     ]
-    assert len(drift_errors) >= 2, (
-        "the conflicted seq must be logged at ERROR level on every poll it persists"
+    assert sum(1 for r in drift_records if r.levelno >= logging.ERROR) == 1, (
+        "the conflicted seq must ERROR once; an identical repeat demotes to DEBUG"
+    )
+    assert sum(1 for r in drift_records if r.levelno == logging.DEBUG) >= 1, (
+        "the still-mutated seq must keep being tracked (DEBUG) on later polls, not go silent"
     )
     # The sibling match kept collecting in the same polls.
     assert event_seqs(db, qualified("B")) == [0, 1]
@@ -956,7 +964,8 @@ def test_retroactive_insert_below_head_is_never_written_and_stays_loud(tmp_path,
     VAR-restored goal) must never be written — inserting under the head would
     violate the writer's monotonic invariant and could interleave two
     timelines — but it must NOT be silently baselined away either: it is
-    logged at ERROR on every poll it persists (loud-but-alive), while
+    logged at ERROR the first time it's seen and kept tracked at DEBUG on
+    every later poll it persists (loud once, alive thereafter), while
     genuinely new events beyond the head keep landing."""
     db = tmp_path / "engine.db"
     # Poll 1: seqs 0, 1, 3 stored (head = 3; the gap at 2 is legal).
@@ -980,17 +989,17 @@ def test_retroactive_insert_below_head_is_never_written_and_stays_loud(tmp_path,
 
     # Seq 4 landed (no wedge); seq 2 was never written (no insert below head).
     assert event_seqs(db, qualified("m1")) == [0, 1, 3, 4]
-    # The retro insert was logged at ERROR on BOTH polls it persisted — it was
-    # not baked into the baseline and swallowed after the first poll.
-    retro_errors = [
-        r
-        for r in caplog.records
-        if r.levelno >= logging.ERROR
-        and "seq 2" in r.getMessage()
-        and "retroactive" in r.getMessage()
+    # The retro insert was logged at ERROR the first time; poll 3's identical
+    # repeat demotes to DEBUG — it was not baked into the baseline and
+    # silently swallowed, just no longer spamming ERROR every poll.
+    retro_records = [
+        r for r in caplog.records if "seq 2" in r.getMessage() and "retroactive" in r.getMessage()
     ]
-    assert len(retro_errors) >= 2, (
-        "a retroactively-inserted seq must be re-logged at ERROR on every poll it persists"
+    assert sum(1 for r in retro_records if r.levelno >= logging.ERROR) == 1, (
+        "a retroactively-inserted seq must ERROR once; an identical repeat demotes to DEBUG"
+    )
+    assert sum(1 for r in retro_records if r.levelno == logging.DEBUG) >= 1, (
+        "the persisting retro insert must still be tracked at DEBUG, not silently dropped"
     )
 
 

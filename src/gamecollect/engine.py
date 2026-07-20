@@ -728,6 +728,13 @@ class CollectorEngine:
         # from an ordinary match's ``_apply`` failure (unrelated to backfill
         # retry accounting).
         self._backfill_apply_pending: set[str] = set()
+        # Last-logged drift signature per (seeded_id, seq) — see
+        # _log_drift_once. A drifted seq's stored row is never mutated, so
+        # the SAME mismatch would otherwise re-diff and re-log at ERROR every
+        # poll for the rest of the match; this caps each distinct mismatch to
+        # one ERROR, demoting identical repeats to DEBUG while still
+        # re-escalating if the mismatch itself changes shape.
+        self._logged_drift: dict[tuple[str, int], str] = {}
         self._backoff_multiplier = 1
         # One-time restart scan latch: on the FIRST successful poll the stored
         # matches table is scanned for rows this source left live at shutdown
@@ -1053,13 +1060,17 @@ class CollectorEngine:
           single-row append: an identical fingerprint is the writer's
           idempotent no-op; a mutated fingerprint (in-place provider
           correction) raises :class:`~gamecollect.db.writer.SequenceError`,
-          logged at ERROR — the stored row is never mutated (append-only).
+          logged via :meth:`_log_drift_once` — the stored row is never
+          mutated (append-only).
         * seq at-or-below the stored head and NOT stored — a retroactive
           insertion (e.g. a VAR-restored event): never written (it would
           violate the writer's monotonic invariant and could interleave two
-          timelines), logged at ERROR. Because the returned baseline excludes
-          it, it re-diffs and re-logs on every poll it persists —
-          loud-but-alive, not silently swallowed.
+          timelines), logged via :meth:`_log_drift_once`. Because the
+          returned baseline excludes it, it re-diffs on every poll it
+          persists — loud-but-alive, not silently swallowed, though
+          :meth:`_log_drift_once` caps an UNCHANGED mismatch to one ERROR
+          (later identical polls log at DEBUG) so a single persistent drift
+          does not spam ERROR for the rest of the match.
         * seq strictly beyond the stored head — appended one row at a time in
           ascending order, so the writer's strictly-increasing invariant holds
           for every insert it performs. Appended seqs join the stored set, so
@@ -1095,23 +1106,26 @@ class CollectorEngine:
                     try:
                         self._writer.append_events(seeded_id, [row])
                     except SequenceError as exc:
-                        log.error(
-                            "event drift for match %s seq %s on source %s: %s "
-                            "(keeping stored row, skipping this event)",
-                            provider_match_id,
+                        self._log_drift_once(
+                            seeded_id,
                             seq,
-                            self._source,
-                            exc,
+                            signature=str(exc),
+                            message=(
+                                "event drift for match %s seq %s on source %s: %s "
+                                "(keeping stored row, skipping this event)"
+                            ),
+                            args=(provider_match_id, seq, self._source, exc),
                         )
                 else:
-                    log.error(
-                        "event drift for match %s seq %s on source %s: retroactive "
-                        "event insertion below stored head %s; event NOT written "
-                        "(re-logged every poll it persists)",
-                        provider_match_id,
+                    self._log_drift_once(
+                        seeded_id,
                         seq,
-                        self._source,
-                        head,
+                        signature="retroactive",
+                        message=(
+                            "event drift for match %s seq %s on source %s: retroactive "
+                            "event insertion below stored head %s; event NOT written"
+                        ),
+                        args=(provider_match_id, seq, self._source, head),
                     )
                 continue
             try:
@@ -1132,6 +1146,33 @@ class CollectorEngine:
                 stored_seqs.add(seq)
                 appended_this_batch.add(seq)
         return self._stored_events(seeded_id)
+
+    def _log_drift_once(
+        self,
+        seeded_id: str,
+        seq: int,
+        *,
+        signature: str,
+        message: str,
+        args: tuple[Any, ...],
+    ) -> None:
+        """Log a drift ERROR once per distinct (match, seq) mismatch; repeats stay at DEBUG.
+
+        The stored row is never mutated, so an unresolved drift re-diffs
+        identically on every subsequent poll for the rest of the match —
+        logging it at ERROR every time drowns real signal (a NEW mismatch
+        elsewhere) in noise. The first occurrence of a given ``signature``
+        for a ``(seeded_id, seq)`` pair still logs at ERROR; identical
+        repeats are demoted to DEBUG. If the mismatch itself changes shape
+        (e.g. more columns diverge), the signature changes too and it
+        re-escalates to ERROR as new information.
+        """
+        key = (seeded_id, seq)
+        if self._logged_drift.get(key) == signature:
+            log.debug(message, *args)
+            return
+        self._logged_drift[key] = signature
+        log.error(message, *args)
 
     def _stored_events(self, seeded_id: str) -> list[NormalizedEvent]:
         """Read the ACTUALLY-STORED event rows back as :class:`NormalizedEvent`s.
