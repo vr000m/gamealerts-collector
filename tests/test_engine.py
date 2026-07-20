@@ -1192,12 +1192,14 @@ def test_defensive_malformed_seq_branch_handles_unhashable_seq_without_crashing(
     )
 
 
-def test_logged_drift_is_evicted_on_terminal_match_resolution(tmp_path):
+def test_logged_drift_is_evicted_once_drift_stops_recurring(tmp_path):
     """``self._logged_drift`` is keyed like ``self._cooldowns``/``_transitions``
     (by provider-native match id) specifically so it can be evicted the same
-    way when a match resolves terminally — otherwise drift memory for every
-    match that ever drifted would leak for the life of a long-running
-    collector process."""
+    way — but eviction on a non-live resolution poll must be conditional on the
+    drift having STOPPED recurring. A terminal poll that still re-surfaces the
+    drift keeps the dedup cache (or the persistent drift would re-ERROR every
+    poll); the very next poll on which the drift no longer recurs evicts it, so
+    a finished match's drift memory does not leak for the life of the process."""
     db = tmp_path / "engine.db"
     p1 = nm("m1", (ev(0, "goal"), ev(1, "yellow", detail="Booking"), ev(3, "sub", minute=46)))
     # Poll 2: a retroactive insertion below head — populates self._logged_drift.
@@ -1210,8 +1212,9 @@ def test_logged_drift_is_evicted_on_terminal_match_resolution(tmp_path):
             ev(3, "sub", minute=46),
         ),
     )
-    # Poll 3: the match resolves terminally (FINISHED) — a durable non-live
-    # apply, which must evict this match's self._logged_drift entries.
+    # Poll 3: FINISHED but the retroactive drift STILL recurs (seq 2 is present
+    # again, still not stored) — a durable non-live apply that must NOT wipe the
+    # dedup cache, because the drift is still active this poll.
     p3 = nm(
         "m1",
         (*p2.events,),
@@ -1219,13 +1222,76 @@ def test_logged_drift_is_evicted_on_terminal_match_resolution(tmp_path):
         minute=None,
         display_clock="FT",
     )
-    provider = ScriptedProvider([[p1], [p2], [p3]])
+    # Poll 4: FINISHED and the provider stops re-sending the retroactive event
+    # (the stored 0/1/3 stream). Drift no longer recurs, so the stale cache is
+    # evicted on this resolution poll.
+    p4 = nm(
+        "m1",
+        (ev(0, "goal"), ev(1, "yellow", detail="Booking"), ev(3, "sub", minute=46)),
+        status=MatchStatus.FINISHED,
+        minute=None,
+        display_clock="FT",
+    )
+    provider = ScriptedProvider([[p1], [p2], [p3], [p4]])
     engine = _engine(make_pack(provider), db)
     run_engine(engine, provider)
 
     assert "m1" not in engine._logged_drift, (
-        "a terminally-resolved match's drift memory must be evicted, not leak for the "
-        "life of the process"
+        "once the drift stops recurring, a resolved match's drift memory must be evicted, "
+        "not leak for the life of the process"
+    )
+
+
+def test_non_live_recurring_drift_errors_once_then_warns_across_polls(tmp_path, caplog):
+    """A non-live (FINISHED) match whose SAME unreconcilable drift recurs on
+    every poll must log ERROR once then WARNING — not ERROR every poll.
+
+    Regression guard for the eviction path BETWEEN polls: ``_resolve_tracker``
+    runs on every non-live durable snapshot, and an UNCONDITIONAL
+    ``self._logged_drift`` pop there wiped the dedup cache each poll, so
+    ``_log_drift_once`` re-escalated the identical persistent drift to ERROR
+    every poll — reintroducing the exact spam the dedup exists to damp. Driven
+    through two full non-live ``_apply``/``_on_durable_snapshot`` cycles (polls
+    3 and 4 below), since the bug lives in the eviction between polls, not in
+    ``_reconcile_sequence_conflict`` itself."""
+    db = tmp_path / "engine.db"
+    # Poll 1 live, poll 2 FINISHED (clean transition, no drift). Then polls 3
+    # and 4 are FINISHED snapshots that BOTH re-send the same retroactive seq 2
+    # (below the stored head 3, never stored) — the identical persistent drift.
+    live = nm("m1", (ev(0, "goal"), ev(1, "yellow", detail="Booking"), ev(3, "sub", minute=46)))
+    finished_clean = nm(
+        "m1",
+        (ev(0, "goal"), ev(1, "yellow", detail="Booking"), ev(3, "sub", minute=46)),
+        status=MatchStatus.FINISHED,
+        minute=None,
+        display_clock="FT",
+    )
+    finished_drift = nm(
+        "m1",
+        (
+            ev(0, "goal"),
+            ev(1, "yellow", detail="Booking"),
+            ev(2, "goal", minute=25, detail="VAR-restored"),
+            ev(3, "sub", minute=46),
+        ),
+        status=MatchStatus.FINISHED,
+        minute=None,
+        display_clock="FT",
+    )
+    provider = ScriptedProvider([[live], [finished_clean], [finished_drift], [finished_drift]])
+    engine = _engine(make_pack(provider), db)
+    with caplog.at_level(logging.DEBUG):
+        run_engine(engine, provider)
+
+    retro_records = [
+        r for r in caplog.records if "seq 2" in r.getMessage() and "retroactive" in r.getMessage()
+    ]
+    assert sum(1 for r in retro_records if r.levelno >= logging.ERROR) == 1, (
+        "the identical persistent drift on a non-live match must ERROR exactly once, not "
+        "re-escalate every poll because the dedup cache was wiped by the resolution path"
+    )
+    assert sum(1 for r in retro_records if r.levelno == logging.WARNING) >= 1, (
+        "the recurrence on the next non-live poll must stay at WARNING (loud but alive)"
     )
 
 

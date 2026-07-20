@@ -738,6 +738,16 @@ class CollectorEngine:
         # so _resolve_tracker/_resolve_backfill_tracker can evict a resolved
         # match's entries instead of leaking for the life of the process.
         self._logged_drift: dict[str, dict[Any, str]] = {}
+        # Provider-native match ids whose drift RE-SURFACED during the current
+        # poll (populated by _log_drift_once, cleared at the top of each
+        # poll_once). Read by the eviction helper _evict_match_tracking so a
+        # terminal-resolution/backfill-resolution apply does NOT wipe the
+        # drift-dedup cache of a match whose drift is STILL recurring this poll
+        # — wiping it would re-escalate the same persistent drift to ERROR next
+        # poll (the spam _log_drift_once exists to damp). A match that stops
+        # drifting is absent from this set on its next resolution poll and its
+        # cache is then evicted, so a finished match's memory does not leak.
+        self._drifted_this_poll: set[str] = set()
         self._backoff_multiplier = 1
         # One-time restart scan latch: on the FIRST successful poll the stored
         # matches table is scanned for rows this source left live at shutdown
@@ -816,6 +826,10 @@ class CollectorEngine:
         retroactively-inserted seq) keeps re-diffing and re-logging instead of
         being silently baselined away.
         """
+        # Reset the per-poll drift-recurrence set: only drift observed DURING
+        # this poll gates the eviction helper's drift-cache retention (see
+        # _evict_match_tracking / _log_drift_once).
+        self._drifted_this_poll.clear()
         matches, live_resumptions = self._fetch_poll_snapshots()
         if self._recorder is not None:
             self._recorder.accumulate(matches)
@@ -965,6 +979,26 @@ class CollectorEngine:
             return False
         return bool(reader.get_events_since(self._conn, resolved_id))
 
+    def stored_source_and_has_events(self, match_id: str) -> tuple[str | None, bool]:
+        """Return ``(stored source, has-events)`` for ``match_id`` in ONE resolve.
+
+        The backfill skip-check needs both the stored ``source`` and whether
+        events landed. Calling :meth:`stored_source` and :meth:`has_events`
+        separately re-runs the multi-arm ``_resolve_stored_match_id`` UNION
+        query twice per enumerated match; this resolves the stored id once and
+        answers both, halving the skip-check's SQL round trips. Same
+        ``self._source`` scoping as the two single-answer methods: a row stored
+        under a DIFFERENT source reports ``(None, ...)`` for the source, so a
+        caller must skip only on an exact match to its own ``source``.
+        """
+        resolved_id = self._resolve_stored_match_id(match_id)
+        if resolved_id is None:
+            return None, False
+        row = reader.get_state(self._conn, resolved_id)
+        source = row["source"] if row is not None else None
+        has_events = bool(reader.get_events_since(self._conn, resolved_id))
+        return source, has_events
+
     def apply_one_off_match(
         self, scoreboard: NormalizedMatch, detail: NormalizedMatch
     ) -> NormalizedMatch | None:
@@ -983,10 +1017,13 @@ class CollectorEngine:
         """
         merged = _merge_detail(scoreboard, detail)
         diff = diff_match(merged, None)
-        return self._apply(diff)
+        # side_tables_first: a one-shot finished match must be applied
+        # all-or-(events-)nothing so the backfill skip-check's has_events()
+        # proxy reliably means "fully stored" — see _apply's docstring.
+        return self._apply(diff, side_tables_first=True)
 
-    def _apply(self, diff: MatchDiff) -> NormalizedMatch | None:
-        """Seed the match through the pack hook, then append its new events.
+    def _apply(self, diff: MatchDiff, *, side_tables_first: bool = False) -> NormalizedMatch | None:
+        """Seed the match through the pack hook, then persist events + side tables.
 
         Returns the snapshot the caller should advance the diff baseline to:
         the incoming snapshot on a clean write, a snapshot whose event list is
@@ -998,6 +1035,24 @@ class CollectorEngine:
         returned when the pack's ``persist_side_tables`` hook raises: the
         failure is logged (never fatal to the daemon) and the un-advanced
         baseline gives side-table persistence a retry on the next poll.
+
+        ``side_tables_first`` swaps the order of the two child writes:
+
+        * The live poll loop (default, ``False``) writes EVENTS FIRST — they
+          are the primary data and must be streamed the moment they are
+          observed; the side-table persist is best-effort with an independent
+          next-poll retry, so a side-table failure never costs already-observed
+          events.
+        * The one-shot backfill path (``True``, via
+          :meth:`apply_one_off_match`) persists SIDE TABLES FIRST, so a
+          side-table failure leaves NO events stored either. Backfill's
+          skip-check uses ``has_events()`` as its "already fully stored" proxy;
+          writing events last makes that proxy reliable — a match whose side
+          tables were stranded reports ``has_events()`` ``False`` and is
+          retried on a rerun instead of being silently skipped with its
+          stats/lineups/venue permanently lost. A finished match is applied
+          once (no incremental streaming), so the live path's events-first
+          priority does not apply here.
         """
         match = diff.match
         seeded_id = self._pack.seed_match(self._conn, self._writer, match)
@@ -1011,6 +1066,29 @@ class CollectorEngine:
                 self._source,
             )
             return None
+
+        if side_tables_first:
+            if not self._persist_side_tables_guarded(match, seeded_id):
+                return None
+            return self._append_new_events(seeded_id, diff)
+
+        baseline = self._append_new_events(seeded_id, diff)
+        if not self._persist_side_tables_guarded(match, seeded_id):
+            return None
+        return baseline
+
+    def _append_new_events(self, seeded_id: str, diff: MatchDiff) -> NormalizedMatch:
+        """Append a diff's new events; return the snapshot to baseline from.
+
+        On a clean append the baseline is the incoming snapshot; on a
+        sequence-drift rejection the batch is reconciled against the stored
+        rows and the baseline is rebuilt from what is ACTUALLY stored so
+        unresolved drift keeps re-diffing (and re-logging) every poll instead
+        of being silently accepted. Writer rejections other than
+        :class:`SequenceError` propagate (caught by ``poll_once``'s per-match
+        isolation).
+        """
+        match = diff.match
         baseline = match
         if diff.new_events:
             rows = [_event_to_row(e) for e in diff.new_events]
@@ -1028,28 +1106,32 @@ class CollectorEngine:
                 # re-logs) every poll instead of being silently accepted.
                 stored_events = self._reconcile_sequence_conflict(seeded_id, match.match_id, rows)
                 baseline = replace(match, events=stored_events)
+        return baseline
+
+    def _persist_side_tables_guarded(self, match: NormalizedMatch, seeded_id: str) -> bool:
+        """Run the pack's ``persist_side_tables`` hook; return whether it succeeded.
+
+        A pack hook must never kill the daemon (a malformed payload value
+        binding into sqlite raises InterfaceError, for example). A failure is
+        logged and reported as ``False`` so the caller returns ``None`` and
+        leaves the diff baseline un-advanced: the next poll (or backfill
+        rerun) re-diffs the full match, the idempotent core append is a no-op,
+        and the side-table hook gets a natural retry.
+        """
         try:
             self._pack.persist_side_tables(self._conn, self._writer, match, seeded_id)
         except Exception as exc:
-            # A pack hook must never kill the daemon (a malformed payload
-            # value binding into sqlite raises InterfaceError, for example).
-            # Core writes above already committed in their own transactions,
-            # so failing here would otherwise leave durable core state with
-            # missing/stale side tables and NO retry path. Returning None
-            # keeps the baseline un-advanced: the next poll re-diffs the full
-            # match, the idempotent core appends no-op, and the side-table
-            # hook gets a natural retry.
             log.error(
                 "persist_side_tables failed for match %s (seeded id %s) on source %s: %s "
-                "(baseline not advanced; side tables retried next poll)",
+                "(baseline not advanced; side tables retried next poll/rerun)",
                 match.match_id,
                 seeded_id,
                 self._source,
                 exc,
                 exc_info=True,
             )
-            return None
-        return baseline
+            return False
+        return True
 
     def _reconcile_sequence_conflict(
         self, seeded_id: str, provider_match_id: str, rows: list[dict[str, Any]]
@@ -1118,7 +1200,7 @@ class CollectorEngine:
                         self._log_drift_once(
                             provider_match_id,
                             seq,
-                            signature=f"conflict:{repr(sorted(row.items()))}",
+                            signature=self._drift_signature("conflict", row),
                             message=(
                                 "event drift for match %s seq %s on source %s: %s "
                                 "(keeping stored row, skipping this event)"
@@ -1137,7 +1219,7 @@ class CollectorEngine:
                     self._log_drift_once(
                         provider_match_id,
                         seq,
-                        signature=f"retroactive:{repr(sorted(row.items()))}",
+                        signature=self._drift_signature("retroactive", row),
                         message=(
                             "event drift for match %s seq %s on source %s: retroactive "
                             "event insertion below stored head %s; event NOT written"
@@ -1153,7 +1235,7 @@ class CollectorEngine:
                 self._log_drift_once(
                     provider_match_id,
                     seq,
-                    signature=f"malformed:{repr(sorted(row.items()))}",
+                    signature=self._drift_signature("malformed", row),
                     message=(
                         "event drift for match %s seq %s on source %s: %s (skipping this event)"
                     ),
@@ -1165,6 +1247,20 @@ class CollectorEngine:
                 stored_seqs.add(seq)
                 appended_this_batch.add(seq)
         return self._stored_events(seeded_id)
+
+    @staticmethod
+    def _drift_signature(kind: str, row: dict[str, Any]) -> str:
+        """Build a drift-dedup signature capturing the incoming row's FULL content.
+
+        ``kind`` is the drift class (``"conflict"``/``"retroactive"``/
+        ``"malformed"``); the row's sorted items follow, so a re-drift with
+        genuinely different content (a new wrong value on the same column, a
+        different retroactive event) re-escalates to ERROR rather than being
+        demoted against a coarser signature — see :meth:`_log_drift_once`. The
+        three :meth:`_reconcile_sequence_conflict` call sites share this one
+        builder so the signatures cannot drift apart in shape.
+        """
+        return f"{kind}:{repr(sorted(row.items()))}"
 
     def _log_drift_once(
         self,
@@ -1206,6 +1302,10 @@ class CollectorEngine:
         without this, drift memory for finished matches would linger for the
         life of the process.
         """
+        # Record that drift re-surfaced for this match THIS poll so the
+        # eviction helper does not wipe the dedup cache out from under a still-
+        # recurring drift on a non-live match (see _evict_match_tracking).
+        self._drifted_this_poll.add(provider_match_id)
         key = seq if isinstance(seq, Hashable) else repr(seq)
         match_signatures = self._logged_drift.setdefault(provider_match_id, {})
         if match_signatures.get(key) == signature:
@@ -2103,6 +2203,30 @@ class CollectorEngine:
         tracker.consecutive_failures += 1
         return tracker
 
+    def _evict_match_tracking(self, match_id: str, *, force_drift: bool = False) -> None:
+        """Drop a match's cooldown entry and, when safe, its drift-dedup memory.
+
+        The single owner of paired ``self._cooldowns`` + ``self._logged_drift``
+        eviction, used by all three eviction sites (:meth:`_resolve_tracker`,
+        :meth:`_resolve_backfill_tracker`, and the expired-unseen purge in
+        :meth:`_age_cooldowns`) so the two maps are never popped out of step by
+        a hand-written pair that forgets one.
+
+        The cooldown entry is always removed. ``self._logged_drift`` is removed
+        only when the match did NOT drift during the CURRENT poll — a
+        still-recurring drift on a now-non-live match must keep its dedup cache,
+        or the next poll re-escalates the same drift to ERROR (the spam
+        :meth:`_log_drift_once` exists to damp). ``force_drift=True`` bypasses
+        that check for the expired-unseen purge, where the match has been absent
+        for a full cap-length window and is genuinely gone (nothing is drifting
+        it any more, so the memory is pure leak). A drift that has stopped
+        recurring is evicted on the match's next resolution poll (it is absent
+        from ``_drifted_this_poll`` then), so a finished match does not leak.
+        """
+        self._cooldowns.pop(match_id, None)
+        if force_drift or match_id not in self._drifted_this_poll:
+            self._logged_drift.pop(match_id, None)
+
     def _age_cooldowns(self, slate_ids: set[str]) -> None:
         """Decrement every active abandonment cooldown by one poll (floor 0).
 
@@ -2141,8 +2265,9 @@ class CollectorEngine:
             if cooldown.expired_unseen >= _COOLDOWN_MAX_POLLS:
                 purge.append(match_id)
         for match_id in purge:
-            del self._cooldowns[match_id]
-            self._logged_drift.pop(match_id, None)
+            # Genuinely retired (unseen a full cap window): force-evict the
+            # drift cache too — nothing is drifting the match any more.
+            self._evict_match_tracking(match_id, force_drift=True)
 
     def _cooling_down(self, match_id: str) -> bool:
         """True while ``match_id`` is within an unexpired abandonment cooldown."""
@@ -2688,8 +2813,13 @@ class CollectorEngine:
         on live status — see that method's docstring for why it must not be
         gated behind this (non-live-only) method.
         """
-        self._cooldowns.pop(match_id, None)
-        self._logged_drift.pop(match_id, None)
+        # Evict the cooldown always; evict the drift-dedup cache only when the
+        # drift is NOT still recurring this poll (see _evict_match_tracking) —
+        # this method runs on EVERY non-live durable snapshot, including every
+        # poll of a FINISHED match whose provider keeps re-sending an
+        # unreconcilable event, and an unconditional drift pop here would
+        # re-ERROR that persistent drift every single poll.
+        self._evict_match_tracking(match_id)
         tracker = self._transitions.pop(match_id, None)
         if tracker is None or not tracker.give_up_pending:
             return
@@ -2735,8 +2865,9 @@ class CollectorEngine:
         """
         tracker = self._backfill.pop(match_id, None)
         if tracker is not None:
-            self._cooldowns.pop(match_id, None)
-            self._logged_drift.pop(match_id, None)
+            # Same eviction discipline as _resolve_tracker: keep the drift
+            # cache if the drift is still recurring this poll.
+            self._evict_match_tracking(match_id)
         if tracker is None or not tracker.give_up_pending:
             return
         log.error(

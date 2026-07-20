@@ -124,9 +124,15 @@ def run_backfill(
     next chunk rather than aborting the whole run.
 
     For each enumerated terminal match: skipped (counted in
-    ``already_stored_skipped``) only when ``engine.stored_source(match_id) ==
-    source`` AND ``engine.has_events(match_id)`` — a same-source stored row
-    with zero events is retried, not skipped. Otherwise sleeps
+    ``already_stored_skipped``) only when the stored ``source`` equals this
+    run's ``source`` AND events landed — resolved in a single
+    ``engine.stored_source_and_has_events(match_id)`` call (one stored-id
+    resolution instead of two). A same-source stored row with zero events is
+    retried, not skipped. ``has_events`` is a RELIABLE "already fully stored"
+    proxy because :meth:`CollectorEngine.apply_one_off_match` writes events
+    LAST (``side_tables_first``): a match whose side-table persist failed has
+    no stored events either, so it is retried on a rerun rather than skipped
+    with its stats/lineups/venue stranded. Otherwise sleeps
     ``request_delay`` seconds (rate-limit mitigation), fetches full detail
     via ``provider.fetch_match_detail(match_id)``, and applies via
     ``engine.apply_one_off_match(scoreboard, detail)``. The whole per-match
@@ -175,7 +181,8 @@ def run_backfill(
             match_id = match.match_id
 
             try:
-                if engine.stored_source(match_id) == source and engine.has_events(match_id):
+                stored_source, has_events = engine.stored_source_and_has_events(match_id)
+                if stored_source == source and has_events:
                     already_stored_skipped += 1
                     continue
                 if request_delay:

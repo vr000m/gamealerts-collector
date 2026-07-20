@@ -227,6 +227,11 @@ class FakeEngine:
         entry = self._stored.get(match_id)
         return entry[1] if entry else False
 
+    def stored_source_and_has_events(self, match_id: str) -> tuple[str | None, bool]:
+        # Route through the two single-answer methods so stored_raises still
+        # raises from the skip-check exactly as before the combined call.
+        return self.stored_source(match_id), self.has_events(match_id)
+
     def apply_one_off_match(
         self, scoreboard: NormalizedMatch, detail: NormalizedMatch
     ) -> NormalizedMatch | None:
@@ -462,6 +467,72 @@ def test_run_backfill_cross_partition_error_propagates_uncaught_not_swallowed_in
     )
     with pytest.raises(CrossPartitionError):
         backfill.run_backfill(engine, provider, ["20260601"], source=SOURCE, request_delay=0.0)
+
+
+def test_run_backfill_side_table_failure_is_retried_not_skipped(tmp_path):
+    """Finding 1 regression: a ``persist_side_tables`` failure must not strand
+    side-table data with no retry path.
+
+    ``apply_one_off_match`` writes events LAST (``side_tables_first``), so a
+    first-run side-table failure leaves NO events stored — the skip-check's
+    ``has_events()`` proxy then correctly reports "not fully stored" and a
+    SECOND ``run_backfill`` retries the match (re-running the side-table
+    persist to success) instead of silently skipping it as already-stored and
+    leaving its stats/lineups/venue lost forever.
+    """
+
+    side_ddl = (
+        "CREATE TABLE IF NOT EXISTS bf_side ("
+        "source TEXT NOT NULL, match_id TEXT NOT NULL, val TEXT, "
+        "PRIMARY KEY (source, match_id));",
+    )
+    persist_calls = {"n": 0}
+
+    def flaky_persist(conn, writer, match: NormalizedMatch, seeded_id: str) -> None:
+        persist_calls["n"] += 1
+        if persist_calls["n"] == 1:
+            raise RuntimeError("transient side-table write failure")
+        with conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO bf_side (source, match_id, val) VALUES (?, ?, ?)",
+                (writer.source, seeded_id, "persisted"),
+            )
+
+    pack = SportPack(
+        name="backfill-sidetable-test",
+        sport="football",
+        provider_factory=NullProvider,
+        taxonomy=TAXONOMY,
+        prompt_fragments={"x": "y"},
+        preference_schema={"type": "object"},
+        display_metadata={"sport_display": "Football"},
+        compaction_boundaries=["kickoff"],
+        side_table_ddl=side_ddl,
+        persist_side_tables=flaky_persist,
+    )
+    finished = nm("m1", (ev(0, "goal"),), status=MatchStatus.FINISHED)
+    provider = FakeScheduleProvider({"20260601": [finished]}, details={"m1": finished})
+    engine = CollectorEngine(pack, str(tmp_path / "bf.db"), SOURCE, 30.0, provider=NullProvider())
+    try:
+        # Run 1: side-table persist fails → events NOT stored (side_tables_first),
+        # match recorded as failed, side table empty.
+        r1 = backfill.run_backfill(engine, provider, ["20260601"], source=SOURCE, request_delay=0.0)
+        assert set(r1.failed) == {"m1"}
+        assert engine.has_events("m1") is False, (
+            "events must not land when the side-table persist fails, so the skip-check "
+            "proxy correctly reports the match as not fully stored"
+        )
+        assert engine._conn.execute("SELECT COUNT(*) FROM bf_side").fetchone()[0] == 0
+
+        # Run 2: the eventless/side-tableless row must NOT be skipped; the retry
+        # persists both the side table AND the events.
+        r2 = backfill.run_backfill(engine, provider, ["20260601"], source=SOURCE, request_delay=0.0)
+        assert r2.already_stored_skipped == 0, "a match with stranded side tables must be retried"
+        assert r2.applied == 1
+        assert engine.has_events("m1") is True
+        assert engine._conn.execute("SELECT val FROM bf_side").fetchone()[0] == "persisted"
+    finally:
+        engine.close()
 
 
 # --------------------------------------------------------------------------- #

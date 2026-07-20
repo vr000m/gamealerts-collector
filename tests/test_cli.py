@@ -1082,6 +1082,9 @@ class _FakeBackfillEngine:
     def has_events(self, match_id: str) -> bool:
         return False
 
+    def stored_source_and_has_events(self, match_id: str) -> tuple[str | None, bool]:
+        return None, False
+
     def apply_one_off_match(self, scoreboard: NormalizedMatch, detail: NormalizedMatch) -> Any:
         self.apply_calls.append((scoreboard, detail))
         if self._apply_raises is not None:
