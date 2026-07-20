@@ -118,8 +118,10 @@ def run_backfill(
     drifted from the engine it is driving fails loudly rather than silently
     reading one partition while writing another.
 
-    For each date chunk, ``provider.fetch_schedule(dates=chunk)`` is wrapped
-    in a try/except: a chunk-level failure is recorded in
+    For each date chunk, ``request_delay`` seconds are slept immediately
+    before ``provider.fetch_schedule(dates=chunk)`` (rate-limit mitigation for
+    the scoreboard call, mirroring the per-match throttle), and the fetch is
+    wrapped in a try/except: a chunk-level failure is recorded in
     :attr:`BackfillReport.failed_chunks` and enumeration continues with the
     next chunk rather than aborting the whole run.
 
@@ -165,6 +167,13 @@ def run_backfill(
     failed_chunks: list[tuple[str, Exception]] = []
 
     for chunk in date_chunks:
+        # Throttle the per-chunk scoreboard fetch the same way the per-match
+        # loop throttles fetch_match_detail below (sleep immediately before the
+        # fetch): a date range of many empty/low-yield chunks would otherwise
+        # issue back-to-back fetch_schedule requests with zero delay and risk
+        # provider rate-limiting on large backfills.
+        if request_delay:
+            time.sleep(request_delay)
         try:
             matches = _fetch_terminal_matches(provider, chunk)
         except MissingScheduleSupportError:

@@ -448,6 +448,43 @@ def test_run_backfill_fetch_schedule_failure_on_one_chunk_records_failed_chunk_a
     assert report.applied == 1
 
 
+def test_run_backfill_throttles_before_each_fetch_schedule(monkeypatch):
+    """Round 3 review finding: request_delay was applied only before
+    ``fetch_match_detail`` inside the per-match loop, so the per-chunk
+    ``fetch_schedule`` scoreboard calls fired back-to-back with zero delay — a
+    date range of many empty/low-yield chunks would hammer the provider and
+    risk rate-limiting. The throttle must also gate each chunk's fetch_schedule.
+
+    Empty slates for every chunk mean NO matches, so the only possible sleeps
+    come from the per-chunk throttle; a combined event log pins that the sleep
+    lands BEFORE each fetch_schedule call, mirroring the per-match convention
+    (sleep immediately before the fetch)."""
+    provider = FakeScheduleProvider({})
+    engine = FakeEngine(SOURCE)
+
+    events: list[str] = []
+    monkeypatch.setattr(backfill.time, "sleep", lambda seconds: events.append(f"sleep:{seconds}"))
+    original_fetch = provider.fetch_schedule
+
+    def logged_fetch(*, dates: str):
+        events.append(f"schedule:{dates}")
+        return original_fetch(dates=dates)
+
+    monkeypatch.setattr(provider, "fetch_schedule", logged_fetch)
+
+    chunks = ["20260601", "20260602", "20260603"]
+    backfill.run_backfill(engine, provider, chunks, source=SOURCE, request_delay=0.5)
+
+    assert events == [
+        "sleep:0.5",
+        "schedule:20260601",
+        "sleep:0.5",
+        "schedule:20260602",
+        "sleep:0.5",
+        "schedule:20260603",
+    ], "request_delay must be applied before each chunk's fetch_schedule, not only before detail"
+
+
 class FailFirstThenSucceedEngine:
     """Engine double whose ``apply_one_off_match`` fails the FIRST time it sees
     a given match_id and succeeds on every later encounter.
