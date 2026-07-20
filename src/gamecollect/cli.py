@@ -334,19 +334,25 @@ def _run_read(op: Operation, args: argparse.Namespace) -> int:
     ``client.get_vocabulary``) can raise ``PackError``/``PackNotFoundError``
     for an unknown or malformed pack. Surface that as the same clean one-line
     stderr error + exit 2 that ``collect``/``backfill`` produce (see
-    :func:`_resolve_pack`) rather than a raw traceback. Only ops carrying a
-    ``pack`` param can raise this, so ``kwargs['pack']`` is always present when
-    it does; ops that never load a pack never enter these handlers.
+    :func:`_resolve_pack`) rather than a raw traceback. Every op that raises
+    these today carries a ``pack`` param, but nothing in ``registry.py``
+    structurally guarantees that pairing, so the message reads the pack name
+    defensively via ``kwargs.get`` — a future op that loads a pack under a
+    differently-named (or no) param degrades to a slightly-less-precise
+    message instead of a ``KeyError`` masking the real pack error.
     """
     kwargs = {param.name: getattr(args, param.name) for param in op.params}
     conn = reader.open_reader(args.db)
     try:
         result = op.impl(conn, **kwargs)
     except PackNotFoundError:
-        print(f"error: no pack named {kwargs['pack']!r}", file=sys.stderr)
+        print(f"error: no pack named {kwargs.get('pack', '<unknown>')!r}", file=sys.stderr)
         return 2
     except PackError as exc:
-        print(f"error: pack {kwargs['pack']!r} failed to load: {exc}", file=sys.stderr)
+        print(
+            f"error: pack {kwargs.get('pack', '<unknown>')!r} failed to load: {exc}",
+            file=sys.stderr,
+        )
         return 2
     finally:
         conn.close()
