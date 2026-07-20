@@ -1284,9 +1284,7 @@ class TestMigratableSideTablesDerivation:
             _MIGRATABLE_SIDE_TABLES,
         )
 
-        match_keyed_names = {
-            name for name, match_keyed, _ddl in _FOOTBALL_SIDE_TABLE_SPECS if match_keyed
-        }
+        match_keyed_names = {spec.name for spec in _FOOTBALL_SIDE_TABLE_SPECS if spec.match_keyed}
         assert set(_MIGRATABLE_SIDE_TABLES) == match_keyed_names
         # football_roster is team-keyed and must NOT be migratable.
         assert "football_roster" not in _MIGRATABLE_SIDE_TABLES
@@ -1295,108 +1293,76 @@ class TestMigratableSideTablesDerivation:
         """Simulates adding a new match-keyed side table: derive a fresh
         _MIGRATABLE_SIDE_TABLES from specs + one fake extra entry, exactly as
         reconcile.py itself does at import time, and assert the new table is
-        included with zero additional hand-editing."""
-        from gamecollect_football.reconcile import _FOOTBALL_SIDE_TABLE_SPECS
+        included with zero additional hand-editing. ``match_keyed`` is now
+        DERIVED from the DDL, so the fake table declares a real match_id
+        column instead of a hand-set flag."""
+        from gamecollect_football.reconcile import _FOOTBALL_SIDE_TABLE_SPECS, SideTableSpec
 
         fake_specs = (
             *_FOOTBALL_SIDE_TABLE_SPECS,
-            (
+            SideTableSpec(
                 "football_fake_new_table",
-                True,
-                "CREATE TABLE IF NOT EXISTS football_fake_new_table (x TEXT);",
+                "CREATE TABLE IF NOT EXISTS football_fake_new_table "
+                "(source TEXT, match_id TEXT, x TEXT);",
             ),
         )
-        derived = tuple(name for name, match_keyed, _ddl in fake_specs if match_keyed)
+        derived = tuple(spec.name for spec in fake_specs if spec.match_keyed)
         assert "football_fake_new_table" in derived
 
 
-class TestSideTableSpecStructuralValidation:
-    """Round 2 review finding: the derivation tests above are tautological —
-    they re-derive the same filter production code uses, so a wrong
-    ``match_keyed`` TAG (as opposed to a missing spec entry) is never caught.
-    ``test_a_new_match_keyed_spec_is_automatically_migratable`` above even
-    feeds the mechanism a fabricated table with NO ``match_id`` column tagged
-    ``match_keyed=True`` and it is accepted as migratable. This class checks
-    the structural cross-check added in reconcile.py
-    (``_assert_side_table_specs_structurally_consistent``, run at import time
-    over the real specs) actually rejects a mistagged entry like that one."""
+class TestSideTableSpecMatchKeyedDerivation:
+    """``SideTableSpec.match_keyed`` is DERIVED from the DDL (not a hand-set
+    boolean cross-checked at import time), so the tag can never drift from the
+    DDL beside it — the two-sources-of-truth problem the old
+    ``_assert_side_table_specs_structurally_consistent`` guarded is now
+    structurally impossible. These pin the derivation itself."""
 
-    def test_real_specs_pass_structural_validation(self):
-        """The production specs must already satisfy their own validator —
-        this is what actually runs at import time (see reconcile.py's
-        module-level call), so a regression here would fail on every import,
-        not just in this test."""
-        from gamecollect_football.reconcile import (
-            _FOOTBALL_SIDE_TABLE_SPECS,
-            _assert_side_table_specs_structurally_consistent,
+    def test_real_specs_derive_expected_match_keyed(self):
+        from gamecollect_football.reconcile import _FOOTBALL_SIDE_TABLE_SPECS
+
+        by_name = {spec.name: spec.match_keyed for spec in _FOOTBALL_SIDE_TABLE_SPECS}
+        assert by_name["football_stats"] is True
+        assert by_name["football_lineups"] is True
+        assert by_name["football_venue"] is True
+        # football_roster is deliberately team-keyed (PRIMARY KEY (team, number)).
+        assert by_name["football_roster"] is False
+
+    def test_match_id_column_derives_match_keyed_true(self):
+        from gamecollect_football.reconcile import SideTableSpec
+
+        spec = SideTableSpec(
+            "football_fake_match_keyed_table",
+            "CREATE TABLE IF NOT EXISTS football_fake_match_keyed_table "
+            "(source TEXT, match_id TEXT);",
         )
+        assert spec.match_keyed is True
 
-        _assert_side_table_specs_structurally_consistent(_FOOTBALL_SIDE_TABLE_SPECS)
+    def test_no_match_id_column_derives_match_keyed_false(self):
+        from gamecollect_football.reconcile import SideTableSpec
 
-    def test_match_keyed_true_without_match_id_column_is_rejected(self):
-        """The exact fabricated table from the test above — no match_id
-        column, tagged match_keyed=True — must now fail loudly."""
-        from gamecollect_football.reconcile import (
-            SideTableSpec,
-            _assert_side_table_specs_structurally_consistent,
+        spec = SideTableSpec(
+            "football_fake_new_table",
+            "CREATE TABLE IF NOT EXISTS football_fake_new_table (x TEXT);",
         )
-
-        bad_specs = (
-            SideTableSpec(
-                "football_fake_new_table",
-                True,
-                "CREATE TABLE IF NOT EXISTS football_fake_new_table (x TEXT);",
-            ),
-        )
-        with pytest.raises(AssertionError, match="match_id"):
-            _assert_side_table_specs_structurally_consistent(bad_specs)
-
-    def test_match_keyed_false_with_match_id_column_is_rejected(self):
-        """The reverse mistag: a table that DOES declare match_id but is
-        tagged match_keyed=False must also fail loudly."""
-        from gamecollect_football.reconcile import (
-            SideTableSpec,
-            _assert_side_table_specs_structurally_consistent,
-        )
-
-        bad_specs = (
-            SideTableSpec(
-                "football_fake_match_keyed_table",
-                False,
-                "CREATE TABLE IF NOT EXISTS football_fake_match_keyed_table "
-                "(source TEXT, match_id TEXT);",
-            ),
-        )
-        with pytest.raises(AssertionError, match="match_id"):
-            _assert_side_table_specs_structurally_consistent(bad_specs)
+        assert spec.match_keyed is False
 
     def test_match_id_mention_in_block_comment_is_not_a_false_positive(self):
-        """Round 3 review finding: the comment-stripping only handled `--`
-        line comments before checking for a `match_id` column mention. A
-        `/* ... */` block comment that mentions "match_id" in prose (while
-        the table itself genuinely has no such column) must NOT trip the
-        match_keyed=False branch — this pins that block comments are also
-        stripped before the substring check runs."""
-        from gamecollect_football.reconcile import (
-            SideTableSpec,
-            _assert_side_table_specs_structurally_consistent,
-        )
+        """The comment-stripping must cover `/* ... */` block comments: a
+        table that mentions "match_id" only in prose (while genuinely
+        team-keyed) must derive match_keyed=False, not be misclassified as
+        match-keyed."""
+        from gamecollect_football.reconcile import SideTableSpec
 
-        specs = (
-            SideTableSpec(
-                "football_fake_team_keyed_table",
-                False,
-                """
-                CREATE TABLE IF NOT EXISTS football_fake_team_keyed_table (
-                    /* mirrors the match_id join used elsewhere, but this
-                       table is deliberately team-keyed, not match-keyed */
-                    team TEXT NOT NULL,
-                    value TEXT,
-                    PRIMARY KEY (team)
-                );
-                """,
-            ),
+        spec = SideTableSpec(
+            "football_fake_team_keyed_table",
+            """
+            CREATE TABLE IF NOT EXISTS football_fake_team_keyed_table (
+                /* mirrors the match_id join used elsewhere, but this
+                   table is deliberately team-keyed, not match-keyed */
+                team TEXT NOT NULL,
+                value TEXT,
+                PRIMARY KEY (team)
+            );
+            """,
         )
-        # Must not raise: the mention of "match_id" is inside a block
-        # comment, not a real column.
-        _assert_side_table_specs_structurally_consistent(specs)
+        assert spec.match_keyed is False

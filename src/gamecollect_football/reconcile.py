@@ -39,7 +39,6 @@ from gamecollect.db.writer import PartitionWriter
 from gamecollect.fold import fold
 from gamecollect.provider import NormalizedMatch, merge_payload_preserving_richer
 
-
 # Pack-owned side tables (typed homes for the football-specific shapes the
 # adapter carries in NormalizedMatch.payload: boxscore stats and lineups).
 # Additive + idempotent (CREATE TABLE IF NOT EXISTS); soft refs mirror the
@@ -59,68 +58,51 @@ from gamecollect.provider import NormalizedMatch, merge_payload_preserving_riche
 # instead of two hand-synced lists that can drift (this exact drift bug fired
 # once already: football_venue was omitted from a hand-maintained migration
 # tuple).
-class SideTableSpec(NamedTuple):
-    """One football pack-owned side table's migration-relevant metadata.
-
-    A ``NamedTuple`` (not a bare 3-tuple) so the two unpack sites
-    (``FOOTBALL_SIDE_TABLE_DDL`` below, ``_MIGRATABLE_SIDE_TABLES`` in this
-    module) are self-documenting and IDE-checkable against field reordering."""
-
-    name: str
-    match_keyed: bool
-    ddl: str
-
-
 # Strips SQL line comments (`-- ...` to end of line) and block comments
 # (`/* ... */`, possibly spanning multiple lines) before the match_id check
-# below — a DDL string's PROSE comment can legitimately mention "match_id"
-# (e.g. football_roster's DDL explains it is deliberately unscoped by
-# match_id) without the table declaring any such column; only checking live
-# (non-comment) text avoids a false positive there.
+# in SideTableSpec.match_keyed — a DDL string's PROSE comment can legitimately
+# mention "match_id" (e.g. football_roster's DDL explains it is deliberately
+# unscoped by match_id) without the table declaring any such column; only
+# checking live (non-comment) text avoids a false positive there.
 _SQL_LINE_COMMENT_RE = re.compile(r"--[^\n]*")
 _SQL_BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
 
 # A heuristic (substring, not a SQL parser) check that a bare `match_id`
-# column name appears in the DDL (column declaration or PRIMARY KEY clause)
-# — enough to catch an obviously wrong match_keyed tag (e.g. a table with no
-# match_id column tagged match_keyed=True, or vice versa) without needing
-# real DDL parsing.
+# column name appears in the DDL (column declaration or PRIMARY KEY clause).
 _MATCH_ID_COLUMN_RE = re.compile(r"\bmatch_id\b")
 
 
-def _assert_side_table_specs_structurally_consistent(
-    specs: tuple[SideTableSpec, ...],
-) -> None:
-    """Guard against ``match_keyed`` drifting from the DDL sitting next to it.
+class SideTableSpec(NamedTuple):
+    """One football pack-owned side table: its name and CREATE TABLE DDL.
 
-    ``match_keyed`` is a hand-set boolean (see the module comment above) with
-    nothing else checking it against the DDL string — a mistagged entry would
-    otherwise migrate (or fail to migrate) that table's rows on stub adoption
-    with no loud failure. Runs at import time so a wrong tag on a newly added
-    table fails immediately, not only if/when stub adoption happens to
-    exercise it."""
-    for spec in specs:
-        ddl_without_comments = _SQL_BLOCK_COMMENT_RE.sub("", spec.ddl)
+    A ``NamedTuple`` (not a bare 2-tuple) so the unpack sites
+    (``FOOTBALL_SIDE_TABLE_DDL`` below, ``_MIGRATABLE_SIDE_TABLES`` in this
+    module) are self-documenting and IDE-checkable against field reordering."""
+
+    name: str
+    ddl: str
+
+    @property
+    def match_keyed(self) -> bool:
+        """Whether the table is match-keyed (soft ref to ``matches.match_id``).
+
+        DERIVED structurally from the DDL — not a hand-set flag — so it can
+        never drift from the DDL sitting beside it (the two-sources-of-truth
+        bug a hand-set boolean + import-time cross-checker previously guarded
+        against; deriving removes both). A match-keyed table's per-match rows
+        must migrate when a stub is adopted onto a late-appearing canonical
+        schedule row (see :func:`_adopt_stub_rows` / ``_MIGRATABLE_SIDE_TABLES``);
+        a team-keyed table (one row per team, e.g. ``football_roster``) has no
+        per-match row to migrate. SQL comments are stripped first so DDL prose
+        mentioning "match_id" does not false-positive."""
+        ddl_without_comments = _SQL_BLOCK_COMMENT_RE.sub("", self.ddl)
         ddl_without_comments = _SQL_LINE_COMMENT_RE.sub("", ddl_without_comments)
-        has_match_id = _MATCH_ID_COLUMN_RE.search(ddl_without_comments) is not None
-        if spec.match_keyed and not has_match_id:
-            raise AssertionError(
-                f"{spec.name!r} is tagged match_keyed=True but its DDL declares no "
-                "match_id column — _adopt_stub_rows would migrate a table that "
-                "structurally isn't match-keyed"
-            )
-        if not spec.match_keyed and has_match_id:
-            raise AssertionError(
-                f"{spec.name!r} is tagged match_keyed=False but its DDL declares a "
-                "match_id column — _adopt_stub_rows would SKIP migrating a table "
-                "that structurally is match-keyed"
-            )
+        return _MATCH_ID_COLUMN_RE.search(ddl_without_comments) is not None
 
 
 _FOOTBALL_SIDE_TABLE_SPECS: tuple[SideTableSpec, ...] = (
     SideTableSpec(
         "football_stats",
-        True,
         """
     CREATE TABLE IF NOT EXISTS football_stats (
         source          TEXT NOT NULL,
@@ -140,7 +122,6 @@ _FOOTBALL_SIDE_TABLE_SPECS: tuple[SideTableSpec, ...] = (
     ),
     SideTableSpec(
         "football_lineups",
-        True,
         """
     CREATE TABLE IF NOT EXISTS football_lineups (
         source          TEXT NOT NULL,
@@ -165,7 +146,6 @@ _FOOTBALL_SIDE_TABLE_SPECS: tuple[SideTableSpec, ...] = (
     ),
     SideTableSpec(
         "football_venue",
-        True,
         """
     CREATE TABLE IF NOT EXISTS football_venue (
         source          TEXT NOT NULL,
@@ -178,7 +158,6 @@ _FOOTBALL_SIDE_TABLE_SPECS: tuple[SideTableSpec, ...] = (
     ),
     SideTableSpec(
         "football_roster",
-        False,
         """
     CREATE TABLE IF NOT EXISTS football_roster (
         -- Team-level squad data (static tournament fixture, NOT per-match) —
@@ -199,8 +178,6 @@ _FOOTBALL_SIDE_TABLE_SPECS: tuple[SideTableSpec, ...] = (
     """,
     ),
 )
-
-_assert_side_table_specs_structurally_consistent(_FOOTBALL_SIDE_TABLE_SPECS)
 
 FOOTBALL_SIDE_TABLE_DDL: tuple[str, ...] = tuple(spec.ddl for spec in _FOOTBALL_SIDE_TABLE_SPECS)
 

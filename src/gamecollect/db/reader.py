@@ -48,6 +48,7 @@ __all__ = [
     "get_side_table_row",
     "get_side_table_rows",
     "get_team_side_table_rows",
+    "get_all_team_side_table_rows",
     "get_recent_commentary",
 ]
 
@@ -341,6 +342,21 @@ def _assert_order_by_shaped(order_by: str) -> None:
         raise ValueError(f"order_by contains a disallowed keyword or token, got {order_by!r}")
 
 
+def _append_order_by(sql: str, order_by: str | None) -> str:
+    """Append a validated ``ORDER BY`` clause to *sql* (no-op when *order_by* is
+    falsy).
+
+    Shared by the three side-table read helpers below so the
+    validate-then-append pair (``_assert_order_by_shaped`` + f-string append)
+    lives in exactly one place and cannot be applied inconsistently across
+    them.
+    """
+    if order_by:
+        _assert_order_by_shaped(order_by)
+        sql += f" ORDER BY {order_by}"
+    return sql
+
+
 def get_side_table_row(
     conn: sqlite3.Connection, table: str, source: str, match_id: str
 ) -> dict[str, Any] | None:
@@ -373,9 +389,7 @@ def get_side_table_rows(
     """
     _assert_identifier_shaped(table)
     sql = f"SELECT * FROM {table} WHERE source = ? AND match_id = ?"  # noqa: S608
-    if order_by:
-        _assert_order_by_shaped(order_by)
-        sql += f" ORDER BY {order_by}"
+    sql = _append_order_by(sql, order_by)
     return _query(conn, sql, (source, match_id))
 
 
@@ -389,9 +403,7 @@ def get_team_side_table_rows(
     """
     _assert_identifier_shaped(table)
     sql = f"SELECT * FROM {table} WHERE team = ?"  # noqa: S608
-    if order_by:
-        _assert_order_by_shaped(order_by)
-        sql += f" ORDER BY {order_by}"
+    sql = _append_order_by(sql, order_by)
     return _query(conn, sql, (team,))
 
 
@@ -408,9 +420,7 @@ def get_all_team_side_table_rows(
     """
     _assert_identifier_shaped(table)
     sql = f"SELECT * FROM {table}"  # noqa: S608
-    if order_by:
-        _assert_order_by_shaped(order_by)
-        sql += f" ORDER BY {order_by}"
+    sql = _append_order_by(sql, order_by)
     return _query(conn, sql)
 
 
