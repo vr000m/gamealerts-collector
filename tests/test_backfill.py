@@ -448,6 +448,64 @@ def test_run_backfill_fetch_schedule_failure_on_one_chunk_records_failed_chunk_a
     assert report.applied == 1
 
 
+class FailFirstThenSucceedEngine:
+    """Engine double whose ``apply_one_off_match`` fails the FIRST time it sees
+    a given match_id and succeeds on every later encounter.
+
+    Models a match re-enumerated across two adjacent PADDED date chunks (the
+    overlap ``chunk_date_range`` deliberately produces): the same match can be
+    applied in chunk N and again in chunk N+1. Its skip-check reports nothing
+    durably stored until an apply has succeeded, so the second encounter is
+    correctly NOT skipped and the retry actually runs.
+    """
+
+    def __init__(self, source: str) -> None:
+        self._source = source
+        self._seen: set[str] = set()
+
+    @property
+    def source(self) -> str:
+        return self._source
+
+    def stored_source_and_has_events(self, match_id: str) -> tuple[str | None, bool]:
+        # The first (failed) apply leaves no durable row, so the skip-check
+        # keeps reporting "not stored" and the next chunk retries the match.
+        return None, False
+
+    def apply_one_off_match(
+        self, scoreboard: NormalizedMatch, detail: NormalizedMatch
+    ) -> NormalizedMatch | None:
+        match_id = scoreboard.match_id
+        if match_id not in self._seen:
+            self._seen.add(match_id)
+            raise RuntimeError("transient apply failure on first encounter")
+        return scoreboard
+
+
+def test_run_backfill_match_that_fails_then_succeeds_is_not_reported_as_both():
+    """Regression: a match re-enumerated across two adjacent padded chunks that
+    FAILS in the first chunk and SUCCEEDS in the second must end up counted as
+    applied only — never simultaneously in ``report.failed`` AND
+    ``report.applied``. The stale ``failed[match_id]`` entry from the first
+    encounter must be cleared when the retry succeeds.
+    """
+    provider = FakeScheduleProvider(
+        {
+            "20260601": [nm("m1", status=MatchStatus.FINISHED)],
+            "20260602": [nm("m1", status=MatchStatus.FINISHED)],
+        }
+    )
+    engine = FailFirstThenSucceedEngine(SOURCE)
+    report = backfill.run_backfill(
+        engine, provider, ["20260601", "20260602"], source=SOURCE, request_delay=0.0
+    )
+    # The match ultimately succeeded: it must be counted as applied and must
+    # NOT linger in ``failed`` from its first-chunk failure.
+    assert report.applied == 1
+    assert "m1" not in report.failed
+    assert report.failed == {}
+
+
 def test_run_backfill_source_mismatch_raises_before_any_enumeration_or_fetch():
     provider = FakeScheduleProvider({"20260601": [nm("m1", status=MatchStatus.FINISHED)]})
     engine = FakeEngine("engine-owned-source")

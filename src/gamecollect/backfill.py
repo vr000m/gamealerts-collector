@@ -202,6 +202,15 @@ def run_backfill(
                     "(no durable write landed)"
                 )
             else:
+                # A match can legitimately be re-enumerated under an adjacent
+                # day's padded chunk (see chunk_date_range's overlap): if it
+                # FAILED in an earlier chunk and now SUCCEEDS, clear the stale
+                # failure so the report never claims one match both applied
+                # AND failed. (``enumerated`` still counts the per-chunk
+                # occurrence, not distinct ids — a known, documented tally
+                # limitation, not a correctness bug: a caller reads it as
+                # "matches examined", not "distinct matches".)
+                failed.pop(match_id, None)
                 applied += 1
 
     return BackfillReport(
