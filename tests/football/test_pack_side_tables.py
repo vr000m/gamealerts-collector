@@ -281,6 +281,40 @@ def test_stats_team_is_canonicalized_to_match_roster_and_state_vocabulary(db):
     )
 
 
+def test_read_ops_canonicalize_alias_team_filter(db):
+    """Round 3 review finding: the write path stores team names through
+    ``canonical_display_name`` (Türkiye -> Turkey), but ``get_squad`` /
+    ``get_player_stats`` bound the caller's raw ``team`` filter verbatim into
+    the SQL. A caller passing the raw alias "Türkiye" got a false-empty result
+    even though matching data was stored under "Turkey". The read ops must
+    canonicalize the ``team`` filter the same way the write path (and
+    FootballReadPort) do, so an alias-form filter matches its stored canonical
+    row."""
+    from gamecollect_football.operations import get_player_stats, get_squad
+
+    conn, writer = db
+    # A matches row must exist so the ops resolve the partition source.
+    writer.upsert_match({"match_id": MATCH_ID, "status": "FINISHED"})
+    payload = {
+        "stats": [{"team": "Türkiye", "shots": 5}],
+        "lineups": [
+            {"team": "Türkiye", "players": [{"athlete_id": "a1", "display_name": "A. Player"}]}
+        ],
+    }
+    persist_football_side_tables(conn, writer, _match(payload), MATCH_ID)
+
+    squad = get_squad(conn, MATCH_ID, team="Türkiye")
+    assert [m.team for m in squad] == ["Turkey"], (
+        "get_squad must canonicalize the raw alias team filter (Türkiye -> Turkey) "
+        "to match the stored canonical row"
+    )
+    stats = get_player_stats(conn, MATCH_ID, team="Türkiye")
+    assert [s.team for s in stats] == ["Turkey"], (
+        "get_player_stats must canonicalize the raw alias team filter (Türkiye -> "
+        "Turkey) to match the stored canonical row"
+    )
+
+
 def test_integral_float_and_string_athlete_id_collapse_to_one_row(db):
     """The same athlete spelled as JSON float ``760421.0`` and string
     ``"760421"`` must collapse to ONE primary-key row (last-wins), not two."""

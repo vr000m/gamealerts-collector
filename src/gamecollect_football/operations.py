@@ -22,6 +22,7 @@ from typing import Any
 
 from gamecollect.db import reader
 from gamecollect.registry import Operation, ParamSpec
+from gamecollect_football.reconcile import canonical_display_name
 
 __all__ = [
     "SquadMember",
@@ -145,8 +146,12 @@ def get_squad(
     sql = "SELECT * FROM football_lineups WHERE source = ? AND match_id = ?"
     params: list[Any] = [source, match_id]
     if team is not None:
+        # The write path stamps football_lineups.team through
+        # canonical_display_name (Türkiye -> Turkey); canonicalize the caller's
+        # filter the same way so an alias-form argument matches the stored
+        # canonical row instead of binding verbatim and false-emptying.
         sql += " AND team = ?"
-        params.append(team)
+        params.append(canonical_display_name(team))
     sql += " ORDER BY team, formation_place IS NULL, formation_place, athlete_id"
     return [SquadMember.from_row(r) for r in _rows(conn, sql, tuple(params))]
 
@@ -165,8 +170,10 @@ def get_player_stats(
     sql = "SELECT * FROM football_stats WHERE source = ? AND match_id = ?"
     params: list[Any] = [source, match_id]
     if team is not None:
+        # Same as get_squad: football_stats.team is stored through
+        # canonical_display_name, so canonicalize the filter argument to match.
         sql += " AND team = ?"
-        params.append(team)
+        params.append(canonical_display_name(team))
     sql += " ORDER BY team"
     return [PlayerStats.from_row(r) for r in _rows(conn, sql, tuple(params))]
 
