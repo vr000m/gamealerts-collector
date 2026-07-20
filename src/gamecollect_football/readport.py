@@ -20,7 +20,7 @@ from __future__ import annotations
 import sqlite3
 from typing import Any
 
-from gamecollect.client import _GOAL_FAMILY_EVENT_TYPES, _normalize_legacy_payload
+from gamecollect.client import GOAL_FAMILY_EVENT_TYPES, normalize_legacy_payload
 from gamecollect.db import reader
 from gamecollect.fold import fold
 from gamecollect_football.operations import resolve_source
@@ -139,8 +139,8 @@ class FootballReadPort:
         # "scorer" exactly as gamecollect.engine._stored_events does. The
         # goal-family set is imported from the same module, so this adapter
         # cannot drift from the core taxonomy literal.
-        payload = _normalize_legacy_payload(event_type, reader.decode_payload(row.get("payload")))
-        participant_key = "scorer" if event_type in _GOAL_FAMILY_EVENT_TYPES else "player"
+        payload = normalize_legacy_payload(event_type, reader.decode_payload(row.get("payload")))
+        participant_key = "scorer" if event_type in GOAL_FAMILY_EVENT_TYPES else "player"
         player = payload.get(participant_key)
         return {
             "seq": row["seq"],
@@ -267,7 +267,20 @@ class FootballReadPort:
         return any(row.get("starter") for row in self._lineup_rows(match_id, participant))
 
     def recent_commentary(self, match_id: str, limit: int = 20) -> list[dict[str, Any]]:
-        rows = reader.get_recent_commentary(self._conn, match_id, limit)
+        # The ``commentary`` table is consumer-owned (DESIGN.md §3): the
+        # collector never writes it and core deliberately does not know its
+        # name or column vocabulary. This adapter — which DOES own that
+        # knowledge — supplies the table name, the newest-first ordering, and
+        # the limit to the generic match-keyed reader, and tolerates the table
+        # being absent on a collector-first boot (returns []).
+        rows = reader.get_match_side_table_rows(
+            self._conn,
+            "commentary",
+            match_id,
+            order_by="created_at DESC, id DESC",
+            limit=limit,
+            tolerate_missing_table=True,
+        )
         return [
             {
                 "text": row.get("text"),

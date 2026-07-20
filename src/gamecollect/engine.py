@@ -977,7 +977,7 @@ class CollectorEngine:
         resolved_id = self._resolve_stored_match_id(match_id)
         if resolved_id is None:
             return False
-        return bool(reader.get_events_since(self._conn, resolved_id))
+        return reader.has_any_event(self._conn, resolved_id)
 
     def stored_source_and_has_events(self, match_id: str) -> tuple[str | None, bool]:
         """Return ``(stored source, has-events)`` for ``match_id`` in ONE resolve.
@@ -996,7 +996,7 @@ class CollectorEngine:
             return None, False
         row = reader.get_state(self._conn, resolved_id)
         source = row["source"] if row is not None else None
-        has_events = bool(reader.get_events_since(self._conn, resolved_id))
+        has_events = reader.has_any_event(self._conn, resolved_id)
         return source, has_events
 
     def apply_one_off_match(

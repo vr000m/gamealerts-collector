@@ -47,6 +47,8 @@ __all__ = [
     "get_events_since",
     "get_standings",
     "get_vocabulary",
+    "GOAL_FAMILY_EVENT_TYPES",
+    "normalize_legacy_payload",
 ]
 
 
@@ -78,10 +80,15 @@ def _decode_payload(raw: Any) -> Any:
 # ``threading``, and provider/pack-loading machinery — into this lightweight,
 # sync, read-only client. Kept from drifting by
 # ``test_client_goal_family_matches_engine`` in ``tests/test_engine.py``.
-_GOAL_FAMILY_EVENT_TYPES = frozenset({"goal", "own_goal"})
+#
+# Public (no underscore): the football read-pack (``gamecollect_football``)
+# imports this and ``normalize_legacy_payload`` to avoid a third hand-rolled
+# goal-family copy. A public name makes that cross-package reuse an explicit,
+# rename-safe contract rather than a hidden dependency on a private symbol.
+GOAL_FAMILY_EVENT_TYPES = frozenset({"goal", "own_goal"})
 
 
-def _normalize_legacy_payload(event_type: str, payload: Any) -> Any:
+def normalize_legacy_payload(event_type: str, payload: Any) -> Any:
     """Rewrite a legacy goal-family ``payload.player`` key to ``payload.scorer``.
 
     Rows written before the goal-event participant-contract rename
@@ -97,7 +104,7 @@ def _normalize_legacy_payload(event_type: str, payload: Any) -> Any:
     dict, exactly mirroring ``_stored_events``'s existing fallback.
     """
     if (
-        event_type in _GOAL_FAMILY_EVENT_TYPES
+        event_type in GOAL_FAMILY_EVENT_TYPES
         and isinstance(payload, dict)
         and "scorer" not in payload
         and "player" in payload
@@ -105,6 +112,13 @@ def _normalize_legacy_payload(event_type: str, payload: Any) -> Any:
         payload = dict(payload)
         payload["scorer"] = payload.pop("player")
     return payload
+
+
+# Backward-compatible private aliases: core still references the underscore
+# names internally (below) and the drift guard
+# ``test_client_goal_family_matches_engine`` imports the underscore form.
+_GOAL_FAMILY_EVENT_TYPES = GOAL_FAMILY_EVENT_TYPES
+_normalize_legacy_payload = normalize_legacy_payload
 
 
 @dataclass(frozen=True)
@@ -174,7 +188,7 @@ class Event:
             actor_entity=row.get("actor_entity"),
             target_entity=row.get("target_entity"),
             detail=row.get("detail"),
-            payload=_normalize_legacy_payload(event_type, _decode_payload(row.get("payload"))),
+            payload=normalize_legacy_payload(event_type, _decode_payload(row.get("payload"))),
         )
 
 

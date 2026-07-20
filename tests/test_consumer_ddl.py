@@ -219,29 +219,47 @@ class TestCollectorWriteCycleLeavesNoPollution:
 
 
 class TestGetRecentCommentaryToleranceBoundary:
-    """get_recent_commentary's docstring promises tolerating an ABSENT
-    commentary table (returns [] instead of raising) since gamealerts creates
-    it lazily. It does NOT promise tolerating a column-shape mismatch on a
-    table that DOES exist -- that is a real bug in the consumer's schema and
-    must still raise, so it doesn't silently degrade into a "no commentary"
-    read. This asserts both sides of that documented boundary using a direct
-    sqlite_master existence check (not exception-message string matching,
-    which is fragile across SQLite versions)."""
+    """The consumer-owned ``commentary`` read (now the generic
+    ``get_match_side_table_rows`` with ``tolerate_missing_table=True``, the
+    table name/order/columns supplied by the pack adapter — core no longer
+    hardcodes ``commentary``) tolerates an ABSENT table (returns [] instead of
+    raising) since gamealerts creates it lazily. It does NOT tolerate a
+    column-shape mismatch on a table that DOES exist -- that is a real bug in
+    the consumer's schema and must still raise, so it doesn't silently degrade
+    into a "no commentary" read. This asserts both sides of that documented
+    boundary using a direct sqlite_master existence check (not
+    exception-message string matching, which is fragile across SQLite
+    versions).
+
+    Called exactly as the football pack's ``recent_commentary`` adapter calls
+    it (table name, newest-first ordering, and limit all supplied by the
+    caller), so this guards the tolerance behaviour the adapter relies on.
+    """
+
+    def _read(self, conn):
+        return reader.get_match_side_table_rows(
+            conn,
+            "commentary",
+            MATCH_ID,
+            order_by="created_at DESC, id DESC",
+            limit=20,
+            tolerate_missing_table=True,
+        )
 
     def test_absent_table_returns_empty_list(self, collector_db):
         _path, conn = collector_db
         # No commentary DDL applied at all.
-        assert reader.get_recent_commentary(conn, MATCH_ID) == []
+        assert self._read(conn) == []
 
     def test_existing_table_missing_expected_column_still_raises(self, collector_db):
         _path, conn = collector_db
         # A commentary table that exists but lacks the documented
-        # created_at/id columns get_recent_commentary's ORDER BY relies on.
+        # created_at/id columns the newest-first ORDER BY relies on.
         conn.executescript("CREATE TABLE commentary (match_id TEXT NOT NULL, text TEXT NOT NULL);")
         conn.commit()
 
         with pytest.raises(sqlite3.OperationalError):
-            reader.get_recent_commentary(conn, MATCH_ID)
+            self._read(conn)
 
 
 class TestSideTableHelpersRejectNonIdentifierTable:

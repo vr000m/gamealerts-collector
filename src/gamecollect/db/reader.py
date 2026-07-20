@@ -41,6 +41,7 @@ __all__ = [
     "get_state",
     "get_stored_payload",
     "get_events_since",
+    "has_any_event",
     "get_latest_event_of_type",
     "get_standings",
     "get_entity",
@@ -49,7 +50,7 @@ __all__ = [
     "get_side_table_rows",
     "get_team_side_table_rows",
     "get_all_team_side_table_rows",
-    "get_recent_commentary",
+    "get_match_side_table_rows",
 ]
 
 
@@ -175,6 +176,21 @@ def get_events_since(
         "SELECT * FROM events WHERE match_id = ? AND seq > ? ORDER BY seq",
         (match_id, seq),
     )
+
+
+def has_any_event(conn: sqlite3.Connection, match_id: str) -> bool:
+    """Return whether ``match_id`` has at least one stored event row.
+
+    A bounded existence probe (``SELECT 1 ... LIMIT 1`` on the
+    ``idx_events_match_seq (match_id, seq)`` index) for callers that only need
+    the boolean — e.g. the backfill skip-check's "already fully stored" proxy.
+    Avoids ``get_events_since``'s full ``SELECT *`` fetch-and-materialize of
+    every event row (and its per-row dict construction) just to test
+    ``bool(...)``, mirroring :func:`get_latest_event_of_type`'s bounded
+    single-marker query.
+    """
+    rows = _query(conn, "SELECT 1 FROM events WHERE match_id = ? LIMIT 1", (match_id,))
+    return bool(rows)
 
 
 def get_latest_event_of_type(
@@ -309,6 +325,23 @@ _ORDER_BY_DANGEROUS_RE = re.compile(
 )
 
 
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    """Return whether a table named ``table`` currently exists.
+
+    A parameterized ``sqlite_master`` lookup (table name bound, not
+    interpolated) used by helpers that must tolerate a side table a consuming
+    app creates lazily on its own connection (DESIGN.md §3) — e.g. a
+    collector-first boot where the consumer's table does not exist yet.
+    """
+    return bool(
+        _query(
+            conn,
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table,),
+        )
+    )
+
+
 def _assert_identifier_shaped(table: str) -> None:
     """Cheap defense-in-depth for the ``table`` params below.
 
@@ -424,30 +457,40 @@ def get_all_team_side_table_rows(
     return _query(conn, sql)
 
 
-def get_recent_commentary(
-    conn: sqlite3.Connection, match_id: str, limit: int = 20
+def get_match_side_table_rows(
+    conn: sqlite3.Connection,
+    table: str,
+    match_id: str,
+    *,
+    order_by: str | None = None,
+    limit: int | None = None,
+    tolerate_missing_table: bool = False,
 ) -> list[dict[str, Any]]:
-    """Return the most recent ``commentary`` rows for ``match_id``, newest first.
+    """Return ``match_id``-keyed rows from a pack/consumer side table.
 
-    The collector never writes commentary (DESIGN.md §3) — the table is
-    created lazily by the consuming app on its own scoped connection, so a
-    collector-first boot / pre-match / replay may have no such table yet.
-    Tolerated here: returns ``[]`` when the table is absent, instead of
-    letting ``sqlite3.OperationalError`` escape. This checks
-    ``sqlite_master`` directly rather than string-matching the exception
-    message (fragile across SQLite versions) — a genuine column-shape
-    mismatch on a table that DOES exist is a real bug in the consumer's
-    schema and is allowed to raise, since that is not the documented
-    tolerance here.
+    For per-match, multi-row tables keyed by ``match_id`` ALONE (no ``source``
+    column) — e.g. a consumer-owned ``commentary`` table. Core stays
+    sport/consumer-agnostic: the table name, ``order_by`` columns, and any
+    ``limit`` are all supplied by the caller (the pack/consumer read adapter
+    that owns that table's vocabulary), not hardcoded here.
+
+    ``tolerate_missing_table=True`` returns ``[]`` (via a parameterized
+    :func:`_table_exists` ``sqlite_master`` check) when the table has not been
+    created yet, instead of letting ``sqlite3.OperationalError`` escape — for
+    tables a consuming app creates lazily on its own scoped connection
+    (DESIGN.md §3), so a collector-first boot / pre-match / replay may have no
+    such table yet. Checking ``sqlite_master`` directly (not string-matching
+    the exception message, which is fragile across SQLite versions) keeps a
+    genuine column-shape mismatch on a table that DOES exist raising — that is
+    a real bug in the consumer's schema, not the tolerated absent-table case.
     """
-    exists = _query(
-        conn,
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'commentary'",
-    )
-    if not exists:
+    _assert_identifier_shaped(table)
+    if tolerate_missing_table and not _table_exists(conn, table):
         return []
-    return _query(
-        conn,
-        "SELECT * FROM commentary WHERE match_id = ? ORDER BY created_at DESC, id DESC LIMIT ?",
-        (match_id, limit),
-    )
+    sql = f"SELECT * FROM {table} WHERE match_id = ?"  # noqa: S608
+    sql = _append_order_by(sql, order_by)
+    params: list[Any] = [match_id]
+    if limit is not None:
+        sql += " LIMIT ?"
+        params.append(limit)
+    return _query(conn, sql, params)
